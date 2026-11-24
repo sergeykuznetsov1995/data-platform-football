@@ -446,7 +446,7 @@ def start_submissions(owner):
         raise RuntimeError('core prior packet submission is still pending')
 
 
-def reserve_submission(scopes, owner, intent, *, missing_receipts=None):
+def reserve_submission(scopes, owner, intent, *, missing_receipts=None, publications=None):
     """Mirror the complete packet reservation before its individual scope guards."""
     head = submission_head(owner)
     if (head is None and _packet_watermark(owner).exists()) or (head and not submission_is_current(head)):
@@ -466,7 +466,8 @@ def reserve_submission(scopes, owner, intent, *, missing_receipts=None):
         # worklist and pre-submit attempts before the first receipt can be sent.
         head = {**head, 'receipt_repair': {'intent': intent, 'missing': list(missing_receipts),
                                           'before': head.get('members', {})}}
-    _replace_submission({**head, 'owner': owner, 'scopes': scopes, 'reservation': intent})
+    _replace_submission({**head, 'owner': owner, 'scopes': scopes, 'reservation': intent,
+                         **({'after_publication': list(publications)} if publications is not None else {})})
 
 
 def finish_guarded_receipt_repair(owner, intent):
@@ -516,15 +517,22 @@ def submission_retired(head):
     return False
 
 
-def reservation_released(head):
-    """A no-POST retirement marker precedes the individual ownership unlinks."""
-    if not head.get('reservation') or 'statement' in head:
-        return False
+def reservation_release_started(head):
+    watermark = _read_record(_packet_watermark(head['owner']))
+    return watermark.get('released') is True and watermark.get('scopes') == head['scopes']
+
+
+def remaining_reservation_scopes(head):
+    """Read ownership under an authenticated no-POST reservation."""
     owner = head['owner']
-    watermark = _read_record(_packet_watermark(owner))
-    return (watermark.get('released') is True and watermark.get('scopes') == head['scopes']
-            and not _record_path('reserving-bundles', owner).exists()
-            and all(scope_owner(scope) != owner for scope in head['scopes']))
+    scopes = set(map(tuple, head['scopes']))
+    if not reservation_release_started(head) or _record_path('reserving-bundles', owner).exists():
+        return scopes
+    return {scope for scope in scopes if scope_owner(scope) == owner}
+
+
+def reservation_released(head):
+    return bool(head.get('reservation') and 'statement' not in head and not remaining_reservation_scopes(head))
 
 
 def submission_is_current(head):
@@ -1079,7 +1087,7 @@ def completed_intent(intent):
         return record
 
 
-def complete_intent(path, digest, owner, terminal):
+def complete_intent(path, digest, owner, terminal, publication_reservation=None):
     from .native_writer import _bundle_identity, _intent_unit
 
     body = _intent_body(path, 'core write intent checksum differs')
@@ -1088,6 +1096,8 @@ def complete_intent(path, digest, owner, terminal):
     descriptor_digest = _bundle_identity(plans, run)[1]
     receipt = read_receipt(digest)
     binding = {'intent': path.stem, 'digest': digest, 'owner': owner, 'terminal': terminal}
+    if publication_reservation is not None:
+        binding['reservation_head'] = publication_reservation
     existing = completed_intent(path.stem)
     completion = existing or {
         **binding, 'descriptor_digest': descriptor_digest,

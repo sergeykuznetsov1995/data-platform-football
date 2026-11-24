@@ -2964,7 +2964,11 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
             write_journal._immutable_record(path, {'table': table, 'capture': capture, 'body': body})
         if len(scopes) > 1:
             member = _operation(_target_scope(plans[0]), receipt_ids[0])
-            write_journal.reserve_submission(scopes, receipt_ids[0], member['intent'])
+            if repair is None:
+                write_journal.reserve_submission(scopes, receipt_ids[0], member['intent'])
+            else:
+                write_journal.reserve_submission(scopes, receipt_ids[0], member['intent'],
+                                                 publications=member.get('after_publication', ()))
             write_journal.reserve_scopes(scopes, receipt_ids[0])
     for key, (table, rows, _reason) in restorations.items():
         write_journal.hold_scope((rows[0][1], rows[0][2]), receipt_ids[0])
@@ -3654,12 +3658,12 @@ def _intent_terminal(path, identity, plans, receipt_ids):
         for key, plan in zip(receipt_ids, plans, strict=True) if plan.write_mode == 'replace')
 
 
-def _complete_packet(plans, receipt_ids, paths):
+def _complete_packet(plans, receipt_ids, paths, publication_reservation=None):
     owner = receipt_ids[0]
     for path in paths:
         identity = write_journal._intent_body(path, 'core write intent checksum differs')['identity']
         terminal = _intent_terminal(path, identity, plans, receipt_ids)
-        write_journal.complete_intent(path, identity['digest'], owner, terminal)
+        write_journal.complete_intent(path, identity['digest'], owner, terminal, publication_reservation)
     write_journal.retire_operations({_target_scope(plan) for plan in plans}, owner)
     _release_packet(plans, owner, paths)
 
@@ -3807,17 +3811,29 @@ def _repair_prefix(head, path, payload, plans, receipt_ids):
     return _receipt_prefix(head, path.stem, plans, receipt_ids)
 
 
-def _check_undispatched_reservation(head, plans, receipt_ids):
+def _check_undispatched_reservation(head, plans, receipt_ids, owned_scopes):
     scopes = {_target_scope(plan) for plan in plans}
     if (head.get('scopes') != [list(scope) for scope in sorted(scopes)]
             or head.get('receipt_repair', {}).get('intent', head['reservation']) != head['reservation']):
         raise RuntimeError('core completed reservation binding differs')
     for plan, member in zip(plans, receipt_ids, strict=True):
         scope = _target_scope(plan)
-        keys = (scope, (CORE_RECEIPTS_TABLE, member), (CORE_PAGES_TABLE, member))
+        keys = [(CORE_RECEIPTS_TABLE, member), (CORE_PAGES_TABLE, member)]
+        if scope in owned_scopes:
+            keys.append(scope)
+        else:
+            # A released target key can now fence another packet. Its bound
+            # operation and statement stay with that packet.
+            for path in (write_journal._statement_path(scope), write_journal._attempt_path(scope)):
+                if path.exists():
+                    statement = write_journal._read_record(path)
+                    if (_statement_expected(statement) == member
+                            or statement.get('operation', {}).get('owner') == head['owner']):
+                        raise RuntimeError('core reserved operation outcome is still pending')
         if (any(write_journal._statement_path(key).exists() or write_journal._attempt_path(key).exists()
                 for key in keys)
-                or any(record.get('statement') for record in write_journal.scope_operations(scope))):
+                or any(record.get('statement') for record in write_journal.scope_operations(scope)
+                       if scope in owned_scopes or record['operation']['owner'] == head['owner'])):
             raise RuntimeError('core reserved operation outcome is still pending')
 
 
@@ -3825,8 +3841,6 @@ def _check_retiring_receipts(head, paths, plans, receipts):
     """Completion covers removed records. Surviving receipts must still agree."""
     intents = {path.stem for path in paths}
     last = (head or {}).get('statement')
-    if not last and head and head.get('reservation') in intents:
-        return  # the reservation and absence of dispatch were checked before settlement
     if not last or last['operation']['intent'] not in intents:
         raise RuntimeError('core completed submission binding differs')
     for plan, receipt in zip(plans, receipts, strict=True):
@@ -4102,30 +4116,47 @@ def _commit_bundle(
                 and last['operation']['member'] in receipt_ids
                 and head.get('members', {}).get(last['operation']['member']) == last['attempt']):
             retry_statement = last
-        write_journal.check_dispatch_bindings(scopes, reviewed_dispatch=reviewed_dispatch,
-                                              retry_statement=retry_statement)
         completed = [write_journal.completed_intent(path.stem) for path in paths]
-        if current_head and not last and head.get('reservation') and completed and all(completed):
-            if current_intents != {head['reservation']}:
+        no_post = bool(current_head and head.get('reservation') and not last)
+        closing_reservation = no_post and bool(completed) and all(completed)
+        publication_reservation = None
+        if (no_post and len(pending) == 1 and 'warehouse_identity' not in pending[0][1]['payload']
+                and pending[0][0].stem != head['reservation']):
+            publication = pending[0][0].stem
+            if 'after_publication' in head and publication not in head['after_publication']:
+                raise RuntimeError('core reservation publication binding differs')
+            publication_reservation = _digest(head)
+        checked_scopes = scopes
+        if closing_reservation:
+            if current_intents != {head['reservation']} and not (
+                    publication_reservation and completed[0].get('reservation_head') == publication_reservation):
                 raise RuntimeError('core completed submission binding differs')
-            _check_undispatched_reservation(head, plans, receipt_ids)
-        active_operations = _check_operation_history(plans, receipt_ids[0], reviewed_dispatch,
-                                                     retry_statement=retry_statement)
-        # A surviving worklist outlives a restore of the original descriptor
-        # (and possibly its acknowledgement). Only exact readback is available
-        # through that descriptor, including after the repair's last INSERT.
+            checked_scopes = write_journal.remaining_reservation_scopes(head)
+            _check_undispatched_reservation(head, plans, receipt_ids, checked_scopes)
+        write_journal.check_dispatch_bindings(checked_scopes, reviewed_dispatch=reviewed_dispatch,
+                                              retry_statement=retry_statement)
+        active_operations = _check_operation_history(
+            [p for p in plans if _target_scope(p) in checked_scopes], receipt_ids[0], reviewed_dispatch,
+            retry_statement=retry_statement)
+        # A pending general repair can extend its predecessor or its own
+        # current reservation/dispatch. A restored older descriptor is evidence
+        # for readback only, even if the intervening repair was target-only.
+        head_intent = last['operation']['intent'] if last else (head or {}).get('reservation')
+        stale_descriptors = {
+            path for path, body in pending
+            if reviews is None and 'warehouse_identity' in body['payload'] and path not in receipt_repairs
+            and not (current_head and path.stem == head_intent)
+            and body['payload'].get('predecessor_head') != _digest(head)
+        }
         missing_repair = False
-        if head_repair and head_repair['intent'] not in current_intents:
-            # A fresh general descriptor may follow a retired receipt worklist.
-            # Its predecessor distinguishes it from a restored older repair.
-            predecessor = _digest(head)
-            stale_descriptor = any(
-                'warehouse_identity' not in payload
-                or (not payload.get('receipt_only') and payload.get('predecessor_head') != predecessor)
-                for payload in (body['payload'] for _, body in pending))
-            missing_repair = (not current_head or active_operations or stale_descriptor
+        if head_repair and head_repair['intent'] not in current_intents and not closing_reservation:
+            missing_repair = (not current_head or active_operations
+                              or any('warehouse_identity' not in body['payload'] for _, body in pending)
                               or not write_journal.submission_retired(head))
-        read_only_publication = reviews is not None or missing_repair
+        released_descriptor = (no_post and not closing_reservation and head['reservation'] in current_intents
+                               and write_journal.reservation_release_started(head))
+        read_only_publication = (reviews is not None or missing_repair or bool(stale_descriptors)
+                                 or released_descriptor or publication_reservation is not None and not closing_reservation)
         historical_receipts = any(not body['identity'].get('packet_attempt') for _, body in pending) or (
             historical_intent is not None and any(
                 write_journal.terminal_target(historical_intent.stem, key, scope=_target_scope(plan))
@@ -4156,11 +4187,13 @@ def _commit_bundle(
                 write_journal.hold_restored_packet(receipt_ids[0], digest, scopes)
                 raise _ScopePending('core packet submission history is still pending', receipt_ids[0])
             released_without_post = False
-            if reviews is None and missing_repair and not paths:
-                if not write_journal.reservation_released(head) or head['reservation'] != head_repair['intent']:
+            if reviews is None and not paths and (missing_repair or no_post):
+                if (not write_journal.reservation_released(head)
+                        or head_repair and head['reservation'] != head_repair['intent']):
                     raise _ScopePending('core receipt repair descriptor is still pending', receipt_ids[0])
-                _check_undispatched_reservation(head, plans, receipt_ids)
+                _check_undispatched_reservation(head, plans, receipt_ids, scopes)
                 released_without_post = True
+                read_only_publication = True
             # The acknowledgement names the identity its warehouse receipts
             # were written under. A unit migrated from an earlier writer keeps
             # that one, so a retry under today's identity reuses them.
@@ -4179,8 +4212,8 @@ def _commit_bundle(
                 raise RuntimeError('core journal receipt warehouse identity differs')
             if write_journal.read_snapshot_anchors(receipt_digest).keys() != _anchored_tables(plans):
                 raise RuntimeError('core acknowledged snapshot anchors differ')
-            if (not read_only_publication and not active_operations and len(pending) == 1 and not any(completed)
-                    and _released_after_ack(pending[0][1], plans, receipt_ids)):
+            if (not no_post and not read_only_publication and not active_operations
+                    and len(pending) == 1 and not any(completed) and _released_after_ack(pending[0][1], plans, receipt_ids)):
                 _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, identity, universe_version)
                 _complete_packet(plans, receipt_ids, paths)
                 if journaled:
@@ -4194,6 +4227,8 @@ def _commit_bundle(
                 and (active_operations or not guarded_repairs and (
                     write_journal._record_path('reserving-bundles', receipt_ids[0]).exists()
                     or all(write_journal.scope_owner(scope) == receipt_ids[0] for scope in scopes))))
+            if closing_reservation and checked_scopes == scopes:
+                retiring = True  # the independent head still owns the entire packet
             if not read_only_publication and completed and all(completed) and not (active_operations or retiring):
                 if set(paths) == guarded_repairs:
                     for path in paths:
@@ -4203,6 +4238,12 @@ def _commit_bundle(
                     _release_packet(plans, receipt_ids[0], paths)
                 if journaled:
                     return stored
+                if closing_reservation:
+                    # The packet has released its remaining owners. An ordinary
+                    # write still checks current ownership across the full request.
+                    write_journal.check_dispatch_bindings(scopes)
+                    _check_operation_history(plans, receipt_ids[0])
+                    released_without_post = read_only_publication = True
                 paths.clear()  # an ordinary retry still verifies live data
                 receipt_repairs.clear()
                 guarded_repairs.clear()
@@ -4258,6 +4299,13 @@ def _commit_bundle(
                                 if path != paths[-1]:
                                     raise RuntimeError('core receipt repair intent binding differs')
                                 prefix = candidate
+                if (no_post and prefix and held_receipts.intersection(prefix.untouched)
+                        and current_intents == {head['reservation']} and head_repair):
+                    # A restored worklist row can only complete an exact packet.
+                    # Suppress all inserts and compare every receipt cell below.
+                    _check_undispatched_reservation(head, plans, receipt_ids, scopes)
+                    read_only_publication = True
+                    prefix = _ReceiptPrefix((), retired=True)
                 _verify_receipt_prefix(connection, plans, receipt_ids, receipt_hashes, receipt_digest,
                                        run_id, universe_version, batch, stored['committed_at'], prefix=prefix)
                 verify_postimages = verify_only or read_only_publication or prefix is not None
@@ -4280,7 +4328,7 @@ def _commit_bundle(
                                   universe_version, batch, stored['committed_at'])
                     for plan, proof, plan_hash in zip(plans, proofs, receipt_hashes, strict=True)
                 ]
-                if retiring:
+                if retiring and not closing_reservation:
                     _check_retiring_receipts(head, paths, plans, plan_receipts)
                 held = _stored_receipts(connection, receipt_ids)
                 if verify_only and not stored['plans']:
@@ -4294,7 +4342,7 @@ def _commit_bundle(
                         prefix = _ReceiptPrefix(missing)
                     if head_repair.get('intent') != paths[-1].stem:
                         write_journal.reserve_submission(scopes, receipt_ids[0], paths[-1].stem,
-                                                         missing_receipts=prefix.untouched)
+                                                         missing_receipts=prefix.untouched, publications=publications)
                     if not verify_only:
                         write_journal.reserve_scopes(scopes, receipt_ids[0])
                 _merge_receipts(connection, plan_receipts, read_only=read_only_publication, prefix=prefix)
@@ -4306,7 +4354,7 @@ def _commit_bundle(
                            or _terminal_packet(historical_intent, plans, receipt_ids))
                 if not settled and paths and not guarded_repairs:
                     write_journal.finish_guarded_receipt_repair(receipt_ids[0], paths[-1].stem)
-                if settled:
+                if settled and not stale_descriptors:
                     _clean_stages(connection, writer, plans, receipt_ids, run_id, defer=read_only_publication)
                 if reviews is not None:
                     write_journal.confirm_reviewed_submission(receipt_ids[0], reviews, scopes)
@@ -4323,7 +4371,13 @@ def _commit_bundle(
                 write_journal.finish_intent(path)
                 paths.remove(path)
             if settled:
-                _complete_packet(plans, receipt_ids, paths)
+                if stale_descriptors:
+                    # Readback closes the obsolete descriptor. It cannot retire
+                    # the later submission or unlink that reservation's owners.
+                    for path in stale_descriptors:
+                        write_journal.finish_intent(path)
+                else:
+                    _complete_packet(plans, receipt_ids, paths, publication_reservation)
             return stored
 
         # An interrupted write of this very unit left its intent behind: the
@@ -4433,7 +4487,7 @@ def _commit_bundle(
         write_journal.record_receipt(digest, receipt)
         _publish_alias(current, receipt, plan_hashes, digest)
         # A pre-fence intent still guards the scope after read-only verification.
-        _complete_packet(plans, receipt_ids, paths)
+        _complete_packet(plans, receipt_ids, paths, publication_reservation)
         return receipt
 
 
