@@ -269,6 +269,7 @@ def guard_history():
             if identity.get('digest') != record['digest']:
                 raise RuntimeError('core migration identity differs')
     known = {entry.get('identity', {}).get('digest') for entry in entries.values()}
+    accounted = known.copy()
     for path in (_root() / 'receipts').glob('*.json'):
         digest = path.stem
         if digest in known:
@@ -277,11 +278,24 @@ def guard_history():
         if receipt is None or receipt.get('plan_sha256') != digest:
             raise RuntimeError('core archived acknowledgement identity differs')
         warehouse = (receipt.get('identity') or {}).get('digest', digest)
+        accounted.update((digest, warehouse))
         if warehouse not in known:
             # No dispatch protocol survives. The acknowledgement binds the
             # affected targets, but does not certify terminal DML.
             yield {'digest': digest, 'status': 'finished',
                    'identity': {'run_id': receipt['run_id'], 'digest': digest}}
+    for path in (_root() / 'anchors').glob('*.json'):
+        if path.stem in accounted:
+            continue
+        alias = _record_path('anchor-copies', path.stem)
+        if alias.exists():
+            copy = _read_record(alias)
+            if (copy['target'] != path.stem or copy['source'] == path.stem or
+                    read_snapshot_anchors(copy['source']) != read_snapshot_anchors(path.stem)):
+                raise RuntimeError('core alias snapshot anchors differ')
+            if read_receipt(copy['source']) is not None:
+                continue  # interrupted between copying the anchors and publishing their alias receipt
+        yield {'digest': path.stem, 'status': 'finished', 'identity': {'digest': path.stem}}
     for entry in entries.values():
         if entry['status'] == 'pending':
             # Completion precedes owner unlink and index retirement. Its
@@ -307,14 +321,73 @@ def _statement_path(key):
     return _record_path('pending-statements', hashlib.sha256(_canonical(key)).hexdigest())
 
 
+def _attempt_path(key):
+    return _record_path('dispatch-attempts', _statement_path(key).stem)
+
+
+def _unlink_record(path):
+    if path.exists():
+        path.unlink()
+        _fsync_directory(path.parent)
+
+
 def pending_statement(key):
     path = _statement_path(key)
-    if not path.exists():
+    binding = _attempt_path(key)
+    settled = _record_path('settled-statements', path.stem)
+    if not path.exists() and not binding.exists():
+        if settled.exists():
+            if _read_record(settled)['key'] != list(key):
+                raise RuntimeError('core settled statement key differs')
+            _unlink_record(settled)
         return None
-    statement = _read_record(path)
+    statement = _read_record(path if path.exists() else binding)
     if statement['key'] != list(key):
         raise RuntimeError('core pending statement key differs')
+    if binding.exists():
+        if _read_record(binding) != statement:
+            raise RuntimeError('core pending statement binding differs')
+    else:
+        _immutable_record(binding, statement)
+    if not path.exists():
+        _immutable_record(path, statement)
+    if settled.exists():
+        finish_statement(statement)
+        return None
     return statement
+
+
+def _dispatch_keys():
+    keys = set()
+    for directory in ('pending-statements', 'dispatch-attempts'):
+        for path in (_root() / directory).glob('*.json'):
+            key = tuple(_read_record(path)['key'])
+            if path.name != _statement_path(key).name:
+                raise RuntimeError('core pending statement key differs')
+            keys.add(key)
+    return keys
+
+
+def check_dispatch_bindings():
+    """An old query ID with no surviving key cannot safely be assigned to a scope."""
+    queries = {path.stem for path in (_root() / 'statement-queries').glob('*.json')}
+    if queries:
+        for key in _dispatch_keys():
+            statement = pending_statement(key)
+            if statement is not None:
+                queries.discard(statement['attempt'])
+        if any(_record_path('statement-queries', attempt).exists() for attempt in queries):
+            raise RuntimeError('unbound core statement outcome is still pending')
+
+
+def stage_in_use(record):
+    for key in _dispatch_keys():
+        if key[0] == record['table']:
+            target = pending_statement(key)
+            if target and (target.get('stage') == record['stage'] or not target.get('stage') and
+                           target['expected'] in (record['receipt_id'], {'single_submit': record['receipt_id']})):
+                return True
+    return False
 
 
 def begin_statement(key, expected, *, observable=True, target_preimage=False, stage=None):
@@ -325,6 +398,9 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         statement['target_preimage'] = True
     if stage is not None:
         statement['stage'] = stage
+    if pending_statement(key) is not None:
+        raise RuntimeError('core statement outcome is still pending: ' + key[0])
+    _immutable_record(_attempt_path(key), statement)
     _immutable_record(_statement_path(key), statement)
     return statement
 
@@ -343,11 +419,18 @@ def statement_query(statement):
 def finish_statement(statement):
     """Release the fence only after the attempt is settled, including across a crash."""
     path = _statement_path(statement['key'])
-    if _read_record(path) != statement:
-        raise RuntimeError('core pending statement changed')
-    path.unlink()
-    _fsync_directory(path.parent)
-    _record_path('statement-queries', statement['attempt']).unlink(missing_ok=True)
+    binding = _attempt_path(statement['key'])
+    for record in (path, binding):
+        if record.exists() and _read_record(record) != statement:
+            raise RuntimeError('core pending statement changed')
+    if not (path.exists() or binding.exists()):
+        raise RuntimeError('core pending statement is missing')
+    settled = _record_path('settled-statements', path.stem)
+    _immutable_record(settled, statement)
+    _unlink_record(_record_path('statement-queries', statement['attempt']))
+    _unlink_record(path)
+    _unlink_record(binding)
+    _unlink_record(settled)
 
 
 def _scope_owner_path(scope):
@@ -525,6 +608,7 @@ def copy_snapshot_anchors(source: str, target: str) -> bool:
     source_path, target_path = _record_path('anchors', source), _record_path('anchors', target)
     if not source_path.exists() or target_path.exists():
         return False
+    _immutable_record(_record_path('anchor-copies', target), {'source': source, 'target': target})
     _immutable_record(target_path, {**_read_record(source_path), 'intent_sha256': target})
     return True
 
@@ -539,10 +623,28 @@ def record_receipt(digest: str, receipt: Mapping) -> None:
         raise RuntimeError('core journal receipt readback differs')
 
 
+def guard_inventories():
+    for path in (_root() / 'guard-inventories').glob('*.json'):
+        inventory = _read_record(path)
+        if inventory['intent'] != path.stem:
+            raise RuntimeError('core guard inventory identity differs')
+        yield inventory
+
+
+def acknowledgement_matches_inventory(digest, receipt):
+    originals = {i['acknowledgement'] for i in guard_inventories() if i['digest'] == digest}
+    return not originals or originals == {hashlib.sha256(_canonical(receipt)).hexdigest()}
+
+
 def acknowledgements():
     """Read the verified, immutable acknowledgements, including pre-upgrade records."""
+    fingerprints = {}
+    for inventory in guard_inventories():
+        fingerprints.setdefault(inventory['digest'], set()).add(inventory['acknowledgement'])
     for path in sorted((_root() / 'receipts').glob('*.json')):
         receipt = _read_record(path)
+        if path.stem in fingerprints and fingerprints[path.stem] != {hashlib.sha256(_canonical(receipt)).hexdigest()}:
+            continue  # the inventory fences this acknowledgement's original scopes
         if receipt.get('verified') is not True:
             raise RuntimeError('core journal receipt is unverified')
         yield receipt

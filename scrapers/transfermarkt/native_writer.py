@@ -12,6 +12,7 @@ from collections import Counter
 from collections.abc import Mapping
 from contextlib import contextmanager
 import fcntl
+import json
 import logging
 import os
 from dataclasses import asdict, dataclass
@@ -1106,6 +1107,17 @@ def _accepted_pages(connection, plan: NativeWritePlan, *, own=(), restore=None) 
         elif not original and receipt_id not in own:
             raise RuntimeError('core page manifest lacks original capture evidence: ' + plan.table)
         walks[receipt_id] = tuple(sorted(walk, key=lambda cells: cells[3]))
+        if not original and len(walk) > 1:
+            # The receipt names just one response. The other clocks must
+            # match the independently bound descriptor or immutable walk.
+            member = own.get(receipt_id) if isinstance(own, dict) else None
+            if member is None:
+                raise StaleTransfermarktWrite('core page manifest lacks independent page clocks: ' + plan.table)
+            ordered = walks[receipt_id]
+            _expected_walk(member, receipt_id, ordered[0][-1], held=ordered)
+        if complete and receipt_id not in own and original:
+            _settle_statement(connection, (CORE_PAGES_TABLE, receipt_id), _digest(walks[receipt_id]),
+                              lambda: True, release=restore is not None, independent_postimage=True)
         versions = rules[receipt_id] = _walk_versions(saved[0]) if saved else (8, 7, 6)
         for cells in walk:
             url, capture_id, clock, body_hash, count, digest, acknowledged_at = cells[5:]
@@ -1370,12 +1382,12 @@ def _stored_walk(connection, receipt_id: str):
     return tuple(sorted(walk, key=lambda cells: cells[3]))
 
 
-def _record_pages(connection, plan: NativeWritePlan, receipt_id: str, committed_at: str) -> None:
+def _record_pages(connection, plan: NativeWritePlan, receipt_id: str, committed_at: str, repair=False) -> None:
     """Log the walk the acknowledgement stands for, once and as a whole."""
     stored = _stored_walk(connection, receipt_id)
     complete = stored if stored and len(stored) == len(plan.pages) else None
     rows = _walk_rows(plan, receipt_id, committed_at, held=complete)
-    _log_walk(connection, plan.table, receipt_id, rows, stored=stored)
+    _log_walk(connection, plan.table, receipt_id, rows, stored=stored, repair=repair)
 
 
 def _held_page_numbers(stored, expected, table):
@@ -1389,7 +1401,7 @@ def _held_page_numbers(stored, expected, table):
 _UNREAD_WALK = object()
 
 
-def _log_walk(connection, table: str, receipt_id: str, rows, *, stored=_UNREAD_WALK) -> None:
+def _log_walk(connection, table: str, receipt_id: str, rows, *, stored=_UNREAD_WALK, repair=False) -> None:
     """Log the pages of a walk its receipt still lacks.
 
     One statement carries every page the receipt lacks: they land whole or
@@ -1405,7 +1417,8 @@ def _log_walk(connection, table: str, receipt_id: str, rows, *, stored=_UNREAD_W
     if stored is not None:
         kept = _held_page_numbers(stored, expected, table)
         if len(kept) == len(expected):
-            _settle_statement(connection, key, _digest(expected), lambda: stored == expected)
+            _settle_statement(connection, key, _digest(expected), lambda: stored == expected,
+                              independent_postimage=repair)
             return
         rows = tuple(row for row, cells in zip(rows, expected, strict=True) if cells[3] not in kept)
     names = ', '.join(PAGES_COLUMNS)
@@ -1413,7 +1426,7 @@ def _log_walk(connection, table: str, receipt_id: str, rows, *, stored=_UNREAD_W
     sql = f'INSERT INTO {CORE_PAGES_TABLE} ({names}) VALUES ' + ', '.join([marks] * len(rows))
     _insert_once(
         connection, key, sql, tuple(value for row in rows for value in row),
-        lambda: _stored_walk(connection, receipt_id), expected)
+        lambda: _stored_walk(connection, receipt_id), expected, repair=repair)
 
 
 def _walk_versions(walk):
@@ -1786,7 +1799,7 @@ def _replay_state(connection, plan: NativeWritePlan, receipt_id: str = '',
         existing = _read_plan_rows(connection, plan)
         committed, planned = _by_capture(existing), _by_capture(plan.rows)
         if accepted is None:
-            accepted = _accepted_pages(connection, plan, own=(receipt_id,) if own is None else own)
+            accepted = _accepted_pages(connection, plan, own={receipt_id: plan} if own is None else own)
         _check_walk_digests(connection, plan, accepted, planned, committed, restoring, remember_rules)
         for page in plan.pages:
             rows = planned.setdefault(page[1], [])
@@ -2063,7 +2076,7 @@ def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_i
             raise RuntimeError('core receipt contradicts its earlier acknowledgement')
 
 
-_CTAS_ANALYSIS_ERRORS = {'TYPE_MISMATCH', 'COLUMN_NOT_FOUND', 'COLUMN_TYPE_UNKNOWN',
+_CTAS_ANALYSIS_ERRORS = {'TYPE_MISMATCH', 'COLUMN_NOT_FOUND', 'TABLE_NOT_FOUND', 'COLUMN_TYPE_UNKNOWN',
                          'COLUMN_NAME_NOT_SPECIFIED', 'DUPLICATE_COLUMN_NAME', 'SYNTAX_ERROR'}
 
 
@@ -2136,13 +2149,14 @@ def _statement_expected(statement):
 
 
 def _settle_statement(connection, key, expected, landed, *, release=True, target=False, require_finished=False,
-                      on_finished=None):
+                      on_finished=None, independent_postimage=False):
     statement = write_journal.pending_statement(key)
     if statement is None:
         return
     binding = _statement_expected(statement)
     observable = statement['observable'] and (not target or statement.get('target_preimage') is True)
-    matches = landed() if observable and binding == expected and not require_finished else None
+    may_observe = observable and not (require_finished or independent_postimage)
+    matches = landed() if may_observe and binding == expected else None
     applied = matches is True
     if not applied:
         outcome = _query_outcome(connection, statement)
@@ -2171,16 +2185,16 @@ def _execute_once(cursor, sql, bound, statement):
         raise
 
 
-def _insert_once(connection, key, sql, bound, read, expected) -> None:
+def _insert_once(connection, key, sql, bound, read, expected, *, repair=False) -> None:
     """Fence one physical INSERT until its previously missing cells land or Trino rejects it."""
     fingerprint = _digest(expected)
-    _settle_statement(connection, key, fingerprint, lambda: read() == expected)
+    _settle_statement(connection, key, fingerprint, lambda: read() == expected, independent_postimage=repair)
     if read() == expected:
         return
     cursor = connection.cursor()
     statement = None
     try:
-        statement = write_journal.begin_statement(key, {'single_submit': fingerprint})
+        statement = write_journal.begin_statement(key, {'single_submit': fingerprint}, observable=not repair)
         _execute_once(cursor, sql, bound, statement)
     except Exception as exc:
         if statement is None:
@@ -2188,14 +2202,14 @@ def _insert_once(connection, key, sql, bound, read, expected) -> None:
         if _definite_rejection(exc):
             write_journal.finish_statement(statement)
             raise
-        if read() != expected:
+        if repair or read() != expected:
             raise
     finally:
         cursor.close()
     write_journal.finish_statement(statement)
 
 
-def _merge_receipts(connection, receipts) -> None:
+def _merge_receipts(connection, receipts, *, repair=False) -> None:
     """Acknowledge the receipts the warehouse does not hold yet.
 
     A receipt is immutable: one already stored under the same id must equal
@@ -2212,7 +2226,7 @@ def _merge_receipts(connection, receipts) -> None:
         if earlier is not None:
             if earlier != expected:
                 raise RuntimeError('core receipt contradicts its earlier acknowledgement')
-            _settle_statement(connection, key, _digest(expected), lambda: True)
+            _settle_statement(connection, key, _digest(expected), lambda: True, independent_postimage=repair)
             continue
         bound = []
         for col in RECEIPT_COLUMNS:
@@ -2223,7 +2237,7 @@ def _merge_receipts(connection, receipts) -> None:
             bound.append(value)
         _insert_once(
             connection, key, f'INSERT INTO {CORE_RECEIPTS_TABLE} ({names}) VALUES ({marks})',
-            bound, lambda: _stored_receipts(connection, [expected[0]]).get(expected[0]), expected)
+            bound, lambda: _stored_receipts(connection, [expected[0]]).get(expected[0]), expected, repair=repair)
 
 
 def _verify_receipts(connection, receipts) -> None:
@@ -2395,7 +2409,7 @@ def _check_scope_owners(plans, bundle_owner):
         member_scopes = [_target_scope(member) for member in members]
         if len(set(member_scopes)) < 2:
             continue
-        if _partially_released(body, members, keys):
+        if _released_after_ack(body, members, keys):
             if not _intent_terminal(path, body['identity'], members, keys):
                 # Old DML uncertainty survives the release of packet ownership.
                 by_table = {}
@@ -2424,7 +2438,8 @@ def _check_scope_owners(plans, bundle_owner):
             raise _ScopePending('core scope acknowledgement is still pending: ' + plan.table, owner)
 
 
-def _partially_released(body, plans, receipt_ids):
+def _released_after_ack(body, plans, receipt_ids):
+    """An old releaser could stop after any unlink, including the last one."""
     identity = body['identity']
     if (not identity.get('single_submit') or identity.get('packet_attempt')
             or body['payload'].get('warehouse_identity') or len(plans) < 2):
@@ -2432,7 +2447,7 @@ def _partially_released(body, plans, receipt_ids):
     owner = receipt_ids[0]
     scopes = {_target_scope(p) for p in plans}
     held = {scope for scope in scopes if write_journal.scope_owner(scope) == owner}
-    if not held or held == scopes or write_journal._record_path('reserving-bundles', owner).exists():
+    if held == scopes or write_journal._record_path('reserving-bundles', owner).exists():
         return False
     hashes, descriptor = _bundle_identity(plans, identity['run_id'])
     ack = write_journal.read_receipt(identity['digest'])
@@ -2443,6 +2458,7 @@ def _partially_released(body, plans, receipt_ids):
             or ack.get('universe_version') != body['evidence'].get('universe_version')
             or ack.get('committed_batch') != _batch_id_for_run(identity['run_id'])
             or len(ack.get('plans', ())) != len(plans)
+            or not write_journal.acknowledgement_matches_inventory(identity['digest'], ack)
             or write_journal.read_snapshot_anchors(descriptor).keys() != _anchored_tables(plans)):
         return False
     # Unlinking an owner is post-ack evidence only after every bound
@@ -2463,7 +2479,7 @@ def _partially_released(body, plans, receipt_ids):
 
 
 def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bundle_owner, contested,
-                            historical_intent):
+                            historical_intent, *, repair):
     scope = _target_scope(plan)
     target = write_journal.pending_statement(scope)
     if target is not None:
@@ -2473,7 +2489,7 @@ def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bu
         owner = unit.get(expected)
 
         def record_finished(statement):
-            if historical_intent and owner.write_mode == 'replace':
+            if historical_intent:
                 write_journal.remember_terminal_target(historical_intent.stem, expected, statement)
 
         if owner is None:
@@ -2485,7 +2501,7 @@ def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bu
             write_journal.hold_scope(scope, bundle_owner)
         elif _settle_statement(connection, scope, expected, lambda: _target_matches(connection, owner),
                                release=False, target=True, require_finished=scope in contested,
-                               on_finished=record_finished):
+                               on_finished=record_finished, independent_postimage=repair):
             write_journal.hold_scope(scope, bundle_owner)
         write_journal.finish_statement(target)
     elif scope in contested and not _target_matches(connection, plan):
@@ -2495,16 +2511,17 @@ def _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, bu
         held = _stored_walk(connection, receipt_id)
         complete = held if held and len(held) == len(plan.pages) else None
         expected = _expected_walk(plan, receipt_id, committed_at, held=complete)
-        _settle_statement(connection, page_key, _digest(expected), lambda: held == expected)
+        _settle_statement(connection, page_key, _digest(expected), lambda: held == expected,
+                          independent_postimage=repair)
     key = (CORE_RECEIPTS_TABLE, receipt_id)
     statement = write_journal.pending_statement(key)
     if statement is not None:
         expected = _statement_expected(statement)
         _settle_statement(connection, key, expected, lambda: _digest(
-            _stored_receipts(connection, [receipt_id]).get(receipt_id)) == expected)
+            _stored_receipts(connection, [receipt_id]).get(receipt_id)) == expected, independent_postimage=repair)
 
 
-def _write_plan(connection, writer, plan, receipt_id, bundle_owner):
+def _write_plan(connection, writer, plan, receipt_id, bundle_owner, repair=False):
     if _uses_merge(plan) and not plan.rows:
         return
     before = _owned_rows(connection, plan)
@@ -2514,7 +2531,8 @@ def _write_plan(connection, writer, plan, receipt_id, bundle_owner):
     if write_journal.scope_owner(scope) == bundle_owner and _rows_equal(before, plan.rows):
         return  # this unit already dispatched its target and only lacks ops evidence
     previous = getattr(_LOCAL, 'target', None)
-    _LOCAL.target = (scope, receipt_id, _strictly_additive(connection, plan, before), bundle_owner)
+    observable = not repair and _strictly_additive(connection, plan, before)
+    _LOCAL.target = (scope, receipt_id, observable, bundle_owner)
     try:
         if not plan.rows or getattr(writer, 'dispatches_journalled_target', False) is True:
             _mutate_plan(connection, writer, plan)
@@ -2548,7 +2566,7 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
                                 _statement_expected(target))
         required = {scope} if verify_only and target else contested
         _settle_plan_statements(connection, plan, receipt_id, committed_at, unit, receipt_ids[0], required,
-                                historical_intent)
+                                historical_intent, repair=repair is not None)
     if not verify_only:
         execute_statement(connection.cursor(), core_receipts_ddl())
         if any(plan.pages for plan in plans):
@@ -2577,8 +2595,9 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
         _held_page_numbers(held or (), expected, plan.table)
         # Preflight the fence of every historical INSERT before the first
         # repair. In particular an absent walk cannot settle a queued INSERT.
-        _settle_statement(connection, (CORE_PAGES_TABLE, receipt_id),
-                          _digest(expected), lambda: held == expected, release=False)
+        _settle_statement(connection, (CORE_PAGES_TABLE, receipt_id), _digest(expected),
+                          lambda: held == expected, release=False,
+                          independent_postimage=repair is not None or member is None)
         restorations[receipt_id] = (plan.table, rows, 'differs' if surviving else 'lost')
         return expected
 
@@ -2620,15 +2639,15 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
     for key, (table, rows, _reason) in restorations.items():
         write_journal.hold_scope((rows[0][1], rows[0][2]), receipt_ids[0])
         if key in unit:
-            _record_pages(connection, unit[key], key, committed_at)
+            _record_pages(connection, unit[key], key, committed_at, repair is not None)
         else:
-            _log_walk(connection, table, key, rows)
+            _log_walk(connection, table, key, rows, repair=True)
         if _stored_walk(connection, key) != tuple(_walk_cells(row) for row in rows):
             raise RuntimeError('core page manifest differs: ' + table)
     for (plan, state), receipt_id in zip(states, receipt_ids, strict=True):
         if state == 'written' or _target_scope(plan) in contested:
             continue
-        _write_plan(connection, writer, plan, receipt_id, receipt_ids[0])
+        _write_plan(connection, writer, plan, receipt_id, receipt_ids[0], repair is not None)
     if repair is None or needs_write:
         for scope in scopes:
             write_journal.hold_scope(scope, receipt_ids[0])
@@ -2636,7 +2655,7 @@ def _commit_plans(connection, writer, plans, repair=None, receipt_ids=(), commit
         # The logged walk follows the snapshot it belongs to; a snapshot that
         # is written is logged under its own acknowledgement.
         if plan.pages and state != 'written':
-            _record_pages(connection, plan, receipt_id, committed_at)
+            _record_pages(connection, plan, receipt_id, committed_at, repair is not None)
     # Like the receipts, the walk is acknowledged only once it reads back: a
     # snapshot whose pages did not reach the warehouse is not written.
     for plan, receipt_id in zip(plans, receipt_ids, strict=True):
@@ -2812,33 +2831,90 @@ def _legacy_proof_scopes(connection, table, receipt, proofs, warehouse):
     raise RuntimeError('finished pre-upgrade scope evidence is still pending: ' + table)
 
 
-def _missing_ack_targets(connection, identity):
+def _missing_ack_overlaps(connection, identity, plans):
+    """Exclude a table using anchors, or an edition using a complete, bound warehouse member."""
     digest = identity['digest']
-    anchors = write_journal.read_snapshot_anchors(digest)
-    if anchors:
-        return set(anchors) - {_RECEIPTS_ANCHOR_NAME, _PAGES_ANCHOR_NAME}
+    targets = set(write_journal.read_snapshot_anchors(digest)) - {_RECEIPTS_ANCHOR_NAME, _PAGES_ANCHOR_NAME}
+    requested = {plan.table for plan in plans}
+    # Separate finished attempts can share one warehouse identity. A
+    # surviving full scope inventory for a table applies to all of them.
+    for inventory in write_journal.guard_inventories():
+        if inventory['digest'] == digest:
+            for plan in plans:
+                guard = inventory['guards'].get(plan.table)
+                if guard:
+                    if guard['digest'] != digest or guard['table'] != plan.table or not guard['scopes']:
+                        raise RuntimeError('finished pre-upgrade scope evidence differs')
+                    if _scope_json(plan) in guard['scopes']:
+                        return True
+                    requested.discard(plan.table)
+    if not requested:
+        return False
+    if targets and requested.isdisjoint(targets):
+        return False
+    if len(targets) > 1:
+        return True
     run = identity.get('run_id')
-    if not run:
-        return set()
-    # A surviving single-plan receipt can prove the entire packet identity
-    # without an anchor. Merely finding a member of a larger packet cannot.
+    if run:
+        predicate, bound = 'run_id = ?', (run,)
+    elif targets:
+        predicate, bound = 'target_table = ?', ('iceberg.bronze.' + next(iter(targets)),)
+    else:
+        return True
     cursor = connection.cursor()
     try:
-        rows = _query_rows(cursor, f'SELECT receipt_id, plan_sha256, target_table, entity FROM {CORE_RECEIPTS_TABLE} '
-                           'WHERE run_id = ?', (run,))
+        rows = _query_rows(cursor, f'SELECT receipt_id, plan_sha256, run_id, target_table, entity, scope_values_json, '
+                           f'committed_at, source_capture_id, captured_at, source_body_hash '
+                           f'FROM {CORE_RECEIPTS_TABLE} WHERE {predicate}', bound)
     except Exception as exc:
         if write_journal._table_not_found(exc):
-            return set()
+            return True
         raise
     finally:
         cursor.close()
-    members = [(h, t, entity) for key, h, t, entity in rows if key == _receipt_id(h, run, digest)]
-    if len(members) == 1:
-        plan_hash, table, entity = members[0]
-        if (_digest({'plans': [plan_hash], 'run_id': run}) == digest
-                and table == 'iceberg.bronze.' + _entity_registry(entity)['table']):
-            return {table.rsplit('.', 1)[-1]}
-    return set()
+    members = [row for row in rows if row[0] == _receipt_id(row[1], row[2], digest)]
+    if len(members) != 1:
+        return True
+    key, plan_hash, run, full_table, entity, scope, acknowledged_at, capture, captured_at, body = members[0]
+    # Only a complete bundle hash rules out an unobserved sibling scope.
+    if _digest({'plans': [plan_hash], 'run_id': run}) != digest:
+        return True
+    contract = _entity_registry(entity)
+    table = contract['table']
+    if full_table != 'iceberg.bronze.' + table or targets and targets != {table}:
+        return True
+    if table not in requested:
+        return False
+    if entity not in _MULTI_PAGE_REPLACE_ENTITIES:
+        return True
+    # A receipt's scope string alone can drift. Bind every page to the
+    # receipt ID, table, canonical scope and original edition route.
+    from scrapers.transfermarkt import core, sections
+
+    walk = _stored_walk(connection, key)
+    if not walk:
+        return True
+    try:
+        pairs = json.loads(scope)
+        values = dict(pairs)
+        if (list(values) != list(contract['scope_columns']) or not all(map(_nonempty, values.values()))
+                or write_journal._canonical(list(values.items())).decode() != scope):
+            return True
+        for number, row in enumerate(walk, 1):
+            if (row[:5] != (key, full_table, scope, number, len(walk))
+                    or sections._attendance_page_number(row[5]) != number):
+                return True
+            core._check_scope_against_capture(entity, values, SimpleNamespace(url=row[5], endpoint='attendance'))
+    except (ValueError, TypeError, KeyError):
+        return True
+    overlaps = any(p.table == table and _scope_json(p) == scope for p in plans)
+    if overlaps:
+        if any(row[-1] != _page_cell('acknowledged_at', acknowledged_at) for row in walk):
+            raise RuntimeError('core page manifest acknowledgement clock differs: ' + table)
+        named = (capture, _page_cell('captured_at', captured_at), body)
+        if sum(row[6:9] == named for row in walk) != 1:
+            raise RuntimeError('core page manifest named capture differs: ' + table)
+    return overlaps
 
 
 def _publish_scope_guards(migration, guards):
@@ -2864,7 +2940,8 @@ def _finished_legacy_scopes(connection, plans, identities, *, run_id, acknowledg
         if entry['status'] != 'finished':
             continue
         completion = write_journal.completed_intent(entry['digest'])
-        if completion and completion['terminal'] and completion['digest'] == identity.get('digest'):
+        if (completion and completion['terminal'] and completion['digest'] == identity.get('digest')
+                and write_journal._record_path('receipts', completion['digest']).exists()):
             continue
         digest = identity.get('digest')
         if not digest:
@@ -2875,19 +2952,23 @@ def _finished_legacy_scopes(connection, plans, identities, *, run_id, acknowledg
             raise RuntimeError('finished pre-upgrade migration differs')
         inventory_path = write_journal._record_path('guard-inventories', entry['digest'])
         inventory = write_journal._read_record(inventory_path) if inventory_path.exists() else None
-        receipt = write_journal.read_receipt(digest)
         if inventory is not None:
-            if receipt is not None and inventory['acknowledgement'] != _digest(receipt):
-                raise RuntimeError('finished pre-upgrade acknowledgement differs')
             guards = inventory['guards']
             _publish_scope_guards(migration, guards)
-            if receipt is None and any(p.table in guards and _scope_json(p) in guards[p.table]['scopes']
-                                       for p in plans):
-                raise RuntimeError('finished pre-upgrade acknowledgement is still pending')
+            if any(p.table in guards and _scope_json(p) in guards[p.table]['scopes'] for p in plans):
+                receipt = write_journal.read_receipt(digest)
+                if receipt is None:
+                    raise RuntimeError('finished pre-upgrade acknowledgement is still pending')
+                if inventory['acknowledgement'] != _digest(receipt):
+                    raise RuntimeError('finished pre-upgrade acknowledgement differs')
+            continue
+        receipt = write_journal.read_receipt(digest)
+        if receipt is not None and not write_journal.acknowledgement_matches_inventory(digest, receipt):
+            if _missing_ack_overlaps(connection, identity, plans):
+                raise RuntimeError('finished pre-upgrade acknowledgement differs')
             continue
         if receipt is None:
-            targets = _missing_ack_targets(connection, identity)
-            if targets and requested.isdisjoint(targets):
+            if not _missing_ack_overlaps(connection, identity, plans):
                 continue
             raise RuntimeError('finished pre-upgrade acknowledgement is still pending')
         if receipt['plan_sha256'] != digest or receipt['run_id'] != identity.get('run_id', receipt['run_id']):
@@ -2937,17 +3018,21 @@ def _finished_legacy_scopes(connection, plans, identities, *, run_id, acknowledg
             **migration, 'acknowledgement': _digest(receipt), 'guards': guards})
         _publish_scope_guards(migration, guards)
     bound_hashes, bound_digest = _bundle_identity(plans, run_id)
-    for plan, plan_hash in zip(plans, bound_hashes, strict=True):
-        key = _receipt_id(plan_hash, run_id, bound_digest)
+    keys = [_receipt_id(plan_hash, run_id, bound_digest) for plan_hash in bound_hashes]
+    bound_targets = set()
+    for plan, key in zip(plans, keys, strict=True):
         target = write_journal.pending_statement(_target_scope(plan))
-        bound = ((target and _statement_expected(target) == key)
-                 or historical_intent and write_journal.terminal_target(historical_intent.stem, key))
+        if ((target and _statement_expected(target) == key)
+                or historical_intent and write_journal.terminal_target(historical_intent.stem, key)):
+            bound_targets.add(key)
+    for plan, key in zip(plans, keys, strict=True):
+        rowless_member = historical_intent is not None and bool(bound_targets) and not plan.rows and _uses_merge(plan)
         for path in (write_journal._root() / 'legacy-scopes' / plan.table).glob('*.json'):
             guard = write_journal._read_record(path)
             if guard['table'] != plan.table:
                 raise RuntimeError('finished pre-upgrade scope evidence differs')
             if _scope_json(plan) in guard['scopes']:
-                if not acknowledged and not bound and guard['digest'] not in identities \
+                if not acknowledged and key not in bound_targets and not rowless_member and guard['digest'] not in identities \
                         and guard['warehouse'] not in identities:
                     raise StaleTransfermarktWrite('finished pre-upgrade core statement outcome is still pending')
                 # Exact read-only verification is allowed; later DML remains
@@ -3000,7 +3085,7 @@ def _pre_upgrade_pending(plans, paths, descriptor_digest, *, acknowledged, recei
         if len(descriptors) > 1 and body['identity'].get('single_submit'):
             members, hashes, digest = _intent_unit(body)
             keys = [_receipt_id(h, body['identity']['run_id'], digest) for h in hashes]
-            if _partially_released(body, members, keys):
+            if _released_after_ack(body, members, keys):
                 continue
         warehouse = body['payload'].get('warehouse_identity') or body['identity']
         adoption = write_journal._record_path('single-submit-adoptions', path.stem)
@@ -3059,6 +3144,8 @@ def _retire_abandoned_stage(connection, writer, path, record):
     stage = path.stem
     qualified = 'iceberg.bronze.' + stage
     _stage_identity(path.parent.name, record['table'], stage, record)
+    if write_journal.stage_in_use(record):
+        return
     create = write_journal.pending_statement(('stage-create', qualified))
     if create and _statement_expected(create) != qualified:
         raise RuntimeError('core retained stage identity differs')
@@ -3139,8 +3226,10 @@ def _complete_packet(plans, receipt_ids, paths):
     _release_packet(plans, owner, paths)
 
 
-def _terminal_packet(path, receipt_ids):
-    return path is not None and all(write_journal.terminal_target(path.stem, key) for key in receipt_ids)
+def _terminal_packet(path, plans, receipt_ids):
+    return path is not None and all(write_journal.terminal_target(path.stem, key)
+                                    for plan, key in zip(plans, receipt_ids, strict=True)
+                                    if plan.rows or plan.write_mode == 'replace')
 
 
 def _commit_bundle(
@@ -3156,6 +3245,7 @@ def _commit_bundle(
     """
     with writer_deadline(deadline), journalled_write(), writer_lock():
         _validate_bundle(plans, run_id, universe_version, committed_at)
+        write_journal.check_dispatch_bindings()
         if len(set(plan_hashes)) != len(plan_hashes):
             # One acknowledgement never stands for two plans of a bundle.
             raise ValueError('duplicate core receipt identity across plans')
@@ -3207,6 +3297,8 @@ def _commit_bundle(
                 c and (c['digest'] not in keys or c['owner'] != receipt_ids[0]) for c in completed)):
             raise RuntimeError('core completed intent acknowledgement differs')
         if stored is not None:
+            if not write_journal.acknowledgement_matches_inventory(digest, stored):
+                raise RuntimeError('finished pre-upgrade acknowledgement differs')
             if stored.get('plan_sha256') != digest:
                 raise RuntimeError('core journal receipt plan_sha256 differs')
             if stored['run_id'] != run_id or stored['committed_batch'] != batch:
@@ -3236,7 +3328,7 @@ def _commit_bundle(
                 raise RuntimeError('core journal receipt warehouse identity differs')
             if write_journal.read_snapshot_anchors(receipt_digest).keys() != _anchored_tables(plans):
                 raise RuntimeError('core acknowledged snapshot anchors differ')
-            if len(pending) == 1 and not any(completed) and _partially_released(pending[0][1], plans, receipt_ids):
+            if len(pending) == 1 and not any(completed) and _released_after_ack(pending[0][1], plans, receipt_ids):
                 _complete_packet(plans, receipt_ids, paths)
                 if journaled:
                     return stored
@@ -3305,9 +3397,9 @@ def _commit_bundle(
                     repair(receipt_only=verify_only)
                     if not verify_only:
                         write_journal.reserve_scopes((_target_scope(plan) for plan in plans), receipt_ids[0])
-                _merge_receipts(connection, plan_receipts)
+                _merge_receipts(connection, plan_receipts, repair=True)
                 _verify_receipts(connection, plan_receipts)
-                settled = not verify_only or _terminal_packet(historical_intent, receipt_ids)
+                settled = not verify_only or _terminal_packet(historical_intent, plans, receipt_ids)
                 if settled:
                     _clean_stages(connection, writer, plans, receipt_ids, run_id)
             finally:
@@ -3335,6 +3427,8 @@ def _commit_bundle(
                 raise RuntimeError('core pending intent metadata differs')
             committed_at = evidence.get('committed_at', committed_at)
         elif not journaled:
+            if write_journal.read_snapshot_anchors(digest):
+                raise RuntimeError('core anchored acknowledgement is still pending')
             paths.append(write_journal.save_intent(
                 {'run_id': run_id, 'digest': digest, 'statement_protocol': 1, 'single_submit': True,
                  'scope_protocol': 1, 'packet_attempt': uuid4().hex},
@@ -3362,8 +3456,9 @@ def _commit_bundle(
                               batch, committed_at)
                 for plan, proof, plan_hash in zip(plans, proofs, plan_hashes, strict=True)
             ]
-            may_acknowledge = not verify_only or _terminal_packet(historical_intent, receipt_ids)
-            _merge_receipts(connection, plan_receipts)
+            may_acknowledge = not verify_only or _terminal_packet(historical_intent, plans, receipt_ids)
+            if may_acknowledge:
+                _merge_receipts(connection, plan_receipts)
             _verify_receipts(connection, plan_receipts)
             if may_acknowledge:
                 _clean_stages(connection, writer, plans, receipt_ids, run_id)
@@ -3417,6 +3512,7 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
     """
     receipts = []
     with writer_lock():
+        write_journal.check_dispatch_bindings()
         pending = write_journal.pending_intents({'run_id': run_id} if run_id else {})
     failures = {}
     while pending:
@@ -3450,6 +3546,7 @@ def replay_pending_intents(connection_factory, writer, *, run_id: str | None = N
         # member of this pass. Never repeat an ambiguous dispatch on error.
         pending = [(path, body) for path, body in deferred if failures[path].owner in completed]
     with writer_lock(), journalled_write():
+        write_journal.check_dispatch_bindings()
         connection = None
         try:
             for path in (write_journal._root() / 'abandoned-stages').glob('*/*.json'):

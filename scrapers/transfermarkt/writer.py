@@ -52,10 +52,11 @@ def _stage_create(stage):
         yield statement
     except Exception as exc:
         coordinator = exc.__cause__
-        if (_definite_rejection(exc)
-                or isinstance(coordinator, TrinoQueryError)
-                and coordinator.error_name in _CTAS_ANALYSIS_ERRORS
-                and coordinator.query_id and coordinator.query_id == write_journal.statement_query(statement)):
+        analysis_rejected = (isinstance(coordinator, TrinoQueryError)
+                             and coordinator.error_name in _CTAS_ANALYSIS_ERRORS
+                             and coordinator.query_id
+                             and coordinator.query_id == write_journal.statement_query(statement))
+        if _definite_rejection(exc) or analysis_rejected:
             write_journal.finish_statement(statement)
         raise
     write_journal.finish_statement(statement)
