@@ -72,6 +72,14 @@ def assert_natural_keys(rows: list[dict[str, Any]], key_fields: tuple[str, ...])
     return None
 
 
+def _round_id(item: Mapping[str, Any], where: str) -> str:
+    round_id = _required_id(item, "round", where)
+    slug = item.get("slug")
+    if slug is None or not str(slug).strip():
+        return round_id
+    return f"{round_id}:{str(slug).strip()}"
+
+
 def _round_is_current(item: Mapping[str, Any], current_round: Mapping[str, Any]) -> bool:
     if not current_round:
         return False
@@ -105,7 +113,7 @@ def parse_rounds(
         where = f"{endpoint}[{index}]"
         _required_mapping(item, where)
         row = {
-            "round_id": _required_id(item, "round", where),
+            "round_id": _round_id(item, where),
             "source_tournament_id": str(source_tournament_id),
             "source_season_id": str(source_season_id),
         }
