@@ -1112,6 +1112,24 @@ def finish_statement(statement, *, outcome='returned'):
     _unlink_record(settled)
 
 
+def finish_predecessor(statement):
+    """Clean up a writer-verified attempt under the shared lock."""
+    key = statement['key']
+    if read_statement(key) == statement:
+        # Also recreates the marker after a crash immediately following the
+        # returned-operation transition.
+        finish_statement(statement)
+        return
+    # Dispatch files can be gone or already belong to a new owner. Remove
+    # this attempt's mapping while its operation and marker still exist.
+    _unlink_record(_record_path('statement-queries', statement['attempt']))
+    path = _settled_path(key)
+    if path.exists():
+        marker = _read_record(path)
+        if marker.get('statement', marker) == statement:
+            _unlink_record(path)
+
+
 def _scope_owner_path(scope):
     return _record_path('scope-owners', hashlib.sha256(_canonical(scope)).hexdigest())
 

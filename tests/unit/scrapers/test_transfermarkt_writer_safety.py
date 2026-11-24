@@ -1389,7 +1389,7 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
                                       'general-before-receipt-reservation', 'exact-step-predecessor',
                                       'retired-receipt-predecessor', 'reserved-general-predecessor',
                                       'reserved-worklist-predecessor', 'reserved-step-predecessor', 'completed-worklist-predecessor',
-                                      'completed-worklist-empty'])
+                                      'completed-worklist-empty', 'returned-before-marker'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1429,6 +1429,17 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
             assert body['payload']['predecessor_head'] == native_writer._digest(head)
         else:
             assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
+    elif boundary == 'returned-before-marker':
+        # Round 38 finding 7
+        with monkeypatch.context() as patch:
+            native._capture_returned_queries(patch, db, [native_writer.CORE_RECEIPTS_TABLE])
+            saved = native._r37_capture_settlement(
+                patch, 'statement-queries', lambda key: key == [native_writer.CORE_RECEIPTS_TABLE, members[0]])
+            native.write(db, plans)
+        record, pending, attempt, _, mapping = saved
+        for path in (record, pending, attempt, mapping):
+            path.write_bytes(saved[path])
+        db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE receipt_id=?', (members[-1],))
     elif boundary.startswith('completed-worklist-'):
         # Round 37 finding 1
         # Round 36 finding 1
