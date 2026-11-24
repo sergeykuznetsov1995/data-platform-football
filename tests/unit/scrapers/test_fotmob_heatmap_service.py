@@ -53,14 +53,20 @@ def _service(tmp_path, responses, *, store=None, repository=None,
     return service, repository, store, transport, session
 
 
-def _live(tmp_path, body=None):
+def _live(tmp_path, body=None, parent=None):
     if body is None:
         body = encode(payload())
+    if parent is None:
+        parent = PARENT
     setup = _service(tmp_path, [
-        FakeResponse(200, encode(PARENT)), FakeResponse(200, body),
+        FakeResponse(200, encode(parent)), FakeResponse(200, body),
     ])
     result = setup[0].sync_match_payloads(bundle())
     return (*setup, result)
+
+
+def _parent_with_players(players):
+    return {**PARENT, "content": {**PARENT["content"], "playerStats": players}}
 
 
 def _rows(repository, suffix):
@@ -77,6 +83,10 @@ def _assets(repository):
 
 def _points(repository):
     return _rows(repository, "heatmap_points")
+
+
+def _identities(repository):
+    return _rows(repository, "heatmap_player_identities")
 
 
 def _commits(repository, target_type):
@@ -101,6 +111,12 @@ def _outcome(result, expected):
 def _no_rows(repository):
     assert _assets(repository) == []
     assert _points(repository) == []
+    assert _identities(repository) == []
+
+
+def _candidate_ids(row):
+    value = row["candidate_fotmob_player_ids_json"]
+    return json.loads(value) if isinstance(value, str) else list(value)
 
 
 def _parent_success(repository):
@@ -177,6 +193,186 @@ def test_success_publishes_separate_heatmap_manifest_and_typed_rows(tmp_path):
                 "network_fetched", "decoded", "typed", "typed_rows"):
         assert report[key] == 1, key
     assert report["replayed"] == 0
+
+
+def test_identity_match_uses_opta_id_without_changing_legacy_points(tmp_path):
+    parent = _parent_with_players({
+        "200": {"id": 200, "optaId": "20", "name": "Opta match"},
+        "20": {"id": 20, "optaId": "999", "name": "FotMob collision"},
+    })
+    _, repository, _, _, _, result = _live(tmp_path, parent=parent)
+
+    assert result.succeeded == 1
+    point, = _points(repository)
+    assert (point["player_key"], point["player_id"]) == ("p20", 20)
+    identity, = _identities(repository)
+    assert identity["match_id"] == 100
+    assert identity["player_key"] == "p20"
+    assert identity["player_key_suffix"] == 20
+    assert identity["match_status"] == "verified"
+    assert identity["identity_status"] == "matched"
+    assert identity["candidate_count"] == 1
+    assert identity["fotmob_player_id"] == 200
+    assert identity["identity_basis"] == "playerStats.optaId.unique"
+    assert identity["resolver_version"] == "player_stats_opta_id_v1"
+    assert _candidate_ids(identity) == [200]
+
+    heatmap_commit = _commits(repository, "heatmap")[-1]
+    identity_commit = _commits(repository, "heatmap_identity")[-1]
+    parent_commit = _commits(repository, "match")[-1]
+    assert identity["heatmap_batch_id"] == heatmap_commit.batch_id
+    assert identity["asset_content_hash"] == heatmap_commit.content_hash
+    assert identity["parent_content_hash"] == parent_commit.content_hash
+    assert identity["parent_raw_uri"] == parent_commit.raw_uri
+    assert identity_commit.target_key != heatmap_commit.target_key
+    assert identity_commit.batch_id != heatmap_commit.batch_id
+
+
+@pytest.mark.parametrize(
+    "players,expected_status,expected_count,expected_candidates",
+    [
+        ({"20": {"id": 20, "optaId": "999"}}, "missing", 0, []),
+        (
+            {
+                "200": {"id": 200, "optaId": "20"},
+                "201": {"id": 201, "optaId": "20"},
+            },
+            "ambiguous",
+            2,
+            [200, 201],
+        ),
+    ],
+    ids=["missing", "duplicate-ambiguous"],
+)
+def test_identity_missing_and_ambiguous_preserve_points_without_guessing(
+    tmp_path, players, expected_status, expected_count, expected_candidates
+):
+    _, repository, _, _, _, result = _live(
+        tmp_path, parent=_parent_with_players(players)
+    )
+
+    assert result.succeeded == 1
+    assert len(_points(repository)) == 1
+    identity, = _identities(repository)
+    assert identity["player_key"] == "p20"
+    assert identity["match_status"] == "verified"
+    assert identity["identity_status"] == expected_status
+    assert identity["candidate_count"] == expected_count
+    assert identity["fotmob_player_id"] is None
+    assert _candidate_ids(identity) == expected_candidates
+
+
+def test_identity_includes_zero_circle_players(tmp_path):
+    players = {
+        "200": {"id": 200, "optaId": "20"},
+        "300": {"id": 300, "optaId": "3"},
+    }
+    body = encode(payload({"p20": "", "p3": CIRCLE}))
+    _, repository, _, _, _, result = _live(
+        tmp_path, body=body, parent=_parent_with_players(players)
+    )
+
+    assert result.succeeded == 1
+    assert len(_points(repository)) == 1
+    identities = {row["player_key"]: row for row in _identities(repository)}
+    assert set(identities) == {"p20", "p3"}
+    assert identities["p20"]["identity_status"] == "matched"
+    assert identities["p20"]["fotmob_player_id"] == 200
+    assert identities["p3"]["fotmob_player_id"] == 300
+
+
+def test_parent_change_updates_only_identity_batch(tmp_path):
+    first_parent = _parent_with_players({"200": {"id": 200, "optaId": "20"}})
+    _, repository, store, _, _, first = _live(tmp_path, parent=first_parent)
+    assert first.succeeded == 1
+    first_heatmap = _commits(repository, "heatmap")[-1]
+    first_identity = _commits(repository, "heatmap_identity")[-1]
+    second_parent = _parent_with_players({"201": {"id": 201, "optaId": "20"}})
+    service, _, _, _, session = _service(
+        tmp_path,
+        [FakeResponse(200, encode(second_parent)), FakeResponse(200, encode(payload()))],
+        store=store,
+        repository=repository,
+    )
+    second = service.sync_match_payloads(bundle(), force_refresh=True)
+
+    assert second.succeeded == 1
+    second_heatmap = _commits(repository, "heatmap")[-1]
+    second_identity = _commits(repository, "heatmap_identity")[-1]
+    assert second_heatmap.batch_id == first_heatmap.batch_id
+    assert second_identity.batch_id != first_identity.batch_id
+    assert len(_assets(repository)) == 1
+    assert len(_points(repository)) == 1
+    assert len(_identities(repository)) == 2
+    assert _identities(repository)[-1]["fotmob_player_id"] == 201
+    _calls(session, 2)
+
+
+def test_identity_failure_does_not_fallback_to_previous_parent(tmp_path, monkeypatch):
+    first_parent = _parent_with_players({"200": {"id": 200, "optaId": "20"}})
+    _, repository, store, _, _, first = _live(tmp_path, parent=first_parent)
+    assert first.succeeded == 1
+    first_identity = _identities(repository)[0]
+    second_parent = _parent_with_players({"201": {"id": 201, "optaId": "20"}})
+    service, _, _, _, session = _service(
+        tmp_path,
+        [FakeResponse(200, encode(second_parent)), FakeResponse(200, encode(payload()))],
+        store=store,
+        repository=repository,
+    )
+    original_commit = service._commit_for_fetch
+    commit_signature = signature(original_commit)
+
+    @wraps(original_commit)
+    def fail_identity_write(*args, **kwargs):
+        arguments = commit_signature.bind(*args, **kwargs).arguments
+        if arguments["target_type"] == "heatmap_identity":
+            raise OSError("synthetic identity failure")
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_commit_for_fetch", fail_identity_write)
+    second = service.sync_match_payloads(bundle(), force_refresh=True)
+
+    assert second.succeeded == 1
+    second_parent_commit = _commits(repository, "match")[-1]
+    assert second_parent_commit.content_hash != first_identity["parent_content_hash"]
+    assert not any(
+        row["parent_content_hash"] == second_parent_commit.content_hash
+        for row in _identities(repository)
+    )
+    assert _commits(repository, "heatmap")[-1].batch_id == first_identity["heatmap_batch_id"]
+    _outcome(second, "success")
+    _calls(session, 2)
+
+
+def test_new_heatmap_snapshot_replaces_whole_identity_set(tmp_path):
+    parent = _parent_with_players({
+        "200": {"id": 200, "optaId": "20"},
+        "300": {"id": 300, "optaId": "3"},
+    })
+    _, repository, store, _, _, first = _live(tmp_path, parent=parent)
+    assert first.succeeded == 1
+    first_identity = _commits(repository, "heatmap_identity")[-1]
+    service, _, _, _, session = _service(
+        tmp_path,
+        [FakeResponse(200, encode(parent)), FakeResponse(200, encode(payload({"p3": CIRCLE})))],
+        store=store,
+        repository=repository,
+    )
+    second = service.sync_match_payloads(bundle(), force_refresh=True)
+
+    assert second.succeeded == 1
+    latest = _commits(repository, "heatmap_identity")[-1]
+    assert latest.batch_id != first_identity.batch_id
+    current = [
+        row for row in _identities(repository)
+        if row["_target_batch_id"] == latest.batch_id
+    ]
+    assert {row["player_key"] for row in current} == {"p3"}
+    assert current[0]["fotmob_player_id"] == 300
+    assert len(_identities(repository)) == 2
+    assert len(_points(repository)) == 2
+    _calls(session, 2)
 
 
 def test_first_missing_url_does_not_create_heatmap_state(tmp_path):
@@ -329,6 +525,7 @@ def test_replay_reuses_batch_and_preserves_physical_rows_and_observation_time(tm
     _, repository, store, _, _, first = _live(tmp_path)
     _outcome(first, "success")
     original = _commits(repository, "heatmap")[-1]
+    original_identity = _commits(repository, "heatmap_identity")[-1]
     counts = {table: len(rows) for table, rows in repository.tables.items()}
     observed = {
         table: [row["_observed_at"] for row in rows]
@@ -349,6 +546,7 @@ def test_replay_reuses_batch_and_preserves_physical_rows_and_observation_time(tm
     assert report["replayed"] == report["fetched"] == report["typed_rows"] == 1
     assert report["network_fetched"] == 0
     assert _commits(repository, "heatmap")[-1].batch_id == original.batch_id
+    assert _commits(repository, "heatmap_identity")[-1].batch_id == original_identity.batch_id
     assert {table: len(rows) for table, rows in repository.tables.items()} == counts
     assert {
         table: [row["_observed_at"] for row in rows]
@@ -494,4 +692,36 @@ def test_writer_failure_cannot_report_unpublished_child_as_success(tmp_path, mon
     report = _outcome(result, "unknown")
     assert report["typed"] == report["typed_rows"] == 0
     _no_rows(repository)
+    _calls(session, 2)
+
+
+def test_identity_writer_failure_preserves_successful_heatmap(tmp_path, monkeypatch):
+    service, repository, _, _, session = _service(tmp_path, [
+        FakeResponse(200, encode(PARENT)), FakeResponse(200, encode(payload())),
+    ])
+    original_commit = service._commit_for_fetch
+    commit_signature = signature(original_commit)
+
+    @wraps(original_commit)
+    def fail_identity_write(*args, **kwargs):
+        arguments = commit_signature.bind(*args, **kwargs).arguments
+        if arguments["target_type"] == "heatmap_identity":
+            raise OSError("synthetic identity writer failure")
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_commit_for_fetch", fail_identity_write)
+    result = service.sync_match_payloads(bundle())
+
+    assert result.succeeded == 1
+    assert result.errors or result.retryable
+    assert "synthetic identity writer failure" in str((result.errors, result.retryable))
+    _parent_success(repository)
+    assert _commits(repository, "heatmap")[-1].status == ManifestStatus.SUCCESS
+    assert not any(
+        commit.status == ManifestStatus.SUCCESS
+        for commit in _commits(repository, "heatmap_identity")
+    )
+    assert len(_assets(repository)) == 1
+    assert len(_points(repository)) == 1
+    _outcome(result, "success")
     _calls(session, 2)

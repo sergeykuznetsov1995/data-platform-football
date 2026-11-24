@@ -45,6 +45,64 @@ URL; неверный тип `content` — ошибка формы.
 Порядок игроков и кругов исходный; одинаковые круги остаются отдельными строками.
 Пустые игроки входят в `player_count`.
 
+### Identity игроков (#2367)
+
+`fotmob_heatmap_points.player_id` — legacy numeric suffix исходного `player_key`,
+а не подтверждённый FotMob player ID. Старые точки, их natural key и batch identity
+не меняются. Для связи с игроком используется отдельная таблица
+`fotmob_heatmap_player_identities` с natural key `(match_id, player_key)` внутри
+полного identity-снимка. Схема таблицы фиксирована, чтобы первый снимок только
+с `not_attempted` не закрепил типы nullable-колонок через all-NULL inference.
+Игрок с пустым фрагментом получает identity-строку без point rows; строки parent
+без ключа в heatmap не создаются.
+
+Resolver `player_stats_opta_id_v1` сравнивает digit-string после `p` со
+`str(playerStats.optaId)` того же матча; ведущие нули значимы. Fallback по FotMob
+ID, имени, команде или порядку записей запрещён. `match_status` принимает
+`verified`/`mismatch`/`unverified`, `identity_status` —
+`matched`/`missing`/`ambiguous`/`not_attempted`. При выполненном поиске 0/1/2+
+кандидатов даёт `missing`/`matched`/`ambiguous` и соответствующий
+`candidate_count`. Только `matched` получает `fotmob_player_id` из той же parent
+записи. `identity_basis` фиксирует основание/причину,
+`candidate_fotmob_player_ids_json` — численно отсортированный массив кандидатов,
+`NULL` при `not_attempted`. Missing/ambiguous/not_attempted не создают
+произвольную связь и не удаляют исходные точки.
+
+`heatmap_batch_id` связывает identity с неизменным legacy batch. Отдельный
+`target_type=heatmap_identity` и synthetic target key не смешивают dedup двух
+типов. Identity batch зависит от версии resolver, parent content hash и heatmap
+batch, поэтому смена parent при неизменном heatmap обновляет только identity.
+Отсутствие parent raw provenance не создаёт identity batch. Current выбирает целый
+последний успешный identity-снимок по `(target_type, entity_id)`, затем применяет
+natural key; исчезнувшие ключи не воскресают. Обогащать точки можно только по
+`match_id`, дословному `player_key`, равенству `points._target_batch_id =
+identity.heatmap_batch_id` и равенству `identity.parent_content_hash` хешу текущего
+parent payload. При сбое новой identity прежняя версия другого parent не
+подставляется: условие по parent hash отсекает её даже при неизменном heatmap batch.
+
+Ошибка identity commit не меняет уже успешный parent/heatmap outcome и не
+дублирует их строки. Повтор той же parent+heatmap пары сохраняет оба batch ID и
+не создаёт новых physical rows. Откат кода не требует удаления side table или
+миграции points: прежний reader игнорирует identity и продолжает читать старые
+heatmap tables/batches. Само production-создание таблицы — отдельный разрешённый шаг.
+
+Offline evidence 24.11: после разрешения владельца из raw-хранилища прочитаны
+ровно шесть объектов одного завершённого run `fotmob-20261118T150425.516799Z`:
+parent и heatmap матчей 5181902, 5181903, 5181930. Новых запросов к FotMob HTTP
+не было; Trino query `20261124_165358_83421_dyben`. Независимый stdlib-разбор
+проверил parent match ID, heatmap wrapper match ID, content hashes и исходные
+player keys. По трём полным raw-парам получено 94 ключа / 4341 точка:
+`matched=94`, `missing=0`, `ambiguous=0` по `playerStats.optaId`; по FotMob `id` —
+`matched=0`, `missing=94`, `ambiguous=0`. Во всех 94 matched Opta и FotMob ID
+различаются. Например `p194827` означает Opta `194827`, но FotMob `566753`
+(Rey Manaj); `p517997` — Opta `517997`, FotMob `1208969` (Kristjan Asllani);
+`p61824` — Opta `61824`, FotMob `150747` (Etrit Berisha). Кандидат повторил все
+94 связи, не изменил ни одной исходной точки и сохранил unknown semantics.
+Воспроизводимые inputs, скрипт и детерминированные outputs находятся в
+`.local/tasks/2367-heatmap-identity-evidence/authorized-raw-pairs/`;
+`raw_pair_verified=true`. Это доказательство для проверенного формата
+`p<digits>`, а не утверждение о других возможных форматах ключей.
+
 Template должен быть корректным SVG с конечным четырёхчисловым viewBox и
 положительными width/height. Сохраняется точная исходная запись атрибута viewBox,
 включая пробельные символы и character references до XML-нормализации; числа

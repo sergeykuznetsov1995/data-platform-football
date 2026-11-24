@@ -1,5 +1,6 @@
 """Publish heatmaps after the parent match commit, without undoing that commit."""
 
+import json
 from dataclasses import asdict, replace
 from hashlib import sha256
 from typing import Any
@@ -7,16 +8,24 @@ from typing import Any
 from scrapers.fotmob.heatmaps import (
     AssetMetadata,
     FetchOrigin,
+    HEATMAP_IDENTITY_RESOLVER_VERSION,
     HeatmapObservation,
     HeatmapOutcome,
     classify_heatmap_fetch,
     extract_heatmap_reference,
     observation_from_parse,
     parse_heatmap,
+    resolve_heatmap_players,
 )
 from scrapers.fotmob.match_refresh import match_time
 from scrapers.fotmob.planner import BudgetExceeded, RunMode
-from scrapers.fotmob.repository import ManifestStatus, TableRows, utc_now
+from scrapers.fotmob.repository import (
+    PARSER_VERSION,
+    ManifestStatus,
+    TableRows,
+    deterministic_target_batch_id,
+    utc_now,
+)
 from scrapers.fotmob.transport import FetchResult
 
 
@@ -310,6 +319,74 @@ def sync_match_heatmap(
                     },
                 )
             )
+            if not parent_fetch.content_hash or not parent_fetch.raw_uri:
+                _defer(operation, deferred, match_id, "identity parent.raw_provenance.missing")
+                return paths
+            try:
+                heatmap_batch_id = deterministic_target_batch_id(
+                    reference.target.target_key, fetch.content_hash, PARSER_VERSION
+                )
+                identity_rows = resolve_heatmap_players(
+                    parent_fetch.data,
+                    match_id,
+                    parsed.player_keys,
+                    metadata,
+                    heatmap_batch_id=heatmap_batch_id,
+                    parent_content_hash=parent_fetch.content_hash,
+                    parent_raw_uri=parent_fetch.raw_uri,
+                )
+                identity_dicts = []
+                for identity in identity_rows:
+                    row = asdict(identity)
+                    row["match_status"] = identity.match_status.value
+                    row["identity_status"] = identity.identity_status.value
+                    row["_observed_at"] = timestamp
+                    identity_dicts.append(row)
+                identity_observation = sha256(json.dumps(
+                    [
+                        HEATMAP_IDENTITY_RESOLVER_VERSION,
+                        parent_fetch.content_hash,
+                        heatmap_batch_id,
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                identity_target_key = sha256(
+                    f"heatmap-identity:{reference.target.target_key}".encode("utf-8")
+                ).hexdigest()
+                identity_fetch = replace(fetch, target_key=identity_target_key)
+                paths.extend(
+                    service._commit_for_fetch(
+                        identity_fetch,
+                        target_type="heatmap_identity",
+                        competition_id=match["competition_id"],
+                        source_season_key=match["source_season_key"],
+                        entity_id=str(match_id),
+                        datasets=(
+                            TableRows(
+                                "fotmob_heatmap_player_identities",
+                                identity_dicts,
+                                "heatmap_player_identities",
+                            ),
+                        ),
+                        expected_counts={
+                            "heatmap_player_identities": len(identity_dicts),
+                        },
+                        observation_id=identity_observation,
+                        capabilities={
+                            "heatmap_target_key": reference.target.target_key,
+                            "heatmap_batch_id": heatmap_batch_id,
+                            "parent_content_hash": parent_fetch.content_hash,
+                            "resolver_version": HEATMAP_IDENTITY_RESOLVER_VERSION,
+                        },
+                    )
+                )
+            except Exception as exc:
+                operation.record_exception(
+                    f"match {match_id}: heatmap identity processing failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    exc,
+                )
         else:
             _commit_outcome(
                 service, match, match_id, fetch, operation, paths, parsed.outcome,
