@@ -1364,7 +1364,7 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
     assert not list(journal.retained_stages(operation['operation']['member']))
 
 
-@pytest.mark.parametrize('boundary', ['original', 'repair', 'rejected-mapped'])
+@pytest.mark.parametrize('boundary', ['original', 'repair', 'rejected-mapped', 'rejected-cleanup'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1386,8 +1386,9 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
         db.sql.execute(f'DELETE FROM {native.RECEIPTS}')
     hashes, digest = native_writer._bundle_identity(plans, 'run-1')
     members = [native_writer._receipt_id(h, 'run-1', digest) for h in hashes]
-    if boundary == 'rejected-mapped':
-        native._restore_rejected_tail_mapping(monkeypatch, db, plans, members[-1])
+    if boundary.startswith('rejected-'):
+        # Round 22 finding 3
+        native._restore_rejected_tail_mapping(monkeypatch, db, plans, members[-1], cleanup=boundary == 'rejected-cleanup')
     else:
         with monkeypatch.context() as patch:
             submitted = native._interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'first',

@@ -516,6 +516,17 @@ def submission_retired(head):
     return False
 
 
+def reservation_released(head):
+    """A no-POST retirement marker precedes the individual ownership unlinks."""
+    if not head.get('reservation') or 'statement' in head:
+        return False
+    owner = head['owner']
+    watermark = _read_record(_packet_watermark(owner))
+    return (watermark.get('released') is True and watermark.get('scopes') == head['scopes']
+            and not _record_path('reserving-bundles', owner).exists()
+            and all(scope_owner(scope) != owner for scope in head['scopes']))
+
+
 def submission_is_current(head):
     if head.get('superseded'):
         return False
@@ -779,9 +790,6 @@ def bind_pending_operation(statement, operation):
 
 def retire_operations(scopes, owner):
     head = submission_head(owner)
-    if head and head.get('reservation') and not head.get('statement'):
-        _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head['scopes'],
-                                                 'released': True}, replace=True)
     for scope in scopes:
         for record in scope_operations(scope):
             operation = record['operation']
@@ -802,6 +810,9 @@ def retire_operations(scopes, owner):
                                                          'retired': statement['attempt']},
                               replace=True)
             _unlink_record(_operation_path(scope, record['key'], operation['member']))
+    if head and head.get('reservation') and not head.get('statement'):
+        _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head['scopes'],
+                                                 'released': True}, replace=True)
 
 
 def _unlink_record(path):
@@ -811,11 +822,13 @@ def _unlink_record(path):
 
 
 def _check_settled(marker, statement):
+    """Validate the cleanup marker and report a mapped rejection that must stay pending."""
     # Older markers held just the statement. A marker is cleanup evidence
     # only after its own operation crossed the durable settlement boundary.
     if marker.get('statement', marker) != statement:
         raise RuntimeError('core settled statement binding differs')
-    query_id = statement_query(statement)
+    mapped = statement_query(statement)
+    query_id = mapped
     operation = _statement_operation(statement)
     if operation is not None:
         current = latest_operation(operation['scope'], statement['key'], operation['member'])
@@ -826,6 +839,13 @@ def _check_settled(marker, statement):
         query_id = current.get('query_id', query_id)
     if 'statement' in marker and (query_id is not None or operation) and marker['query_id'] != query_id:
         raise RuntimeError('core settled query binding differs')
+
+    # The writer authenticates a restored rejected receipt against the current
+    # submission and coordinator before allowing its cleanup to finish.
+    if operation is not None and current['state'] == 'rejected' and mapped is not None:
+        from .native_writer import CORE_RECEIPTS_TABLE
+        return statement['key'] == [CORE_RECEIPTS_TABLE, operation['member']]
+    return False
 
 
 def pending_statement(key):
@@ -838,14 +858,13 @@ def pending_statement(key):
             statement = marker.get('statement', marker)
             if statement['key'] != list(key):
                 raise RuntimeError('core settled statement key differs')
-            _check_settled(marker, statement)
-            _unlink_record(settled)
+            if not _check_settled(marker, statement):
+                _unlink_record(settled)
         return None
     statement = _read_record(path if path.exists() else binding)
     if statement['key'] != list(key):
         raise RuntimeError('core pending statement key differs')
-    if marker is not None:
-        _check_settled(marker, statement)
+    keep_mapping = marker is not None and _check_settled(marker, statement)
     if binding.exists():
         if _read_record(binding) != statement:
             raise RuntimeError('core pending statement binding differs')
@@ -853,7 +872,7 @@ def pending_statement(key):
         _immutable_record(binding, statement)
     if not path.exists():
         _immutable_record(path, statement)
-    if marker is not None:
+    if marker is not None and not keep_mapping:
         finish_statement(statement)
         return None
     return statement
