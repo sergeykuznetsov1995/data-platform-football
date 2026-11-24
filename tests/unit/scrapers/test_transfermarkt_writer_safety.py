@@ -1134,8 +1134,9 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt, 
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(b.table,)]
 
 
-@pytest.mark.parametrize('legacy_observable', [False, True])
-def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, legacy_observable):
+@pytest.mark.parametrize('roster_receipt', [True, False])
+@pytest.mark.parametrize('legacy_observable', [False, True, 'already-observed'])
+def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, legacy_observable, roster_receipt):
     # Round 16 finding 1
     import shutil
     from dataclasses import replace
@@ -1162,6 +1163,10 @@ def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, le
         patch.setattr(native_writer, '_write_plan', snapshot)
         ack = native.write(db, plans)
     assert native._receipt_count(db) == 3
+    # Round 17 finding 1
+    if not roster_receipt:
+        db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE entity=?', (roster.entity,))
+        assert native._receipt_count(db) == 2
     root.rename(tmp_path / 'published')
     shutil.copytree(backup, root)
     warehouse = _TombstoneWarehouse(roster.table, [dict(r) for r in roster.rows])
@@ -1202,14 +1207,21 @@ def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, le
         with pytest.raises(TrinoAmbiguousWriteError):
             replay()
     target = journal.pending_statement(scope)
-    assert target['observable'] is legacy_observable and journal.statement_query(target) == 'q_target_merge'
+    assert target['observable'] is bool(legacy_observable) and journal.statement_query(target) == 'q_target_merge'
     db.sql.execute("INSERT INTO test_query_history VALUES ('q_target_merge', 'QUEUED', NULL)")
     warehouse.engine.execute(f'INSERT INTO {roster.table} SELECT * FROM exact')
     native._copy_warehouse_scope(warehouse, db, roster)
     assert counts() == (38, 38)
+    if legacy_observable == 'already-observed':
+        # An earlier writer could have released the observation-based fence
+        # before the packet's surviving receipt evidence was considered.
+        with native_writer.writer_lock():
+            journal.note_observed(target)
+            journal.finish_statement(target)
     with pytest.raises(RuntimeError, match='still pending'):
         replay()
-    assert journal.pending_statement(scope) == target and journal.read_receipt(ack['plan_sha256']) is None
+    assert journal.pending_statement(scope) == (None if legacy_observable == 'already-observed' else target)
+    assert journal.read_receipt(ack['plan_sha256']) is None
     assert native.write(db, [native._club_plan('77', 'disjoint', native.NEWEST)], run_id='other',
                         clock=native.NEWEST)['verified']
     submission, = queued
@@ -1221,7 +1233,7 @@ def test_all_squad_receipts_survive_pre_target_restore(tmp_path, monkeypatch, le
     assert counts() == (76, 38) and journal.read_receipt(ack['plan_sha256']) is None
 
 
-@pytest.mark.parametrize('boundary', ['old_receipt', 'old_target'])
+@pytest.mark.parametrize('boundary', ['old_receipt', 'old_target', 'after_publication'])
 def test_pair_restore_fences_queued_attendance_merge(tmp_path, monkeypatch, boundary):
     # Round 16 finding 2
     from tests.unit.scrapers import test_transfermarkt_native_writer as native
@@ -1237,7 +1249,7 @@ def test_pair_restore_fences_queued_attendance_merge(tmp_path, monkeypatch, boun
 
     def backup_finished(statement, **options):
         table = statement['key'][0]
-        if table == (native_writer.CORE_RECEIPTS_TABLE if boundary == 'old_receipt' else scope[0]):
+        if table == {'old_receipt': native_writer.CORE_RECEIPTS_TABLE, 'old_target': scope[0]}.get(boundary):
             journal.remember_query(statement, boundary)
             db.sql.execute('INSERT INTO test_query_history VALUES (?, ?, NULL)', (boundary, 'FINISHED'))
             native._backup_pair(backup)
@@ -1246,6 +1258,9 @@ def test_pair_restore_fences_queued_attendance_merge(tmp_path, monkeypatch, boun
     with monkeypatch.context() as patch:
         patch.setattr(journal, 'finish_statement', backup_finished)
         ack = native.write(db, [plan])
+    # Round 17 finding 2
+    if boundary == 'after_publication':
+        native._backup_pair(backup)
     warehouse = _TombstoneWarehouse(plan.table, [dict(row) for row in old.rows])
     warehouse.lost = True
     native._copy_warehouse_scope(warehouse, db, old)
@@ -1275,12 +1290,15 @@ def test_pair_restore_fences_queued_attendance_merge(tmp_path, monkeypatch, boun
             retry()
         native._restore_pair(backup, tmp_path / 'queued')
         start = len(db.events)
-        for call in (replay, replay, retry):
+        if boundary == 'after_publication':
+            assert not journal.pending_intents({}) and replay() == []
+        for call in ((retry,) if boundary == 'after_publication' else (replay, replay, retry)):
             with pytest.raises(RuntimeError, match='still pending'):
                 call()
         with pytest.raises(native.StaleTransfermarktWrite):
             native.write(db, [native._snapshot(native.NEWEST, 'fresh')], run_id='fresh', clock=native.NEWEST)
-        assert native_writer._target_matches(db, old) and journal.read_receipt(ack['plan_sha256']) is None
+        assert native_writer._target_matches(db, old)
+        assert bool(journal.read_receipt(ack['plan_sha256'])) == (boundary == 'after_publication')
         assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
         submission, = submissions
         execute(submission)
@@ -1288,6 +1306,48 @@ def test_pair_restore_fences_queued_attendance_merge(tmp_path, monkeypatch, boun
         db.sql.execute("UPDATE test_query_history SET state='FINISHED' WHERE query_id='q_target_merge'")
         assert native_writer._target_matches(db, plan)
         with pytest.raises(RuntimeError, match='still pending'):
-            replay()
-        assert journal.read_receipt(ack['plan_sha256']) is None and len(submissions) == 1
+            retry()
+        assert bool(journal.read_receipt(ack['plan_sha256'])) == (boundary == 'after_publication')
+        assert len(submissions) == 1
     assert native.write(db, [native._attendance_edition(plan, '2024')], run_id='disjoint')['verified']
+
+
+def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
+    # Round 17 finding 7
+    from tests.unit.scrapers import test_transfermarkt_native_writer as native
+
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    db, journal = native.CoreDB(), native_writer.write_journal
+    old, plan = native._snapshot(native.EARLIER, 'old'), native._snapshot(native.CLOCK, 'next')
+    native.write(db, [old], run_id='old', clock=native.EARLIER)
+    warehouse = _TombstoneWarehouse(plan.table, [dict(row) for row in old.rows])
+    warehouse.lost = True
+    production = writer.TransfermarktIcebergWriter()
+    production._trino_manager = _scripted(warehouse)
+    monkeypatch.setattr(production._trino_manager, 'table_exists', lambda *args: True)
+    monkeypatch.setattr(native.IcebergWriter, '_evolve_schema', lambda *args: None)
+    sentinel = plan.table + '__stg_tm_' + 'a' * 32
+    warehouse.engine.execute(f'CREATE TABLE {sentinel} AS SELECT * FROM {plan.table}')
+    scope = native_writer._target_scope(plan)
+    finish = journal.finish_statement
+
+    def stop(statement, **kwargs):
+        finish(statement, **kwargs)
+        if statement['key'] == list(scope):
+            native._copy_warehouse_scope(warehouse, db, plan)
+            raise RuntimeError('before stage DROP')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(journal, 'finish_statement', stop)
+        with pytest.raises(RuntimeError, match='before stage DROP'):
+            native_writer.write_core_bundle(lambda: db, production, [plan], run_id='run-1',
+                                            universe_version='core-universe-v1', committed_at=native.CLOCK)
+    operation, = journal.scope_operations(scope)
+    assert operation['state'] == 'returned' and operation['query_id'] == 'q_target_merge'
+    stage = operation['statement']['stage']
+    assert (stage,) in warehouse.engine.execute('SHOW TABLES').fetchall()
+    (journal._root() / 'stages').rename(tmp_path / 'old-registry')
+    assert native_writer.replay_pending_intents(lambda: db, production)[0]['verified']
+    assert native_writer.replay_pending_intents(lambda: db, production) == []
+    assert set(warehouse.engine.execute('SHOW TABLES').fetchall()) == {(plan.table,), (sentinel,)}
+    assert not list(journal.retained_stages(operation['operation']['member']))

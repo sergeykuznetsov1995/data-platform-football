@@ -88,8 +88,12 @@ def _immutable_record(path: Path, payload: Mapping) -> None:
 
 
 def _read_record(path: Path) -> dict:
+    return _decode_record(path.read_bytes())
+
+
+def _decode_record(data: bytes) -> dict:
     try:
-        record = json.loads(path.read_bytes(), parse_constant=_invalid_json_number)
+        record = json.loads(data, parse_constant=_invalid_json_number)
         payload = record['payload']
         checksum = hashlib.sha256(_canonical(payload)).hexdigest()
         if isinstance(payload, dict) and record['sha256'] == checksum:
@@ -358,6 +362,30 @@ def _review_required_path(owner, intent):
     return _submission_path(owner).parent / 'review-required' / owner / (intent + '.json')
 
 
+def hold_restored_packet(owner, digest, scopes):
+    """Under the writer lock, quarantine a known storage restore before reopening the writer.
+
+    A volume restore may rewind all record bytes and their filesystem identities.
+    The restore operator supplies the affected packet. This record only denies
+    admission. It cannot establish the freshness of any submitted statement.
+    """
+    scopes = sorted(set(map(tuple, scopes)))
+    if not scopes or any(len(scope) != 2 or not all(isinstance(v, str) for v in scope) for scope in scopes):
+        raise ValueError('core restore hold requires exact packet scopes')
+    _immutable_record(_review_required_path(owner, digest), {'owner': owner, 'digest': digest, 'scopes': scopes})
+
+
+def restored_packet_hold(scopes):
+    root = _root()
+    directory = root.with_name(root.name + '.submissions') / 'review-required'
+    for path in directory.glob('*/*.json'):
+        record = _read_record(path)
+        if 'scopes' in record and not scopes.isdisjoint(map(tuple, record['scopes'])):
+            if path != _review_required_path(record['owner'], record['digest']):
+                raise RuntimeError('core restored packet review binding differs')
+            yield record
+
+
 def _packet_watermark(owner):
     root = _root()
     return root.with_name(root.name + '.attempts') / 'watermarks' / 'packets' / (owner + '.json')
@@ -373,28 +401,100 @@ def _watermark_binding(owner):
 def _save_submission(head):
     owner = head['owner']
     _store_record(_submission_path(owner), head, replace=True)
-    _store_record(_packet_watermark(owner), _watermark_binding(owner), replace=True)
+    _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head.get('scopes', [])},
+                  replace=True)
+
+
+def _replace_submission(head):
+    # Revoke the actual old inode before replacement. A renamed directory
+    # or a hard link can retain that inode across an atomic rename. Keeping
+    # such a generation must never preserve its right to authorize a POST.
+    path = _submission_path(head['owner'])
+    if path.exists():
+        with path.open('ab') as stream:
+            stream.write(b'\n{"superseded":true}\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+    _save_submission(head)
 
 
 def submission_head(owner):
     path = _submission_path(owner)
     if path.exists():
-        head = _read_record(path)
+        record, separator, _ = path.read_bytes().partition(b'\n')
+        head = _decode_record(record)
         if head['owner'] != owner:
             raise RuntimeError('core submission owner differs')
+        if separator:
+            # The first line is the immutable original record. Even a torn
+            # revocation suffix requires review before this inode can be used.
+            head['superseded'] = True
         return head
 
 
 def start_submissions(owner):
     """Establish a positive pre-dispatch boundary before saving the intent."""
     existing = submission_head(owner)
-    if existing is None:
+    binding = _packet_watermark(owner)
+    if existing is None and not binding.exists():
         _save_submission({'owner': owner})
-    elif 'statement' in existing or not submission_is_current(existing):
+    elif existing == {'owner': owner} and not binding.exists():
+        # start_submissions runs before the intent, anchors or first dispatch.
+        # Never replace a surviving (possibly conflicting) attempts binding.
+        _immutable_record(binding, _watermark_binding(owner))
+    elif existing != {'owner': owner} or not submission_is_current(existing):
         raise RuntimeError('core prior packet submission is still pending')
 
 
+def reserve_submission(scopes, owner, intent):
+    """Mirror the complete packet reservation before its individual scope guards."""
+    head = submission_head(owner)
+    if (head is None and _packet_watermark(owner).exists()) or (head and not submission_is_current(head)):
+        raise RuntimeError('core packet submission history is still pending')
+    scopes = [list(scope) for scope in sorted(set(scopes))]
+    head = head or {}
+    statement = head.get('statement')
+    previous_intent = statement['operation']['intent'] if statement else head.get('reservation')
+    if previous_intent == intent and head.get('scopes') == scopes:
+        return
+    if statement and _read_record(_packet_watermark(owner)).get('retired') == statement['attempt']:
+        # Start a new reservation, keeping the ordering across publication.
+        head = {'sequence': statement.get('sequence', 0), 'members': head.get('members', {})}
+    _replace_submission({**head, 'owner': owner, 'scopes': scopes, 'reservation': intent})
+
+
+def overlapping_submission(scopes, owner, descriptors):
+    """Route a missing descriptor or a rewound packet by its independent scopes."""
+    directory = _submission_path(owner).parent
+    bindings = _packet_watermark(owner).parent
+    for packet in {p.stem for d in (directory, bindings) for p in d.glob('*.json')} - {owner}:
+        binding = _packet_watermark(packet)
+        try:
+            head = submission_head(packet)
+        except RuntimeError:
+            # A damaged head still has an authenticated routing copy.
+            routed = _read_record(binding).get('scopes') if binding.exists() else None
+            if routed and scopes.isdisjoint(map(tuple, routed)):
+                continue
+            raise
+        statement = (head or {}).get('statement')
+        reserved = (head or {}).get('scopes') or ([statement['operation']['scope']] if statement else [])
+        if reserved and scopes.isdisjoint(map(tuple, reserved)):
+            continue
+        watermark = _read_record(binding) if binding.exists() else {}
+        if not reserved and scopes.isdisjoint(map(tuple, watermark.get('scopes', ()))):
+            continue
+        if head is None or not submission_is_current(head):
+            return packet
+        if packet not in descriptors and statement and watermark.get('retired') != statement['attempt']:
+            return packet
+        if packet not in descriptors and head.get('reservation') and not statement and not watermark.get('released'):
+            return packet
+
+
 def submission_is_current(head):
+    if head.get('superseded'):
+        return False
     owner = head['owner']
     path = _packet_watermark(owner)
     if not path.exists():
@@ -415,10 +515,14 @@ def submission_is_current(head):
     return watermark.get('retired') == statement['attempt']
 
 
-def confirm_reviewed_submission(owner):
-    # The caller verified the explicit decisions and the entire live packet.
-    if submission_head(owner) is not None:
-        _store_record(_packet_watermark(owner), _watermark_binding(owner), replace=True)
+def confirm_reviewed_submission(owner, decisions, scopes):
+    """Re-establish the packet head only after every reviewed postimage verified."""
+    previous = submission_head(owner)
+    statement = (previous or {}).get('statement') or max(
+        (d['statement'] for d in decisions.values()), key=lambda s: s.get('sequence', 0))
+    _replace_submission({'owner': owner, 'statement': statement,
+                         'members': {m: d['statement']['attempt'] for m, d in decisions.items()},
+                         'scopes': [list(scope) for scope in sorted(set(scopes))]})
 
 
 def _read_operation(path, scope, record=None):
@@ -449,6 +553,12 @@ def scope_operations(scope):
 def latest_operation(scope, key, member):
     path = _operation_path(scope, key, member)
     return _read_operation(path, scope) if path.exists() else None
+
+
+def packet_used_submissions(digests, run):
+    return any(identity.get('submission_protocol') and identity.get('run_id') == run
+               and identity.get('digest') in digests
+               for entry in _load_index() if (identity := entry.get('identity')))
 
 
 def published_intents(digest, receipt, descriptor):
@@ -521,6 +631,18 @@ def _check_reviewed_attempt(operation, decision):
     latest = head and head.get('statement')
     if latest and latest['operation']['member'] == operation['member'] and latest != statement:
         raise RuntimeError('core operator reconciliation attempt differs')
+    member = operation['member']
+    member_head = (head or {}).get('members', {}).get(member)
+    if member_head is not None and member_head != statement['attempt']:
+        raise RuntimeError('core operator reconciliation attempt differs')
+    others = [r['statement'] for r in scope_operations(operation['scope'])
+              if r['operation']['member'] == member and r.get('statement') and r['statement'] != statement]
+    if 'sequence' in statement:
+        if any(other.get('sequence', 0) >= statement['sequence'] for other in others):
+            raise RuntimeError('core operator reconciliation latest member attempt differs')
+    elif others and latest != statement:
+        # Pre-sequence packets can prove order only for the packet's last POST.
+        raise RuntimeError('core operator reconciliation latest member attempt differs')
     if (decision['operations_sha256'] != _member_operations_digest(operation)
             or not current or current.get('statement') != statement or current['operation'] != reviewed
             or any(reviewed[field] != operation[field] for field in ('scope', 'owner', 'member', 'plan_sha256'))
@@ -546,7 +668,8 @@ def statement_for_readback(scope, key, member):
     if statement:
         return statement
     current = latest_operation(scope, key, member)
-    if current and current['state'] == 'FINISHED':
+    if current and (current['state'] == 'FINISHED' or
+                    current['state'] == 'returned' and statement_query(current['statement']) is not None):
         return current['statement']
 
 
@@ -592,7 +715,8 @@ def _operation_transition(statement, state, query_id=None):
         return previous.get('query_id')  # resume interrupted statement cleanup
     record = {'key': statement['key'], 'statement': statement, 'operation': operation, 'state': state}
     if state == 'FINISHED':
-        if not query_id or statement_query(statement) not in (None, query_id):
+        if (not query_id or previous.get('query_id') not in (None, query_id)
+                or statement_query(statement) not in (None, query_id)):
             raise RuntimeError('core operation query binding differs')
         record['query_id'] = query_id
     elif state != 'dispatched' and (mapped := statement_query(statement)) is not None:
@@ -631,6 +755,9 @@ def bind_pending_operation(statement, operation):
 
 def retire_operations(scopes, owner):
     head = submission_head(owner)
+    if head and head.get('reservation') and not head.get('statement'):
+        _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head['scopes'],
+                                                 'released': True}, replace=True)
     for scope in scopes:
         for record in scope_operations(scope):
             operation = record['operation']
@@ -647,7 +774,8 @@ def retire_operations(scopes, owner):
                 _unlink_record(_record_path('operation-bindings', statement['attempt']))
             if statement and head and head.get('statement') == statement:
                 # Keep the last submit identity in the sibling after retirement.
-                _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'retired': statement['attempt']},
+                _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head.get('scopes', []),
+                                                         'retired': statement['attempt']},
                               replace=True)
             _unlink_record(_operation_path(scope, record['key'], operation['member']))
 
@@ -742,7 +870,8 @@ def check_dispatch_bindings(scopes=None):
                     current and current['operation']) if op}
         if affected and scopes is not None and affected.isdisjoint(scopes):
             continue
-        if (not current or current['state'] != 'FINISHED' or current['query_id'] != mapping['query_id']
+        if (not current or current['state'] not in ('FINISHED', 'returned')
+                or not current.get('query_id') or current['query_id'] != mapping['query_id']
                 or 'statement' in mapping and current['statement'] != statement):
             raise RuntimeError('unbound core statement outcome is still pending')
 
@@ -775,11 +904,18 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
     if operation is not None:
         owner = operation['owner']
         previous = submission_head(owner)
-        if previous and not submission_is_current(previous):
+        if ((previous is None and _packet_watermark(owner).exists())
+                or (previous and not submission_is_current(previous))):
             raise RuntimeError('core pre-publication operator reconciliation is still pending')
+        previous = previous or {}
+        last = previous.get('statement') or previous
+        statement['sequence'] = last.get('sequence', 0) + 1
     _operation_transition(statement, 'dispatched')
     if operation is not None:
-        _save_submission({'owner': owner, 'statement': statement})
+        members = dict(previous.get('members', {}))
+        members[operation['member']] = statement['attempt']
+        _replace_submission({'owner': owner, 'statement': statement, 'members': members,
+                            'scopes': previous.get('scopes') or [operation['scope']]})
     _immutable_record(_attempt_path(key), statement)
     _immutable_record(_statement_path(key), statement)
     return statement
