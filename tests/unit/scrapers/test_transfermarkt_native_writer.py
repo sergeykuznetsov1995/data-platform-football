@@ -7119,3 +7119,272 @@ def test_partial_release_leaves_foreign_target_settlement_to_its_owner(monkeypat
     assert write(db, _representation_packet(('9',), LATER), run_id='next-nine', clock=LATER)['verified']
     assert mapping.read_bytes() == mapping_bytes and marker.read_bytes() == marker_bytes
     assert write_journal._read_record(write_journal._statement_path(seven)) == foreign
+
+
+def _r26_snapshot(monkeypatch, directory, module, method, run):
+    original = getattr(module, method)
+
+    def capture(*args, **kwargs):
+        if not directory.exists():
+            shutil.copytree(write_journal._root(), directory)
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, method, capture)
+        return run()
+
+
+def _r26_members(ack):
+    return [native_writer._receipt_id(h, 'run-1', ack['plan_sha256']) for h in ack['identity']['plan_hashes']]
+
+
+def _r26_restore(snapshot):
+    root = write_journal._root()
+    displaced = snapshot.with_name('displaced')
+    root.rename(displaced)
+    snapshot.rename(root)
+    return displaced
+
+
+def _r26_file_bytes(paths):
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+@pytest.mark.parametrize('snapshot', ['publication', 'clean'])
+def test_active_target_requires_repair_descriptor_before_dml(tmp_path, monkeypatch, snapshot):
+    # Round 26 finding 1
+    db, plans = CoreDB(), _representation_packet(('7', '9'), CLOCK)
+    backup = tmp_path / 'original'
+    if snapshot == 'publication':
+        ack = _r26_snapshot(monkeypatch, backup, write_journal, 'complete_intent', lambda: write(db, plans))
+        write_journal._index_path().unlink()
+    else:
+        ack = write(db, plans)
+        shutil.copytree(write_journal._root(), backup)
+    owner, _ = _r26_members(ack)
+    table = plans[0].table
+    db.sql.execute(f"DELETE FROM {table} WHERE player_id='9'")
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, 'retire_operations', _r22_stop)
+        with pytest.raises(OSError):
+            write(db, plans)
+    head = write_journal.submission_head(owner)
+    assert write_journal.submission_is_current(head) and not write_journal.submission_retired(head)
+    assert bool(head['statement']['operation'].get('after_publication')) == (snapshot == 'clean')
+    _r26_restore(backup)
+    db.sql.execute(f"DELETE FROM {table} WHERE player_id='7'")
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (owner,))
+    protected = _r26_file_bytes([write_journal._submission_path(owner), write_journal._packet_watermark(owner),
+                                 *(path for path, _ in write_journal.pending_intents({}))])
+    writer, start = CoreWriter(db), len(db.events)
+    for replay in ([True, False] if snapshot == 'publication' else [False]):
+        with pytest.raises(StaleTransfermarktWrite, match='descriptor'):
+            _r20_recover(db, writer, plans, replay)
+    assert protected == _r26_file_bytes(protected)
+    assert _receipt_count(db) == 1 and not writer.writes
+    assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+
+
+@pytest.mark.parametrize('before_reservation', [False, True])
+def test_linked_target_verifies_siblings_before_local_cleanup(tmp_path, monkeypatch, before_reservation):
+    # Round 26 finding 2
+    db, plans = CoreDB(), _representation_packet(('7', '9'), CLOCK)
+    backup, scopes = tmp_path / 'original', [native_writer._target_scope(p) for p in plans]
+    if before_reservation:
+        ack = _r26_snapshot(monkeypatch, backup, write_journal, 'reserve_scopes', lambda: write(db, plans))
+    else:
+        release = write_journal.release_scope
+
+        def snapshot_release(scope, owner):
+            release(scope, owner)
+            if scope == scopes[0]:
+                shutil.copytree(write_journal._root(), backup)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(write_journal, 'release_scope', snapshot_release)
+            ack = write(db, plans)
+    owner, tail = _r26_members(ack)
+    db.sql.execute(f"DELETE FROM {plans[0].table} WHERE player_id='7'")
+    with pytest.raises(TrinoAmbiguousWriteError):
+        _r20_recover(db, _LostResponse(db), plans, False)
+    statement = write_journal.pending_statement(scopes[0])
+    displaced = _r26_restore(backup)
+    for directory in ('pending-statements', 'dispatch-attempts', 'statement-queries'):
+        shutil.copytree(displaced / directory, write_journal._root() / directory, dirs_exist_ok=True)
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (tail,))
+    protected = _r26_file_bytes([
+        write_journal._record_path('reserving-bundles', owner), *(write_journal._scope_owner_path(s) for s in scopes),
+        write_journal._statement_path(scopes[0]), write_journal._attempt_path(scopes[0]),
+        write_journal._record_path('statement-queries', statement['attempt']),
+        write_journal._operation_path(scopes[0], scopes[0], owner),
+    ])
+    assert write_journal.statement_query(statement) == 'q_lost_merge'
+    writer, start = CoreWriter(db), len(db.events)
+    for replay in (True, False):
+        with pytest.raises(RuntimeError, match='receipt readback'):
+            _r20_recover(db, writer, plans, replay)
+        assert _r26_file_bytes(protected) == protected
+    assert not writer.writes and not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+
+
+@pytest.mark.parametrize('later_post', [False, True])
+@pytest.mark.parametrize('completed', [False, True])
+def test_linked_receipt_worklist_routes_before_completion_or_predecessor(tmp_path, monkeypatch, later_post, completed):
+    # Round 26 finding 3
+    db, plans = CoreDB(), _representation_packet(('7', '9'), CLOCK)
+    ack = write(db, plans)
+    owner, tail = _r26_members(ack)
+    backup = tmp_path / 'worklist'
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (tail,))
+    module, method = (write_journal, 'retire_operations') if completed else (native_writer, '_merge_receipts')
+    assert _r26_snapshot(monkeypatch, backup, module, method, lambda: write(db, plans)) == ack
+    table = plans[1].table
+    db.sql.execute(f"CREATE TABLE exact AS SELECT * FROM {table} WHERE player_id='9'")
+    db.sql.execute(f"DELETE FROM {table} WHERE player_id='9'")
+    with monkeypatch.context() as patch:
+        if later_post:
+            patch.setattr(write_journal, 'retire_operations', _r22_stop)
+        else:
+            patch.setattr(native_writer, '_write_plan', _r22_stop)
+        with pytest.raises(OSError):
+            write(db, plans)
+    if not later_post:
+        db.sql.execute(f'INSERT INTO {table} SELECT * FROM exact')
+        assert write(db, plans) == ack
+    _r26_restore(backup)
+    (path, _), = write_journal.pending_intents({})
+    head = write_journal.submission_head(owner)
+    assert path.stem in (head['statement']['operation'] if later_post else head)['after_publication']
+    assert bool(write_journal.completed_intent(path.stem)) == completed
+    db.sql.execute(f'CREATE TABLE exact_receipt AS SELECT * FROM {RECEIPTS} WHERE receipt_id=?', (owner,))
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (owner,))
+    writer, start = CoreWriter(db), len(db.events)
+    for replay in (True, False):
+        with pytest.raises(RuntimeError, match='receipt readback'):
+            _r20_recover(db, writer, plans, replay)
+        assert path.exists() and len(list(write_journal.bundle_reservations())) == 1
+    db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM exact_receipt')
+    assert _r20_recover(db, writer, plans, completed) == ack
+    assert not path.exists() and not list(write_journal.bundle_reservations())
+    assert not writer.writes and not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert write(db, _representation_packet(('7',), LATER), run_id='next-seven', clock=LATER)['verified']
+
+
+@pytest.mark.parametrize('worklist', [False, True])
+@pytest.mark.parametrize('replay', [False, True])
+def test_interrupted_obsolete_release_checks_only_remaining_tagged_member(tmp_path, monkeypatch, worklist, replay):
+    # Round 26 finding 4
+    db, plans = CoreDB(), _representation_packet(('7', '9'), CLOCK)
+    ack = write(db, plans)
+    members = _r26_members(ack)
+    table = plans[1].table
+    backup = tmp_path / 'obsolete'
+    if worklist:
+        db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (members[1],))
+    else:
+        db.sql.execute(f"DELETE FROM {table} WHERE player_id='9'")
+    assert _r26_snapshot(monkeypatch, backup, native_writer, '_merge_receipts' if worklist else '_write_plan',
+                         lambda: write(db, plans)) == ack
+    db.sql.execute(f"DELETE FROM {table} WHERE player_id='9'")
+    assert write(db, plans) == ack
+    _r26_restore(backup)
+    scopes = [native_writer._target_scope(p) for p in plans]
+    guards = [write_journal._scope_owner_path(s) for s in scopes]
+    unlink = write_journal._unlink_record
+
+    def stop_after_owner(path):
+        unlink(path)
+        if path in guards:
+            _r22_stop()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(write_journal, '_unlink_record', stop_after_owner)
+        with pytest.raises(OSError):
+            _r20_recover(db, CoreWriter(db), plans, True)
+    released, = [i for i, guard in enumerate(guards) if not guard.exists()]
+    remaining = 1 - released
+
+    class QueuedWriter(CoreWriter):
+        dispatches_journalled_target = True
+
+        def _write_to_iceberg(self, *args, **kwargs):
+            _submit_lost_merge(self.db, query_id='foreign-target')
+
+    later = _representation_packet(plans[released].scope_values, LATER)
+    with pytest.raises(TrinoAmbiguousWriteError):
+        native_writer.write_core_bundle(lambda: db, QueuedWriter(db), later, run_id='foreign-target',
+                                        universe_version='core-universe-v1', committed_at=LATER)
+    foreign = write_journal.pending_statement(scopes[released])
+    protected = _r26_file_bytes([write_journal._statement_path(scopes[released]),
+                                 write_journal._attempt_path(scopes[released]),
+                                 write_journal._record_path('statement-queries', foreign['attempt'])])
+    db.sql.execute(f'CREATE TABLE remaining_receipt AS SELECT * FROM {RECEIPTS} WHERE receipt_id=?',
+                   (members[remaining],))
+    db.sql.execute(f'DELETE FROM {RECEIPTS} WHERE receipt_id=?', (members[remaining],))
+    writer, start = CoreWriter(db), len(db.events)
+    with pytest.raises(RuntimeError, match='receipt readback'):
+        _r20_recover(db, writer, plans, replay)
+    assert guards[remaining].exists() and _r26_file_bytes(protected) == protected
+    db.sql.execute(f'INSERT INTO {RECEIPTS} SELECT * FROM remaining_receipt')
+    if replay:
+        assert _r20_recover(db, writer, plans, True) == ack
+    else:
+        with pytest.raises(StaleTransfermarktWrite) as conflict:
+            _r20_recover(db, writer, plans, False)
+        assert conflict.value.owner == foreign['operation']['owner']
+    assert not guards[remaining].exists() and not write_journal.pending_intents({'run_id': 'run-1'})
+    assert not writer.writes and not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert write(db, _representation_packet(plans[remaining].scope_values, LATER), run_id='next', clock=LATER)['verified']
+    assert _r26_file_bytes(protected) == protected
+
+
+@pytest.mark.parametrize('replay', [True, False])
+def test_retired_target_remnants_verified_before_finishing_publication(tmp_path, monkeypatch, replay):
+    # Round 26 finding 5
+    db, plans = CoreDB(), _representation_packet(('7', '9'), CLOCK)
+    backup = tmp_path / 'publication'
+    ack = _r26_snapshot(monkeypatch, backup, write_journal, 'complete_intent', lambda: write(db, plans))
+    members = _r26_members(ack)
+    scopes = [native_writer._target_scope(p) for p in plans]
+    records = [write_journal._operation_path(s, s, m) for s, m in zip(scopes, members)]
+    unlink = write_journal._unlink_record
+
+    def stop_retired(path):
+        if path in records and write_journal.submission_retired(write_journal.submission_head(members[0])):
+            _r22_stop()
+        unlink(path)
+
+    db.sql.execute(f'DELETE FROM {plans[0].table}')
+    with monkeypatch.context() as patch:
+        retire = write_journal.retire_operations
+        order = list(reversed(scopes)) if replay else scopes
+        patch.setattr(write_journal, 'retire_operations', lambda requested, owner: retire(order, owner))
+        patch.setattr(write_journal, '_unlink_record', stop_retired)
+        with pytest.raises(OSError):
+            write(db, plans)
+    _r26_restore(backup)
+    assert records[-1].exists()
+    (path, _), = write_journal.pending_intents({})
+    writer, start = CoreWriter(db), len(db.events)
+    # The retired head still authenticates its last operation. An unknown
+    # outcome for that same attempt must retain both fences.
+    terminal = write_journal._read_record(records[-1])
+    write_journal._store_record(records[-1], {**terminal, 'state': 'dispatched'}, replace=True)
+    with pytest.raises(StaleTransfermarktWrite):
+        _r20_recover(db, writer, plans, replay)
+    assert path.exists() and records[-1].exists()
+    write_journal._store_record(records[-1], terminal, replace=True)
+    if replay:
+        sibling = write_journal._read_record(records[0])
+        earlier = {**sibling['operation'], 'intent': path.stem}
+        conflict = {**sibling, 'operation': earlier, 'statement': {**sibling['statement'], 'operation': earlier}}
+        write_journal._store_record(records[0], conflict, replace=True)
+        protected = _r26_file_bytes([path, *records])
+        with pytest.raises(RuntimeError, match='retiring target operation binding differs'):
+            _r20_recover(db, writer, plans, replay)
+        assert _r26_file_bytes(protected) == protected
+        write_journal._store_record(records[0], sibling, replace=True)
+    assert _r20_recover(db, writer, plans, replay) == ack
+    assert not path.exists() and not any(r.exists() for r in records)
+    assert not writer.writes and not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+    assert write(db, _representation_packet(('9',), LATER), run_id='next-nine', clock=LATER)['verified']

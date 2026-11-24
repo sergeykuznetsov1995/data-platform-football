@@ -1098,16 +1098,32 @@ def finish_reservation(owner, scopes):
         _fsync_directory(path.parent)
 
 
-def release_obsolete_guards(scopes, owner, intent):
-    """Unlink only guards acquired by this exact descriptor, even across a partial cleanup."""
+def start_obsolete_release(intent, head_digest):
+    completion = completed_intent(intent)
+    _store_record(_record_path('completed-intents', intent),
+                  {**completion, 'obsolete_release_head': head_digest}, replace=True)
+
+
+def _obsolete_guards(scopes, owner, intent):
+    """Yield the exact descriptor's guard files and the scopes each one protects."""
     reservation = _record_path('reserving-bundles', owner)
     if reservation.exists() and _read_record(reservation) == {
             'owner': owner, 'scopes': [list(s) for s in sorted(scopes)], 'intent': intent}:
-        _unlink_record(reservation)
+        yield reservation, scopes
     for scope in scopes:
         path = _scope_owner_path(scope)
         if path.exists() and _read_record(path) == {'owner': owner, 'scope': list(scope), 'intent': intent}:
-            _unlink_record(path)
+            yield path, (scope,)
+
+
+def obsolete_guard_scopes(scopes, owner, intent):
+    return {scope for _, held in _obsolete_guards(scopes, owner, intent) for scope in held}
+
+
+def release_obsolete_guards(scopes, owner, intent):
+    """Unlink only guards acquired by this exact descriptor, even across a partial cleanup."""
+    for path, _ in _obsolete_guards(scopes, owner, intent):
+        _unlink_record(path)
 
 
 def completed_intent(intent):
