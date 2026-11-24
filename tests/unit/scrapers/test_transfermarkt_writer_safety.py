@@ -1044,6 +1044,7 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt, 
     root.rename(tmp_path / 'in-flight')
     shutil.copytree(backup, root)
     if lost_receipt:
+        db.sql.execute(f'CREATE TABLE saved_receipt AS SELECT * FROM {native.RECEIPTS} WHERE receipt_id=?', (key,))
         db.sql.execute(f'DELETE FROM {native.RECEIPTS} WHERE receipt_id=?', (key,))
     (intent, _), = journal.pending_intents({'run_id': ack['run_id']})
     assert journal.read_receipt(ack['plan_sha256']) is None
@@ -1129,6 +1130,15 @@ def _exercise_pre_walk_restore(tmp_path, monkeypatch, page_count, lost_receipt, 
     if restore_owner:
         assert journal.scope_owner(scope) is None
     db.sql.execute(f"UPDATE {b.table} SET club_id='11' WHERE club_id='wrong'")
+    if lost_receipt:
+        # Round 25 finding 2
+        # The later FINISHED target binds this repair to an existing publication.
+        start = len(db.events)
+        with pytest.raises(RuntimeError, match='receipt readback differs'):
+            replay_b()
+        assert intent.exists() and not native_writer._stored_receipts(db, [key])
+        assert not any(native_writer.is_mutation(sql) for sql in db.events[start:])
+        db.sql.execute(f'INSERT INTO {native.RECEIPTS} SELECT * FROM saved_receipt')
     assert replay_b() == [ack]
     assert len(submissions) == 1 and not intent.exists()
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(b.table,)]
