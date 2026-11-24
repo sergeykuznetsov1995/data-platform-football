@@ -868,7 +868,7 @@ def _dispatch_records():
             yield statement
 
 
-def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None):
+def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None, retry_statement=None):
     """Route restored query mappings without settling another scope's statements."""
     root = _root()
     queries = {path.stem: path for path in (root / 'statement-queries').glob('*.json')}
@@ -899,7 +899,9 @@ def check_dispatch_bindings(scopes=None, *, reviewed_dispatch=None):
                 and current['statement'] == statement == decision['statement']
                 and mapping['query_id'] == decision['query_id']):
             continue
-        if (not current or current['state'] not in ('FINISHED', 'returned')
+        rejected_retry = (retry_statement is not None and statement == retry_statement
+                          and current and current['state'] == 'rejected')
+        if (not current or (current['state'] not in ('FINISHED', 'returned') and not rejected_retry)
                 or not current.get('query_id') or current['query_id'] != mapping['query_id']
                 or 'statement' in mapping and current['statement'] != statement):
             raise RuntimeError('unbound core statement outcome is still pending')

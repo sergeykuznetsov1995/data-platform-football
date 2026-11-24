@@ -1364,10 +1364,11 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
     assert not list(journal.retained_stages(operation['operation']['member']))
 
 
-@pytest.mark.parametrize('repair', [False, True])
-def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, repair):
+@pytest.mark.parametrize('boundary', ['original', 'repair', 'rejected-mapped'])
+def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
+    # Round 21 finding 4
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
 
@@ -1380,17 +1381,20 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, rep
     db.sql.close()
     db.sql = shared
     plans = native._representation_packet(('7', '9'), native.CLOCK)
-    if repair:
+    if boundary == 'repair':
         native.write(db, plans)
         db.sql.execute(f'DELETE FROM {native.RECEIPTS}')
     hashes, digest = native_writer._bundle_identity(plans, 'run-1')
     members = [native_writer._receipt_id(h, 'run-1', digest) for h in hashes]
-    with monkeypatch.context() as patch:
-        submitted = native._interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'first',
-                                                  landed=True, member=members[0])
-        with pytest.raises(TrinoAmbiguousWriteError):
-            native.write(db, plans)
-    assert len(submitted) == 1
+    if boundary == 'rejected-mapped':
+        native._restore_rejected_tail_mapping(monkeypatch, db, plans, members[-1])
+    else:
+        with monkeypatch.context() as patch:
+            submitted = native._interrupt_ops_insert(patch, db, native_writer.CORE_RECEIPTS_TABLE, 'first',
+                                                      landed=True, member=members[0])
+            with pytest.raises(TrinoAmbiguousWriteError):
+                native.write(db, plans)
+        assert len(submitted) == 1
     start = len(db.events)
     ready = Barrier(2)
 
