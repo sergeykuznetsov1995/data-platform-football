@@ -986,7 +986,11 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
         members = dict(previous.get('members', {}))
         members[operation['member']] = statement['attempt']
         repair = previous.get('receipt_repair')
+        targets = previous.get('target_attempts', {})
+        if list(key) == operation['scope']:
+            targets = {**targets, operation['member']: statement['attempt']}
         _replace_submission({'owner': owner, 'statement': statement, 'members': members,
+                             **({'target_attempts': targets} if targets else {}),
                             **({'receipt_repair': repair} if repair and repair['intent'] == operation['intent'] else {}),
                             'scopes': previous.get('scopes') or [operation['scope']]})
     _immutable_record(_attempt_path(key), statement)
@@ -1110,8 +1114,12 @@ def finish_reservation(owner, scopes):
         _fsync_directory(path.parent)
 
 
-def start_obsolete_release(intent, head_digest):
+def start_obsolete_release(intent, head_digest, *, terminal_generation=None):
     completion = completed_intent(intent)
+    if completion.get('obsolete_release_head') != head_digest:
+        completion.pop('terminal_guard_generation', None)
+    if terminal_generation is not None:
+        completion['terminal_guard_generation'] = terminal_generation
     _store_record(_record_path('completed-intents', intent),
                   {**completion, 'obsolete_release_head': head_digest}, replace=True)
 
@@ -1126,6 +1134,18 @@ def _obsolete_guards(scopes, owner, intent):
         path = _scope_owner_path(scope)
         if path.exists() and _read_record(path) == {'owner': owner, 'scope': list(scope), 'intent': intent}:
             yield path, (scope,)
+
+
+def check_guard_generations(scopes, owner, intents):
+    """Check every extant guard for this packet before retiring its last descriptor."""
+    allowed = {path for intent in intents for path, _ in _obsolete_guards(scopes, owner, intent)}
+    reservation = _record_path('reserving-bundles', owner)
+    held = {_scope_owner_path(scope) for scope in scopes if scope_owner(scope) == owner}
+    if reservation.exists():
+        held.add(reservation)
+    if held - allowed:
+        raise RuntimeError('core packet guard generation is still pending')
+    return bool(held)
 
 
 def obsolete_guard_scopes(scopes, owner, intent):
