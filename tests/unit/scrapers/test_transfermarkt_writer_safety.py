@@ -1386,7 +1386,7 @@ def test_returned_merge_recovers_only_its_bound_stage(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('boundary', ['original', 'repair', 'before-reservation', 'reserved-tail', 'rejected-mapped', 'rejected-cleanup',
                                       'linked-worklist', 'linked-general', 'linked-original', 'general-with-original',
-                                      'general-before-receipt-reservation'])
+                                      'general-before-receipt-reservation', 'exact-step-predecessor'])
 def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, boundary):
     # Round 19 finding 1
     # Round 19 finding 2
@@ -1426,6 +1426,9 @@ def test_two_retrying_writers_submit_one_receipt_tail(tmp_path, monkeypatch, bou
             assert body['payload']['predecessor_head'] == native_writer._digest(head)
         else:
             assert 'statement' not in head and head['receipt_repair']['missing'] == [members[-1]]
+    elif boundary == 'exact-step-predecessor':
+        # Round 33 finding 7
+        native._r33_restore_step_predecessor(db, plans, monkeypatch, unreserved=True)
     elif boundary == 'general-before-receipt-reservation':
         # Round 32 finding 6
         native.write(db, plans)

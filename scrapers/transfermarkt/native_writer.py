@@ -2073,18 +2073,14 @@ def _stored_receipts(connection, ids) -> dict[str, tuple]:
 
 
 def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_id,
-                                 universe_version, batch, committed_at, *, require_rowless=False) -> set[str]:
+                                 universe_version, batch, committed_at, *, require_rowless=False, proofs=()) -> set[str]:
     """A receipt the warehouse holds under one of this bundle's ids must agree with it.
 
-    Everything a receipt states but its physical proof is known before the
-    bundle writes anything. A contradiction with an earlier acknowledgement is
-    therefore found before the first mutation, not by the receipts step after
-    the data has been replaced.
+    The original acknowledgement also binds the physical cells of each held receipt.
     """
     expected = [
-        _plan_receipt(plan, _UNWRITTEN_PROOF, plan_hash, digest, run_id, universe_version,
-                      batch, committed_at)
-        for plan, plan_hash in zip(plans, plan_hashes, strict=True)
+        _plan_receipt(plan, proof, plan_hash, digest, run_id, universe_version, batch, committed_at)
+        for plan, plan_hash, proof in zip(plans, plan_hashes, proofs or [_UNWRITTEN_PROOF] * len(plans), strict=True)
     ]
     stored = _stored_receipts(connection, [receipt['receipt_id'] for receipt in expected])
     for plan, receipt in zip(plans, expected, strict=True):
@@ -2096,7 +2092,7 @@ def _refuse_receipt_contradictions(connection, plans, plan_hashes, digest, run_i
         cells = _receipt_cells(receipt)
         if any(earlier[index] != cells[index]
                for index, column in enumerate(RECEIPT_COLUMNS)
-               if column not in _RECEIPT_PROOF_COLUMNS):
+               if proofs or column not in _RECEIPT_PROOF_COLUMNS):
             raise RuntimeError('core receipt contradicts its earlier acknowledgement')
     return set(stored)
 
@@ -2691,7 +2687,9 @@ def _check_scope_owners(plans, receipt_ids, *, read_only_paths=()):
                              or 'warehouse_identity' in body['payload']
                              and body['payload'].get('predecessor_head') != _digest(head))
                         and write_journal.submission_is_current(head) and write_journal.submission_retired(head))
-            if not obsolete and path not in read_only_paths:
+            # Only the repairing writer can authenticate an unreserved predecessor.
+            unreserved_repair = body['payload'].get('predecessor_head') == _digest(head)
+            if not obsolete and path not in read_only_paths and not unreserved_repair:
                 write_journal.reserve_scopes(member_scopes, keys[0])
             if keys[0] != bundle_owner:
                 raise _ScopePending('core packet scope acknowledgement is still pending', keys[0])
@@ -3814,7 +3812,8 @@ def _check_retiring_operations(connection, head, plans, receipt_ids, *, bindings
             mapped = write_journal.statement_query(statement)
             if mapped and mapped != query and (state != 'dispatched' or query is not None):
                 raise RuntimeError('core retiring operation query binding differs')
-            if target and state == 'rejected':
+            page = record['key'] == [CORE_PAGES_TABLE, member]
+            if state == 'rejected' and (target or page and mapped and pending == statement):
                 terminal = query and _query_outcome(connection, statement, query_id=query) == 'rejected'
                 if terminal and pending == statement:
                     rejections.append(statement)
@@ -3877,12 +3876,9 @@ def _retire_linked_generation(plans, receipt_ids, head, obsolete, active_operati
     if terminal_scopes and not active_operations and any(
             write_journal.obsolete_guard_scopes(scopes, owner, path.stem) for path in obsolete):
         # An older bundle reservation can coexist with a full set of later
-        # owners. An isolated later owner does not prove release of a no-POST
-        # generation. Keep the descriptor until the generations agree.
-        if statement is None and not write_journal.all_scopes_held_by(scopes, owner, generation):
+        # owners. A lone later owner does not prove release of either generation.
+        if not write_journal.all_scopes_held_by(scopes, owner, generation):
             raise RuntimeError('core packet guard generation is still pending')
-        if terminal_scopes != scopes:
-            terminal_scopes = set()
     if terminal_scopes:
         # The last descriptor must survive a crash at any guard unlink. Bind
         # permission for the terminal generation to this exact verified head.
@@ -4035,9 +4031,10 @@ def _receipt_prefix(head, intent, plans, receipt_ids):
     return _ReceiptPrefix(tail, tuple(submitted))
 
 
-def _check_worklist_predecessor(connection, head, plans, receipt_ids, before):
+def _check_worklist_predecessor(connection, head, plans, receipt_ids):
     # A retired predecessor may still have a restored, settled operation.
-    # Authenticate it against the frozen member heads before replacing them.
+    # Step heads describe one generation. Earlier intents have only the
+    # member attempts carried across the intervening reservations.
     members = dict(zip(receipt_ids, plans, strict=True))
     for scope in {_target_scope(plan) for plan in plans}:
         for record in write_journal.scope_operations(scope):
@@ -4047,7 +4044,14 @@ def _check_worklist_predecessor(connection, head, plans, receipt_ids, before):
             member = op['member']
             plan = members.get(member)
             statement = record.get('statement')
-            if (not statement or statement['attempt'] != before.get(member)
+            attempt = (head or {}).get('members', {}).get(member)
+            last = (head or {}).get('statement')
+            if last and op['intent'] == last['operation']['intent']:
+                if record['key'] == list(scope):
+                    attempt = head.get('target_attempts', {}).get(member, attempt)
+                elif record['key'] == [CORE_PAGES_TABLE, member]:
+                    attempt = head.get('page_attempts', {}).get(member, attempt)
+            if (not statement or statement['attempt'] != attempt
                     or not write_journal.submission_retired(head)
                     or plan is None or scope != _target_scope(plan) or op['plan_sha256'] != plan.plan_sha256()
                     or record['key'] not in (list(scope), [CORE_PAGES_TABLE, member], [CORE_RECEIPTS_TABLE, member])
@@ -4058,7 +4062,7 @@ def _check_worklist_predecessor(connection, head, plans, receipt_ids, before):
                 raise RuntimeError('core receipt repair predecessor operation binding differs')
 
 
-def _repair_prefix(connection, head, path, payload, plans, receipt_ids):
+def _repair_prefix(head, path, payload, plans, receipt_ids):
     """Recover a receipt-only worklist on either side of its reservation."""
     repair = (head or {}).get('receipt_repair', {})
     work = payload.get('receipt_worklist')
@@ -4076,7 +4080,6 @@ def _repair_prefix(connection, head, path, payload, plans, receipt_ids):
                 raise RuntimeError('core receipt repair predecessor differs')
             if work['before'] != (head or {}).get('members', {}):
                 raise RuntimeError('core receipt repair prior attempts differ')
-            _check_worklist_predecessor(connection, head, plans, receipt_ids, work['before'])
             return _ReceiptPrefix(tuple(missing))
     elif payload.get('receipt_only') and repair.get('intent') != path.stem:
         # A pre-worklist descriptor alone cannot identify the authorized rows.
@@ -4523,7 +4526,10 @@ def _commit_bundle(
                         stale_descriptors.add(path)
         general_repairs = {p for p, body in pending if 'warehouse_identity' in body['payload']
                            and p not in receipt_repairs} - stale_descriptors - linked
-        for path in general_repairs:
+        unreserved = {path for path, body in pending
+                      if body['payload'].get('predecessor_head') == _digest(head) and path.stem != head_intent
+                      and path not in linked and path not in stale_descriptors}
+        for path in general_repairs | (receipt_repairs - guarded_repairs - stale_descriptors - linked):
             write_journal.check_guard_generations(scopes, receipt_ids[0], {path.stem})
         closing_reservation = (no_post and bool(completed) and all(completed)
                                and not (linked & stale_descriptors or released_reservation and stale_descriptors))
@@ -4726,12 +4732,19 @@ def _commit_bundle(
                 body['identity']['digest'] == receipt_digest
                 or body['payload'].get('warehouse_identity') == identity for _, body in pending)
 
+            retire_predecessor = bool(unreserved and active_operations)
+
             def repair(*, missing=()):
                 # The acknowledged bundle has to change again (drifted rows, a
                 # lost manifest, a deleted receipt): journal it first.
+                nonlocal retire_predecessor
                 if not publications:
                     publications.extend(write_journal.published_intents(digest, stored, descriptor_digest))
                 if not paths:
+                    if active_operations:
+                        if not fresh_predecessor:
+                            _check_worklist_predecessor(connection, head, plans, receipt_ids)
+                        retire_predecessor = True
                     payload = {'plans': _descriptors(plans), 'warehouse_identity': identity,
                                'predecessor_head': _digest(head)}
                     if missing:
@@ -4745,8 +4758,13 @@ def _commit_bundle(
                         committed_at=stored['committed_at']))
                     if missing and verify_only:
                         guarded_repairs.add(paths[-1])
-                    elif not missing:
+                    else:
                         write_journal.check_guard_generations(scopes, receipt_ids[0], {paths[-1].stem})
+                if retire_predecessor:
+                    # The repair descriptor now exists and its preflight passed.
+                    # Remove only the authenticated predecessor before advancing the head.
+                    write_journal.retire_operations(scopes, receipt_ids[0])
+                    retire_predecessor = False
 
             worklist_paths = {p for p in paths if p.stem == head_repair.get('intent')}
             read_only_paths = stale_descriptors | linked | prefix_paths | predecessors | worklist_paths | general_repairs
@@ -4762,15 +4780,14 @@ def _commit_bundle(
                 verify_only |= _finished_legacy_scopes(connection, plans, keys, run_id=run_id, acknowledged=True)
                 held_receipts = _refuse_receipt_contradictions(
                     connection, plans, receipt_hashes, receipt_digest, run_id,
-                    universe_version, batch, stored['committed_at'],
+                    universe_version, batch, stored['committed_at'], proofs=stored['plans'],
                     require_rowless=(receipt_digest != descriptor_digest and not has_descriptor_evidence))
                 prefix = None
                 # A fresh repair may reach its first reservation in this call.
                 # Inspect surviving predecessor records before the target/DDL path.
                 fresh_predecessor = not paths and active_operations and len(held_receipts) < len(receipt_ids)
-                if fresh_predecessor:
-                    _check_worklist_predecessor(connection, head, plans, receipt_ids, (head or {}).get('members', {}))
-                retire_predecessor = False
+                if fresh_predecessor or retire_predecessor:
+                    _check_worklist_predecessor(connection, head, plans, receipt_ids)
                 if reviews is None and not retiring:
                     retired_intent = (head['statement']['operation']['intent']
                                       if write_journal.submission_retired(head) else None)
@@ -4778,13 +4795,11 @@ def _commit_bundle(
                         if path not in paths or path in stale_descriptors:
                             continue
                         if path.stem in (retired_intent, head_repair.get('intent')) or 'warehouse_identity' in body['payload']:
-                            candidate = _repair_prefix(connection, head, path, body['payload'], plans, receipt_ids)
+                            candidate = _repair_prefix(head, path, body['payload'], plans, receipt_ids)
                             if candidate is not None:
                                 if path != paths[-1]:
                                     raise RuntimeError('core receipt repair intent binding differs')
                                 prefix = candidate
-                                retire_predecessor = (active_operations and 'receipt_worklist' in body['payload']
-                                                      and path not in worklist_paths)
                 unreserved_restoration = None
                 if prefix and held_receipts.intersection(prefix.untouched) and len(pending) == 1:
                     path, body = pending[0]
@@ -4835,17 +4850,9 @@ def _commit_bundle(
                     if any(held[r['receipt_id']] != _receipt_cells(r) for r in plan_receipts if r['receipt_id'] in held):
                         raise RuntimeError('core receipt contradicts its earlier acknowledgement')
                     missing = tuple(member for member in receipt_ids if member not in held)
-                    if not paths and active_operations:
-                        if not fresh_predecessor:
-                            _check_worklist_predecessor(connection, head, plans, receipt_ids, (head or {}).get('members', {}))
-                        retire_predecessor = True
                     repair(missing=missing)
                     if prefix is None:
                         prefix = _ReceiptPrefix(missing)
-                    if retire_predecessor:
-                        # The missing set and every physical proof have now verified.
-                        # Leave the next no-POST reservation free of predecessor operations.
-                        write_journal.retire_operations(scopes, receipt_ids[0])
                     if head_repair.get('intent') != paths[-1].stem:
                         write_journal.reserve_submission(scopes, receipt_ids[0], paths[-1].stem,
                                                          missing_receipts=prefix.untouched, publications=publications)
@@ -4876,6 +4883,8 @@ def _commit_bundle(
                 if retire_predecessor:
                     write_journal.retire_operations(scopes, receipt_ids[0])
                 _record_completion(unreserved_restoration, plans, receipt_ids)
+                if unreserved_restoration not in guarded_repairs:
+                    write_journal.release_obsolete_guards(scopes, receipt_ids[0], unreserved_restoration.stem)
                 write_journal.finish_intent(unreserved_restoration)
                 return stored
             for path in guarded_repairs - stale_descriptors:

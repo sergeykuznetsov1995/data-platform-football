@@ -799,26 +799,28 @@ def bind_pending_operation(statement, operation):
 
 def retire_operations(scopes, owner):
     head = submission_head(owner)
-    for scope in scopes:
-        for record in scope_operations(scope):
-            operation = record['operation']
-            if operation['owner'] != owner:
-                continue
-            statement = record.get('statement')
-            if record['state'] == 'dispatched' or statement and pending_statement(record['key']) == statement:
-                raise RuntimeError('core operation outcome is still pending')
-            if statement and (query_id := statement_query(statement)) is not None:
-                if record['state'] != 'FINISHED' or record['query_id'] != query_id:
-                    raise RuntimeError('core operation query binding differs')
-                _unlink_record(_record_path('statement-queries', statement['attempt']))
-            if statement and 'operation' not in statement:
-                _unlink_record(_record_path('operation-bindings', statement['attempt']))
-            if statement and head and head.get('statement') == statement:
-                # Keep the last submit identity in the sibling after retirement.
-                _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head.get('scopes', []),
-                                                         'retired': statement['attempt']},
-                              replace=True)
-            _unlink_record(_operation_path(scope, record['key'], operation['member']))
+    # A legacy unchanged target can depend on the complete sequence of its
+    # siblings' statements. Retire those no-ops while every witness still exists.
+    records = (record for scope in scopes for record in scope_operations(scope)
+               if record['operation']['owner'] == owner)
+    for record in sorted(records, key=lambda record: record['state'] != 'unchanged'):
+        operation = record['operation']
+        scope = operation['scope']
+        statement = record.get('statement')
+        if record['state'] == 'dispatched' or statement and pending_statement(record['key']) == statement:
+            raise RuntimeError('core operation outcome is still pending')
+        if statement and (query_id := statement_query(statement)) is not None:
+            if record['state'] != 'FINISHED' or record['query_id'] != query_id:
+                raise RuntimeError('core operation query binding differs')
+            _unlink_record(_record_path('statement-queries', statement['attempt']))
+        if statement and 'operation' not in statement:
+            _unlink_record(_record_path('operation-bindings', statement['attempt']))
+        if statement and head and head.get('statement') == statement:
+            # Keep the last submit identity in the sibling after retirement.
+            _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head.get('scopes', []),
+                                                     'retired': statement['attempt']},
+                          replace=True)
+        _unlink_record(_operation_path(scope, record['key'], operation['member']))
     if head and head.get('reservation') and not head.get('statement'):
         _store_record(_packet_watermark(owner), {**_watermark_binding(owner), 'scopes': head['scopes'],
                                                  'released': True}, replace=True)
@@ -998,6 +1000,14 @@ def begin_statement(key, expected, *, observable=True, target_preimage=False, st
             targets = {**targets, operation['member']: statement['attempt']}
         pages = steps.get('page_attempts', {})
         from .native_writer import CORE_PAGES_TABLE
+        member = operation['member']
+        # A legacy head may still name this member's page when a receipt
+        # advances it. Carry that exact page forward in the same generation.
+        if member not in pages and member in steps.get('members', {}):
+            page = latest_operation(operation['scope'], (CORE_PAGES_TABLE, member), member)
+            if (page and page['operation'] == operation
+                    and page['statement']['attempt'] == steps['members'][member]):
+                pages = {**pages, member: steps['members'][member]}
         if list(key) == [CORE_PAGES_TABLE, operation['member']]:
             pages = {**pages, operation['member']: statement['attempt']}
         _replace_submission({'owner': owner, 'statement': statement, 'members': members,
