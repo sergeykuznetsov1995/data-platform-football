@@ -464,10 +464,12 @@ def reserve_submission(scopes, owner, intent, *, missing_receipts=None, publicat
         return
     if statement and _read_record(_packet_watermark(owner)).get('retired') == statement['attempt']:
         # Start a new reservation, keeping the ordering across publication.
-        head = {'sequence': statement.get('sequence', 0), 'members': head.get('members', {}),
-                'retired_steps': {'intent': previous_intent, 'head': hashlib.sha256(_canonical(head)).hexdigest(),
-                                  'target_attempts': head.get('target_attempts', {}),
-                                  'page_attempts': head.get('page_attempts', {})}}
+        steps = {'intent': previous_intent, 'head': hashlib.sha256(_canonical(head)).hexdigest(),
+                 'target_attempts': head.get('target_attempts', {})}
+        # Legacy page attempts live in members. An explicit empty map rules out that fallback.
+        if 'page_attempts' in head:
+            steps['page_attempts'] = head['page_attempts']
+        head = {'sequence': statement.get('sequence', 0), 'members': head.get('members', {}), 'retired_steps': steps}
     if missing_receipts is not None:
         # The per-member heads survive publication. Freeze the repair's ordered
         # worklist and pre-submit attempts before the first receipt can be sent.
@@ -908,10 +910,15 @@ def pending_statement(key, *, inspect_only=False):
     return statement
 
 
-def _dispatch_records():
-    for directory in ('pending-statements', 'dispatch-attempts'):
+def _dispatch_records(*, include_settled=False):
+    directories = ('pending-statements', 'dispatch-attempts')
+    if include_settled:
+        directories += ('settled-statements',)
+    for directory in directories:
         for path in (_root() / directory).glob('*.json'):
             statement = _read_record(path)
+            if directory == 'settled-statements':
+                statement = statement.get('statement', statement)
             if path.name != _statement_path(statement['key']).name:
                 raise RuntimeError('core pending statement key differs')
             yield statement
