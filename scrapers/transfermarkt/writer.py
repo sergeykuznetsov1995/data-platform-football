@@ -188,6 +188,7 @@ class TransfermarktTrinoManager(TrinoTableManager):
                     suffix = 'tm_' + uuid4().hex
                     stage = table + '__stg_' + suffix
                     stage_record = write_journal.stage_record(receipt_id, stage)
+                    write_journal.mark_stage_idle(receipt_id, stage)
                     write_journal._immutable_record(stage_record, {
                         'receipt_id': receipt_id, 'table': scope[0], 'stage': stage, 'fenced_create': True})
                     kwargs['staging_id'] = suffix

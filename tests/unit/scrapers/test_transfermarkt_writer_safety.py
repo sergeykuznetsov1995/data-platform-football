@@ -641,13 +641,13 @@ def test_parameterized_insert_keeps_its_dml_id_across_a_lost_poll(monkeypatch, t
 
 
 @pytest.fixture
-def staged_bundle(monkeypatch, tmp_path):
+def staged_bundle(monkeypatch, tmp_path, request):
     from tests.unit.scrapers import test_transfermarkt_native_writer as native
 
     monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'stage-journal'))
     db = native.CoreDB()
     old = native.membership_plan(['1'])
-    fresh = native.membership_plan(['2'], clock=native.LATER, capture='next', run='next')
+    fresh = native.membership_plan(getattr(request, 'param', ['2']), clock=native.LATER, capture='next', run='next')
     native.write(db, [old])
     warehouse = _TombstoneWarehouse(old.table, [dict(old.rows[0])])
     warehouse.lost = True
@@ -891,3 +891,48 @@ def test_restored_38_rows_do_not_release_a_queued_repair_merge(monkeypatch, tmp_
     assert len(queued) == 1 and len(warehouse.players()) == 38
     assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]
     assert native._receipt_count(db) == 1 and not journal.pending_intents({})
+
+
+@pytest.mark.parametrize('staged_bundle', [['2', '3']], indirect=True)
+def test_pre_binding_stage_survives_loss_of_target_statement(staged_bundle, monkeypatch):
+    # Round 13 finding 1
+    from tests.unit.scrapers import test_transfermarkt_native_writer as native
+
+    warehouse, db, plan, commit, replay, land = staged_bundle
+    journal = native_writer.write_journal
+    scope = native_writer._target_scope(plan)
+    execute, queued = _TombstoneCursor.execute, []
+
+    def lose_first_response(cursor, sql, params=None):
+        if sql.startswith('MERGE INTO'):
+            queued.append(sql)
+            raise ConnectionResetError('Connection reset after accepted MERGE')
+        return execute(cursor, sql, params)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_TombstoneCursor, 'execute', lose_first_response)
+        with pytest.raises(TrinoAmbiguousWriteError):
+            commit()
+        statement = journal.pending_statement(scope)
+        stage = statement['stage']
+        assert journal.statement_query(statement) is None
+        assert warehouse.engine.execute(f'SELECT count(*) FROM {stage}').fetchone() == (3,)
+        # This archive predates the redundant dispatch-attempts record.
+        journal._attempt_path(scope).unlink()
+        journal._statement_path(scope).unlink()
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+        with pytest.raises(RuntimeError, match='still pending'):
+            native.write(db, [native.membership_plan(['4'], clock=native.NEWEST, capture='newer')], run_id='newer')
+        assert journal.stage_record(statement['expected']['single_submit'], stage).exists()
+        submission, = queued
+        land(submission)
+        with pytest.raises(RuntimeError, match='still pending'):
+            replay()
+        assert warehouse.players() == ['2', '3'] and native._receipt_count(db) == 1
+        # Restoring the original bound evidence permits exact settlement.
+        journal._immutable_record(journal._statement_path(scope), statement)
+        journal.remember_query(statement, 'q_original')
+        db.sql.execute("INSERT INTO test_query_history VALUES ('q_original','FINISHED',NULL)")
+        assert replay()[0]['verified'] and len(queued) == 1
+    assert warehouse.engine.execute('SHOW TABLES').fetchall() == [(plan.table,)]

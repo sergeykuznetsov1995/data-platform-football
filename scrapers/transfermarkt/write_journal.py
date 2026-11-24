@@ -275,8 +275,10 @@ def guard_history():
         if digest in known:
             continue
         receipt = read_receipt(digest)
-        if receipt is None or receipt.get('plan_sha256') != digest:
-            raise RuntimeError('core archived acknowledgement identity differs')
+        if not acknowledgement_bound(digest, receipt):
+            accounted.add(digest)
+            yield {'digest': digest, 'status': 'finished', 'identity': {'digest': digest}}
+            continue
         warehouse = (receipt.get('identity') or {}).get('digest', digest)
         accounted.update((digest, warehouse))
         if warehouse not in known:
@@ -293,7 +295,7 @@ def guard_history():
             if (copy['target'] != path.stem or copy['source'] == path.stem or
                     read_snapshot_anchors(copy['source']) != read_snapshot_anchors(path.stem)):
                 raise RuntimeError('core alias snapshot anchors differ')
-            if read_receipt(copy['source']) is not None:
+            if acknowledgement_bound(copy['source'], read_receipt(copy['source'])):
                 continue  # interrupted between copying the anchors and publishing their alias receipt
         yield {'digest': path.stem, 'status': 'finished', 'identity': {'digest': path.stem}}
     for entry in entries.values():
@@ -427,6 +429,8 @@ def finish_statement(statement):
         raise RuntimeError('core pending statement is missing')
     settled = _record_path('settled-statements', path.stem)
     _immutable_record(settled, statement)
+    if statement.get('stage'):
+        mark_stage_idle(statement['expected']['single_submit'], statement['stage'])
     _unlink_record(_record_path('statement-queries', statement['attempt']))
     _unlink_record(path)
     _unlink_record(binding)
@@ -496,23 +500,50 @@ def completed_intent(intent):
 
 
 def complete_intent(path, digest, owner, terminal):
-    _immutable_record(_record_path('completed-intents', path.stem), {
-        'intent': path.stem, 'digest': digest, 'owner': owner, 'terminal': terminal})
+    from .native_writer import _bundle_identity, _intent_unit
+
+    body = _intent_body(path, 'core write intent checksum differs')
+    run = body['identity']['run_id']
+    plans, _, _ = _intent_unit(body)
+    descriptor_digest = _bundle_identity(plans, run)[1]
+    receipt = read_receipt(digest)
+    binding = {'intent': path.stem, 'digest': digest, 'owner': owner, 'terminal': terminal}
+    existing = completed_intent(path.stem)
+    completion = existing or {
+        **binding, 'descriptor_digest': descriptor_digest,
+        'acknowledgement': hashlib.sha256(_canonical(receipt)).hexdigest()}
+    if (not binding.items() <= completion.items()
+            or completion.get('descriptor_digest', descriptor_digest) != descriptor_digest
+            or not acknowledgement_bound(digest, receipt, run, completion)):
+        raise RuntimeError('core completed intent acknowledgement differs')
+    _immutable_record(_record_path('completed-intents', path.stem), completion)
 
 
 def terminal_target(intent, receipt_id, statement=None):
+    return terminal_witness(intent, receipt_id, statement) is not None
+
+
+def terminal_witness(intent, receipt_id, statement=None):
+    """Read the bound coordinator witness, including older ID-only records."""
     directory = 'terminal-targets/' + intent + '/' + receipt_id
     paths = ((_root() / directory).glob('*.json') if statement is None
              else (_record_path(directory, statement['attempt']),))
     for path in paths:
         if path.exists():
             record = _read_record(path)
-            if (record['intent'] != intent or record['receipt_id'] != receipt_id or not record['query_id']
-                    or record['attempt'] != path.stem
-                    or statement is not None and record['query_id'] != statement_query(statement)):
+            if (record['intent'] != intent or record['receipt_id'] != receipt_id
+                    or not isinstance(record['query_id'], str) or not record['query_id']
+                    or record['attempt'] != path.stem or statement is not None and (
+                        statement['expected'] != {'single_submit': receipt_id}
+                        or statement_query(statement) not in (None, record['query_id']))):
                 raise RuntimeError('core terminal target binding differs')
-            return True
-    return False
+            if 'outcome' in record or 'statement_sha256' in record:
+                if (record.get('outcome') != 'FINISHED' or not record.get('statement_sha256')
+                        or statement is not None and record['statement_sha256'] != hashlib.sha256(
+                            _canonical(statement)).hexdigest()):
+                    raise RuntimeError('core terminal target binding differs')
+            return record
+    return None
 
 
 def remember_terminal_target(intent, receipt_id, statement):
@@ -522,11 +553,33 @@ def remember_terminal_target(intent, receipt_id, statement):
         raise RuntimeError('core terminal target binding differs')
     directory = 'terminal-targets/' + intent + '/' + receipt_id
     _immutable_record(_record_path(directory, statement['attempt']), {
-        'intent': intent, 'receipt_id': receipt_id, 'attempt': statement['attempt'], 'query_id': query_id})
+        'intent': intent, 'receipt_id': receipt_id, 'attempt': statement['attempt'], 'query_id': query_id,
+        'outcome': 'FINISHED', 'statement_sha256': hashlib.sha256(_canonical(statement)).hexdigest()})
 
 
 def stage_record(receipt_id, stage):
     return _record_path('stages/' + receipt_id, stage)
+
+
+def _idle_stage_path(receipt_id, stage):
+    return _record_path('idle-stages/' + receipt_id, stage)
+
+
+def mark_stage_idle(receipt_id, stage):
+    _immutable_record(_idle_stage_path(receipt_id, stage), {'receipt_id': receipt_id, 'stage': stage})
+
+
+def stage_idle(receipt_id, stage):
+    path = _idle_stage_path(receipt_id, stage)
+    if not path.exists():
+        return False
+    if _read_record(path) != {'receipt_id': receipt_id, 'stage': stage}:
+        raise RuntimeError('core retained stage identity differs')
+    return True
+
+
+def clear_stage_idle(receipt_id, stage):
+    _unlink_record(_idle_stage_path(receipt_id, stage))
 
 
 def retained_stages(receipt_id):
@@ -537,6 +590,7 @@ def retained_stages(receipt_id):
 def forget_stage(path):
     path.unlink()
     _fsync_directory(path.parent)
+    clear_stage_idle(path.parent.name, path.stem)
 
 
 def read_snapshot_anchors(digest: str) -> dict[str, int | None]:
@@ -636,17 +690,62 @@ def acknowledgement_matches_inventory(digest, receipt):
     return not originals or originals == {hashlib.sha256(_canonical(receipt)).hexdigest()}
 
 
+def acknowledgement_bound(digest, receipt, run=None, completion=None):
+    """Authenticate the acknowledgement before using its targets, clocks or release."""
+    from .native_writer import _batch_id_for_run, _digest, _receipt_id
+
+    if not receipt or receipt.get('plan_sha256') != digest or run is not None and receipt.get('run_id') != run:
+        return False
+    warehouse = receipt.get('identity')
+    run = receipt.get('run_id')
+    if (not isinstance(run, str) or not run or receipt.get('committed_batch') != _batch_id_for_run(run)
+            or receipt.get('receipt_readback') is not True):
+        return False
+    if warehouse is not None:
+        if not isinstance(warehouse, dict):
+            return False
+        hashes = warehouse.get('plan_hashes')
+        if (not isinstance(hashes, list) or not hashes
+                or warehouse.get('digest') != _digest({'plans': hashes, 'run_id': run})
+                or digest != warehouse['digest'] and receipt.get('descriptor_digest', digest) != digest):
+            return False
+    if completion is None:
+        return True
+    if completion['digest'] != digest:
+        return False
+    if 'acknowledgement' in completion:
+        if completion['acknowledgement'] != _digest(receipt):
+            return False
+        descriptor = completion['descriptor_digest']
+    else:
+        descriptor = digest
+    if receipt.get('descriptor_digest', descriptor) != descriptor:
+        return False
+    if warehouse is None:
+        # A Stage-B acknowledgement predates embedded member hashes.
+        return 'acknowledgement' in completion
+    return completion['owner'] == _receipt_id(hashes[0], run, warehouse['digest'])
+
+
 def acknowledgements():
     """Read the verified, immutable acknowledgements, including pre-upgrade records."""
     fingerprints = {}
     for inventory in guard_inventories():
         fingerprints.setdefault(inventory['digest'], set()).add(inventory['acknowledgement'])
+    completions = {}
+    for path in (_root() / 'completed-intents').glob('*.json'):
+        completion = completed_intent(path.stem)
+        completions.setdefault(completion['digest'], []).append(completion)
     for path in sorted((_root() / 'receipts').glob('*.json')):
         receipt = _read_record(path)
-        if path.stem in fingerprints and fingerprints[path.stem] != {hashlib.sha256(_canonical(receipt)).hexdigest()}:
-            continue  # the inventory fences this acknowledgement's original scopes
         if receipt.get('verified') is not True:
             raise RuntimeError('core journal receipt is unverified')
+        if (not acknowledgement_bound(path.stem, receipt) or any(
+                not acknowledgement_bound(path.stem, receipt, completion=c)
+                for c in completions.get(path.stem, ()))):
+            continue
+        if path.stem in fingerprints and fingerprints[path.stem] != {hashlib.sha256(_canonical(receipt)).hexdigest()}:
+            continue  # the inventory fences this acknowledgement's original scopes
         yield receipt
 
 
