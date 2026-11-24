@@ -155,12 +155,12 @@ def _phase_run_id(run_id: str) -> tuple[str, str]:
     value = str(run_id).strip()
     if value.count("::") != 1:
         raise ValueError(
-            "production run_id must end in ::season, ::targets or ::players"
+            "production run_id must end in ::season, ::season_fields, ::targets or ::players"
         )
     base_run_id, phase = value.rsplit("::", 1)
-    if not base_run_id or phase not in {"season", "targets", "players"}:
+    if not base_run_id or phase not in {"season", "season_fields", "targets", "players"}:
         raise ValueError(
-            "production run_id must end in ::season, ::targets or ::players"
+            "production run_id must end in ::season, ::season_fields, ::targets or ::players"
         )
     return base_run_id, phase
 
@@ -300,7 +300,7 @@ class SofascoreLeaseStats:
                 or not isinstance(raw_units, list)
                 or not raw_units
                 or not base_run_id
-                or workload_phase not in {"season", "targets", "players"}
+                or workload_phase not in {"season", "season_fields", "targets", "players"}
                 or phase_plan_digest != plan_digest
             ):
                 raise SofascoreLeaseProtocolError(

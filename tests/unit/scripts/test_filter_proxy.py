@@ -1948,11 +1948,12 @@ def _sofascore_context(**values):
     context.update(values)
     phase = context["run_id"].rsplit("::", 1)[-1]
     allocation_scope = (
-        "season" if phase == "season" else "player" if phase == "players" else "match"
+        "season" if phase in {"season", "season_fields"}
+        else "player" if phase == "players" else "match"
     )
     workload_class = (
         "season_test_shape"
-        if phase == "season"
+        if phase in {"season", "season_fields"}
         else PLAYER_WORKLOAD_CLASS
         if phase == "players"
         else MATCH_WORKLOAD_CLASS
@@ -2577,6 +2578,57 @@ def test_parent_envelope_sums_three_phases_and_stops_before_crossing(mod):
             require_context=True,
         )
     assert mgr.calls == 4
+
+
+def test_parent_envelope_accepts_season_fields(shared_mod):
+    context = _sofascore_context(
+        run_id="manual__season-fields::season_fields", budget=100
+    )
+    plan, _ = shared_mod._signed_allocation_from_request(context, max_bytes=100)
+
+    envelope = shared_mod._parent_envelope_ledger().register(plan)
+
+    assert envelope.phase == "season_fields"
+    assert envelope.phase_cap_bytes == 100
+
+
+@pytest.mark.parametrize("first,second", [("season", "season_fields"), ("season_fields", "season")])
+def test_parent_envelope_sums_independent_season_phase_plans(shared_mod, first, second):
+    base = "manual__independent-season-phases"
+    for phase in (first, second):
+        context = _sofascore_context(run_id=f"{base}::{phase}", budget=100)
+        plan, _ = shared_mod._signed_allocation_from_request(context, max_bytes=100)
+        envelope = shared_mod._parent_envelope_ledger().register(plan)
+
+    assert envelope.parent_cap_bytes == 200
+    assert envelope.parent_spent_provider_bytes == 0
+
+
+def test_parent_envelope_rejects_mislabeled_season_fields(shared_mod):
+    context = _sofascore_context(
+        run_id="manual__bad-season-fields::season_fields", budget=100
+    )
+    original = context["allocation"]
+    allocation = WorkloadAllocation(
+        allocation_id=original["allocation_id"],
+        task_id=original["task_id"],
+        scope="match",
+        workload_class=original["class"],
+        batch_index=original["batch_index"],
+        units=tuple(original["units"]),
+        budget_bytes=original["budget"],
+    )
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id=context["dag_id"],
+        run_id=context["run_id"],
+        player_universe_ids=(),
+        allocations=(allocation,),
+        control_token="c" * 32,
+    )
+
+    with pytest.raises(shared_mod.ParentEnvelopeError, match="season/season_fields phase plan"):
+        shared_mod._parent_envelope_ledger().register(plan)
 
 
 def test_target_first_noop_season_is_allowed_but_late_season_cannot_expand(mod):
