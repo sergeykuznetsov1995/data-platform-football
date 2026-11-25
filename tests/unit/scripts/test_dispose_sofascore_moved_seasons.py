@@ -44,7 +44,10 @@ def test_moved_scope_disposition_is_evidence_based_and_applied():
         ],
         new_scope: [_record(new_scope, "event", ManifestStatus.SUCCESS)],
     }
-    store = type("Store", (), {"upsert": lambda self, record: None})()
+    store = type("Store", (), {
+        "upsert": lambda self, record: None,
+        "flush": lambda self: calls.append("flush"),
+    })()
     calls = []
     store.upsert = lambda record: calls.append(record)
 
@@ -56,11 +59,11 @@ def test_moved_scope_disposition_is_evidence_based_and_applied():
     )
     apply_disposition(store, plan)
 
-    assert len(calls) == 2
-    assert {record.status for record in calls} == {ManifestStatus.SCHEMA_ERROR}
-    assert {record.error_type for record in calls} == {"MovedSourceSeason"}
-    assert {record.run_id for record in calls} == {"moved-test"}
-    assert {record.attempts for record in calls} == {2}
+    assert len(calls) == 3
+    assert {record.status for record in calls if not isinstance(record, str)} == {ManifestStatus.SCHEMA_ERROR}
+    assert {record.error_type for record in calls if not isinstance(record, str)} == {"MovedSourceSeason"}
+    assert {record.run_id for record in calls if not isinstance(record, str)} == {"moved-test"}
+    assert {record.attempts for record in calls if not isinstance(record, str)} == {2}
 
 
 def test_disposition_rejects_wrong_raw_season_before_any_write():

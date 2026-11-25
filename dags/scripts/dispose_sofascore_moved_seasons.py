@@ -110,6 +110,9 @@ def apply_disposition(store, plan):
     for _old_scope, _new_scope, records in plan:
         for record in records:
             store.upsert(record)
+    flush = getattr(store, "flush", None)
+    if callable(flush):
+        flush()
 
 
 def main():
