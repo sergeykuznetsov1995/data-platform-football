@@ -1647,10 +1647,12 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     monkeypatch.setattr(manager, "table_exists", lambda *args: True)
     monkeypatch.setattr(writer, "_evolve_schema", lambda *args: None)
     staged = []
+    staged_by_table = {}
     statements = []
 
     def insert(schema, table, frame, *args, **kwargs):
         staged[:] = [frame]
+        staged_by_table[table.split("__stg_")[0]] = frame
         return len(frame)
 
     def execute(sql, fetch=False):
@@ -1667,6 +1669,9 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     scraper.SOURCE_NAME = "sofascore"
     scraper.save_to_iceberg.side_effect = lambda **kwargs: (
         BaseScraper.save_to_iceberg(scraper, **kwargs)
+    )
+    scraper._build_partition_delete_filter.side_effect = (
+        BaseScraper._build_partition_delete_filter
     )
     output = tmp_path / "season-offline.json"
 
@@ -1692,11 +1697,14 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     save_calls = scraper.save_to_iceberg.call_args_list
     assert [call.kwargs["table_name"] for call in save_calls] == season_tables
     natural_keys_by_table = {
-        call.kwargs["table_name"]: call.kwargs["natural_keys"] for call in save_calls
+        call.kwargs["table_name"]: call.kwargs["natural_keys"]
+        for call in save_calls if "natural_keys" in call.kwargs
     }
-    assert natural_keys_by_table["sofascore_rounds"] == [
-        "league", "season", "round_id",
-    ]
+    rounds_save = next(call for call in save_calls
+                       if call.kwargs["table_name"] == "sofascore_rounds")
+    assert rounds_save.kwargs["replace_partitions"] == ["league", "season"]
+    assert rounds_save.kwargs["min_replace_ratio"] == 0.9
+    assert "sofascore_rounds" not in natural_keys_by_table
     assert natural_keys_by_table["sofascore_cup_trees"] == [
         "league", "season", "cup_tree_id", "node_id",
     ]
@@ -1705,14 +1713,23 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     ]
     assert "sofascore_referee_profile" not in natural_keys_by_table
     merges = [sql for sql in statements if sql.startswith("MERGE INTO")]
-    assert len(merges) == len(season_tables)
+    assert len(merges) == len(season_tables) - 1
+    deletes = [sql for sql in statements if sql.startswith("DELETE FROM")]
+    assert deletes == [
+        "DELETE FROM iceberg.bronze.sofascore_rounds "
+        "WHERE (league = 'SS-17' AND season = '2526')"
+    ]
+    rounds_inserts = [sql for sql in statements
+                      if sql.startswith("INSERT INTO iceberg.bronze.sofascore_rounds ")]
+    assert len(rounds_inserts) == 1
+    assert " FROM iceberg.bronze.sofascore_rounds__stg_" in rounds_inserts[0]
+    assert list(staged_by_table["sofascore_rounds"]["round_id"]) == ["1", "2", "3"]
     schedule_merge = next(sql for sql in merges
                           if sql.startswith("MERGE INTO iceberg.bronze.sofascore_schedule "))
     on_clause = schedule_merge.split(" ON ", 1)[1].split(" WHEN MATCHED", 1)[0]
     assert '(t."league" = \'SS-17\' AND t."season" = \'2526\')' in on_clause
     for key in ("league", "season", "game_id"):
         assert f't."{key}" = s."{key}"' in on_clause
-    assert not any(sql.startswith("DELETE FROM") for sql in statements)
     committed_plan = plan_season_partition(
         raw_store,
         manifest,
@@ -3694,10 +3711,12 @@ def test_runner_season_fields_publishes_four_datasets_without_schedule(tmp_path,
     monkeypatch.setattr(manager, "table_exists", lambda *args: True)
     monkeypatch.setattr(writer, "_evolve_schema", lambda *args: None)
     staged = []
+    staged_by_table = {}
     statements = []
 
     def insert(schema, table, frame, *args, **kwargs):
         staged[:] = [frame]
+        staged_by_table[table.split("__stg_")[0]] = frame
         return len(frame)
 
     def execute(sql, fetch=False):

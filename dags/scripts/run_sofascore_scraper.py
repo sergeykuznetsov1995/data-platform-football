@@ -2787,12 +2787,22 @@ def _publish_normalized_season_fields(scraper, results, materialized) -> None:
         if not rows:
             continue
         frame = scraper._add_metadata(pd.DataFrame(rows), entity)
+        save_kwargs = {
+            "natural_keys": ["league", "season", *key_columns],
+        }
+        if table_name == "sofascore_rounds":
+            # The complete rounds payload also retires legacy numeric IDs when
+            # a source slug becomes part of the identity (#1368).
+            save_kwargs = {
+                "replace_partitions": ["league", "season"],
+                "min_replace_ratio": 0.9,
+            }
         path = _save_publication(
             scraper, results,
             df=frame,
             table_name=table_name,
             partition_cols=["league", "season"],
-            natural_keys=["league", "season", *key_columns],
+            **save_kwargs,
         )
         results["tables"].append(path)
         results[counter] = len(frame)

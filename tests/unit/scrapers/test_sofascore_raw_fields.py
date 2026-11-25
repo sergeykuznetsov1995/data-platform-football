@@ -126,6 +126,36 @@ class TestParseRounds:
         with pytest.raises(ValueError, match="duplicate natural key"):
             parse_rounds(payload, source_tournament_id=1, source_season_id=2)
 
+    def test_slug_disambiguates_reused_round_number(self):
+        rows = parse_rounds(
+            _load_fixture("sofascore_season_89063_rounds.json"),
+            source_tournament_id=1221,
+            source_season_id=89063,
+        )
+        assert [row["round_id"] for row in rows] == [
+            "1", "2", "3", "4", "5", "6", "5:round-of-16", "27:quarterfinals",
+        ]
+        assert rows[4]["round"] == rows[6]["round"] == 5
+        assert rows[4].get("name") is None
+        assert rows[6]["name"] == "Round of 16"
+        assert rows[-1]["is_current"] is True
+
+    def test_duplicate_round_number_and_slug_still_raises(self):
+        payload = {"rounds": [
+            {"round": 5, "slug": "round-of-16"},
+            {"round": 5, "slug": "round-of-16"},
+        ]}
+        with pytest.raises(ValueError, match="duplicate natural key"):
+            parse_rounds(payload, source_tournament_id=1, source_season_id=2)
+
+    def test_slug_identity_collision_with_bare_id_fails_closed(self):
+        payload = {"rounds": [
+            {"round": "5:round-of-16"},
+            {"round": 5, "slug": "round-of-16"},
+        ]}
+        with pytest.raises(ValueError, match="duplicate natural key"):
+            parse_rounds(payload, source_tournament_id=1, source_season_id=2)
+
 
 class TestParseCupTrees:
     def test_fixture_rows(self):

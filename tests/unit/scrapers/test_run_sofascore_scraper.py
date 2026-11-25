@@ -662,3 +662,40 @@ def test_player_ids_env_is_offline_only_and_fails_before_source_access(
     ]
     assert saved == []
     live.assert_not_called()
+
+
+@pytest.mark.unit
+def test_rounds_publication_replaces_partition_for_slug_identity_migration():
+    runner = _runner_module()
+    calls = []
+
+    def save_to_iceberg(**kwargs):
+        calls.append(kwargs)
+        return f"iceberg.bronze.{kwargs['table_name']}"
+
+    scraper = SimpleNamespace(
+        _add_metadata=lambda frame, entity: frame,
+        save_to_iceberg=save_to_iceberg,
+    )
+    materialized = SimpleNamespace(
+        rounds_rows=(
+            {"round_id": "5"},
+            {"round_id": "5:round-of-16", "slug": "round-of-16"},
+        ),
+        cup_trees_rows=({"cup_tree_id": "1", "node_id": "2"},),
+        participants_rows=(),
+        referee_profile_rows=(),
+    )
+    results = {"tables": []}
+
+    runner._publish_normalized_season_fields(scraper, results, materialized)
+
+    assert calls[0]["table_name"] == "sofascore_rounds"
+    assert calls[0]["replace_partitions"] == ["league", "season"]
+    assert calls[0]["min_replace_ratio"] == 0.9
+    assert "natural_keys" not in calls[0]
+    assert calls[1]["table_name"] == "sofascore_cup_trees"
+    assert calls[1]["natural_keys"] == ["league", "season", "cup_tree_id", "node_id"]
+    assert "replace_partitions" not in calls[1]
+    assert results["rounds_rows"] == 2
+    assert results["cup_trees_rows"] == 1
