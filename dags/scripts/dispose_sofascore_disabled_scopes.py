@@ -18,6 +18,7 @@ DISABLED_SCOPES = (
     ("7", "11773"),
     ("270", "1138"),
     ("7", "36886"),
+    ("14756", "27703"),
 )
 
 
@@ -80,7 +81,7 @@ def build_disabled_disposition(
                     attempts=record.attempts + 1,
                     error_type="ReplayScopeNotSupported",
                     error_message=(
-                        "registry capture_allowed=false; raw scope identity verified"
+                        "scope not admitted by registry/campaign; raw identity verified"
                     ),
                     parsed_at=utc_now_iso(),
                     updated_at=utc_now_iso(),
@@ -109,9 +110,13 @@ def main():
     runtime = build_capture_runtime(run_id=run_id, task_id="disposition")
     manager = _replay_manager(getattr(runtime, "manifest_store", None))
     catalog = getattr(runtime, "catalog", None) or SofaScoreCatalog.load()
+    def capture_allowed(scope):
+        try:
+            return bool(catalog.tournament(int(scope[0])).capture_allowed)
+        except (ValueError, KeyError, TypeError):
+            return False
     capture_allowed_by_scope = {
-        scope: bool(catalog.tournament(int(scope[0])).capture_allowed)
-        for scope in DISABLED_SCOPES
+        scope: capture_allowed(scope) for scope in DISABLED_SCOPES
     }
     records_by_scope = {
         scope: load_replay_scope_records(
