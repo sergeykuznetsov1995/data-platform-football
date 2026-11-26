@@ -2623,10 +2623,12 @@ class SqliteInventory(SeedTrino):
 
 def test_discovery_inventory_shares_positive_keys_and_rechecks_a_miss():
     from scrapers.fotmob.load_meter import parse_sql
+    from scrapers.fotmob.repository import DISCOVERY_INVENTORY_SCOPES
 
     trino = SqliteInventory()
     db = trino.db
-    scopes = [(i, "2026" if i % 2 else "Cup '26") for i in range(1, 17)]
+    scopes = [(i, "2026" if i % 2 else "Cup '26")
+              for i in range(1, DISCOVERY_INVENTORY_SCOPES + 1)]
     db.executemany("INSERT INTO fotmob_field_inventory VALUES ('league_season', ?, ?, ?, ?, ?)", [
         (f"{i}.0", "2026.0" if season == "2026" else season, "path", "typed", "good")
         for i, season in scopes

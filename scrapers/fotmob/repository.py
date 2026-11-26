@@ -535,7 +535,8 @@ DEDUP_KEYS: dict[str, tuple[str, ...]] = {
 # Player inventory keys carry no scope columns, so one preload would pull the
 # whole ~3.8M-key population for rows the run-level dedup already collapses.
 INVENTORY_PRELOAD_SKIP: frozenset[str] = frozenset({"player"})
-DISCOVERY_INVENTORY_SCOPES = 16
+# A single season can have thousands of inventory keys under the same parser.
+DISCOVERY_INVENTORY_SCOPES = 6
 
 
 def _inventory_sql_values(value: str) -> tuple[str, ...]:

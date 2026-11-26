@@ -473,7 +473,7 @@ def test_catalog_discovery_reads_published_inventory_in_small_groups(monkeypatch
     results = service.discover_competitions(classifications)
     assert all(result.operation.ok and result.seasons for result in results)
     assert [result.competition for result in results] == [item.competition for item in classifications]
-    assert len(trino.queries) == 3
+    assert len(trino.queries) == 6
     assert not any(key[0] == "fotmob_field_inventory" for key in repo._pending)
     trino.db.close()
 
