@@ -127,6 +127,31 @@ def club_capture(absences, risks, *, http=200):
     return cap("club_absences", CLUB, body, http=http)
 
 
+@pytest.mark.parametrize("change", ["all_missing", "one_missing", "wrong_key"])
+def test_published_current_injury_inventory_must_match_the_table(change):
+    meta, body = next(
+        (m, b) for m, b in actual_current_files() if m["url"].endswith("/URU1")
+    )
+    soup = BeautifulSoup(body, "html.parser")
+    table = sections._block(soup, {"injured players"}).select_one("table.items")
+    inventory = table.find_parent(class_="grid-view").select_one(":scope > .keys")
+    assert len(inventory.select(":scope > span")) == 28
+    if change == "all_missing":
+        table.tbody.clear()
+        row = soup.new_tag("tr")
+        cell = soup.new_tag("td", colspan=str(len(table.thead.find_all("th"))))
+        cell.string = "No entries found"
+        row.append(cell)
+        table.tbody.append(row)
+    elif change == "one_missing":
+        table.tbody.find("tr", recursive=False).decompose()
+    else:
+        inventory.span.string = "999"
+    source = cap("current_injury", meta["url"], str(soup))
+    (outcome,) = extract(source, competition_id="URU1", edition_id="2025")
+    assert outcome.status == "error" and not outcome.rows and outcome.proof is None
+
+
 def test_four_recorded_current_editions_match_source_and_exclude_league_standings():
     expected = {
         "URU1": ("2025", 28),
@@ -407,6 +432,7 @@ def test_missing_unknown_and_explicit_empty_current_tables_stay_distinct():
     meta, body = next(actual_current_files())
     soup = BeautifulSoup(body, "html.parser")
     table = soup.select_one("table.items")
+    table.find_parent(class_="grid-view").select_one(":scope > .keys").clear()
     table.tbody.clear()
     marker = soup.new_tag("tr")
     cell = soup.new_tag("td", colspan="5")

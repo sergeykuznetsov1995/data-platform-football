@@ -307,6 +307,20 @@ def _current_records(soup, scope):
         record["player_id"] == "0" or record["club_id"] == "0" for record in records
     ):
         raise InjurySectionError("invalid_current_injury_identity")
+    grid = block.select_one("table.items").find_parent(class_="grid-view")
+    if grid is not None:
+        inventories = grid.select(":scope > .keys")
+        if len(inventories) > 1:
+            raise InjurySectionError("current_injury_inventory_ambiguous")
+        if inventories:
+            published = [
+                tag.get_text(strip=True)
+                for tag in inventories[0].select(":scope > span")
+            ]
+            if published != list(inventories[0].stripped_strings) or published != [
+                r["player_id"] for r in records
+            ]:
+                raise InjurySectionError("current_injury_inventory_mismatch")
     return records
 
 
@@ -730,6 +744,9 @@ def extract(captures, scope, *, extracted_at, universe_version):
     capture = captures[0]
     endpoint = capture.endpoint
     entities = ENDPOINT_ENTITIES[endpoint]
+    revision = (
+        "current-injuries-section-v2" if endpoint == "current_injury" else _REVISION
+    )
 
     def outcome(entity, source, status, reason, rows=(), proof=None):
         return make_outcome(
@@ -740,7 +757,7 @@ def extract(captures, scope, *, extracted_at, universe_version):
             reason=reason,
             records=rows,
             proof=proof,
-            parser_revision=_REVISION,
+            parser_revision=revision,
             extracted_at=extracted_at,
             universe_version=universe_version,
         )

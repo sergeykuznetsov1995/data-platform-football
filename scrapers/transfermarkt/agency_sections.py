@@ -9,6 +9,7 @@ See licenses/exclusive-affiliation-ergm-replication-MIT.txt.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 import json
 import re
@@ -79,6 +80,23 @@ class AgencyError(ValueError):
         super().__init__(reason)
 
 
+@dataclass
+class _WalkBounds:
+    highest_seen: int = 1
+    declared_last: int | None = None
+
+    def check(self, number, following, highest, declared):
+        self.highest_seen = max(self.highest_seen, highest, number)
+        if declared is not None:
+            if self.declared_last is not None and self.declared_last != declared:
+                raise AgencyError('pager_last_changed_during_walk')
+            self.declared_last = declared
+        if self.declared_last is not None and self.highest_seen > self.declared_last:
+            raise AgencyError('pager_extends_beyond_declared_last')
+        if following is None and number < self.highest_seen:
+            raise AgencyError('walk_ended_before_announced_page')
+
+
 def scope_from_url(endpoint, url, *, edition_id='', competition_id=''):
     if endpoint == 'agency_statistics':
         land, number = agency_statistics_route(url)
@@ -123,10 +141,26 @@ def _absolute(href):
 def _document(capture):
     soup = BeautifulSoup(capture.text, 'html.parser')
     expected = scope_from_url(capture.endpoint, capture.url)
-    for canonical in soup.select('link[rel~=canonical], meta[property="og:url"]'):
+    canonicals = soup.select('link[rel~=canonical], meta[property="og:url"]')
+    for canonical in canonicals:
         url = _absolute(canonical.get('href') or canonical.get('content'))
         if scope_from_url(capture.endpoint, url) != expected:
             raise AgencyError('representative_page_identity_mismatch')
+    if capture.endpoint in {'agency_profile', 'agency_clients', 'agent_profile'}:
+        agency = capture.endpoint != 'agent_profile'
+        owner = expected.get('agency_id') or expected['entity_id']
+        navigations = soup.select('tm-subnavigation')
+        if any(nav.get('controller') != 'berater' or nav.get('section', 'berater') != 'berater' or nav.get('id') != owner
+               for nav in navigations):
+            raise AgencyError('representative_navigation_identity_mismatch')
+        title = soup.title.get_text(' ', strip=True) if soup.title else ''
+        agency_header = soup.select_one('h2.advisor-header__headline')
+        if (re.search(r'[-|]\s*(?:referee|player|manager|coach) profile\b', title, re.I)
+                or agency and re.search(r'[-|]\s*agent profile\b', title, re.I)
+                or not agency and agency_header is not None):
+            raise AgencyError('representative_page_type_mismatch')
+        if not canonicals and not (agency and agency_header is not None and navigations):
+            raise AgencyError('representative_page_identity_missing')
     return soup
 
 
@@ -181,7 +215,8 @@ def _pagination(capture, number, soup, table, count):
             if page != number + 1:
                 raise AgencyError('invalid_next_page')
             next_links.add(url)
-        if classes & {'last', 'tm-pagination__list-item--icon-last', 'tm-pagination__list-item--icon-last-page'}:
+        if (classes & {'last', 'tm-pagination__list-item--icon-last', 'tm-pagination__list-item--icon-last-page'}
+                or 'last' in (link.get('rel') or ())):
             declared_last.add(page)
         if page == number + 1:
             following_links.add(url)
@@ -192,18 +227,19 @@ def _pagination(capture, number, soup, table, count):
         raise AgencyError('pager_last_mismatch')
     if len(next_links or following_links) > 1:
         raise AgencyError('ambiguous_next_page')
-    if number >= last and not next_links:
-        return None
-    match = _AGENCY.fullmatch(capture.url)
-    return next(iter(next_links or following_links), f'{match[1]}/page/{number + 1}')
+    following = None
+    if number < last or next_links:
+        match = _AGENCY.fullmatch(capture.url)
+        following = next(iter(next_links or following_links), f'{match[1]}/page/{number + 1}')
+    return following, last, next(iter(declared_last), None)
 
 
 def next_page(capture, page_number):
     if capture.endpoint == 'agency_directory':
-        return _directory_page(capture, page_number)[2]
+        return _directory_page(capture, page_number)[2][0]
     soup = _document(capture)
     table, _, _ = _table(soup)
-    return _pagination(capture, page_number, soup, table, _count(soup))
+    return _pagination(capture, page_number, soup, table, _count(soup))[0]
 
 
 def _links(cell, route, marker):
@@ -261,6 +297,7 @@ def _client_row(tr, cols, width):
 def _client_walk(captures):
     expected_count = None
     next_url = captures[0].url
+    bounds = _WalkBounds()
     remaining = []
     by_player = {}
     seen_captures = set()
@@ -271,7 +308,9 @@ def _client_walk(captures):
         soup = _document(capture)
         table, cols, width = _table(soup)
         count = _count(soup)
-        next_url = _pagination(capture, number, soup, table, count)
+        pager = _pagination(capture, number, soup, table, count)
+        bounds.check(number, *pager)
+        next_url = pager[0]
         if number > 1 and count != expected_count:
             raise AgencyError('client_inventory_changed')
         expected_count = count
@@ -281,6 +320,15 @@ def _client_walk(captures):
         rows = [_client_row(tr, cols, width) for tr in body.find_all('tr', recursive=False)]
         if count and not rows:
             raise AgencyError('unproven_empty_page')
+        ids = [row['player_id'] for row in rows]
+        grid = table.find_parent(class_='grid-view')
+        inventories = grid.select(':scope > .keys') if grid is not None else []
+        if len(inventories) > 1:
+            raise AgencyError('client_page_inventory_ambiguous')
+        if inventories:
+            published = [tag.get_text(strip=True) for tag in inventories[0].select(':scope > span')]
+            if published != list(inventories[0].stripped_strings) or published != ids:
+                raise AgencyError('client_page_player_inventory_mismatch')
         new_rows = []
         for row in rows:
             player = row['player_id']
@@ -290,7 +338,6 @@ def _client_walk(captures):
             else:
                 by_player[player] = row
                 new_rows.append(row)
-        ids = [r['player_id'] for r in rows]
         page = dict(page_number=number, client_count=count, source_row_count=len(rows), new_client_count=len(new_rows),
                     page_client_ids=json.dumps(ids, separators=(',', ':')), next_page_url=next_url)
         remaining.append((capture, page, new_rows))
@@ -306,27 +353,29 @@ def _staff(soup, agency_id):
         if heading and heading.get_text(' ', strip=True).casefold() in {'staff', 'agents', 'mitarbeiter', 'berater'}:
             tables.extend(box.select('table.items'))
     if len(tables) != 1:
-        return (), None
+        return (), None, False
     body = tables[0].find('tbody', recursive=False) or tables[0]
     members = {}
     listings = []
-    identified = True
+    unresolved = False
     for tr in body.find_all('tr', recursive=False):
         agent_id, name = _links(tr, _AGENT, '/profil/berater/')
         if agent_id and name and members.setdefault(agent_id, name) != name:
             raise AgencyError('conflicting_agency_staff')
-        identified &= bool(agent_id and name)
+        unresolved |= not (agent_id and name)
         labels = tr.select('strong.employee-label')
         if len(labels) == 1 and (listed_name := labels[0].get_text(' ', strip=True)):
-            cell = labels[0].parent
+            if agent_id and name and listed_name != name:
+                raise AgencyError('conflicting_agency_staff')
+            cell = labels[0].find_parent('td') or labels[0].parent
             roles = [match[1] for span in cell.find_all('span', recursive=False)
                      if (match := re.fullmatch(r'\(([^()]+)\)', span.get_text(' ', strip=True)))]
             licensed = cell.select_one('.licensed__label[title="Officially licensed"]')
             listings.append(dict(source_name=listed_name, source_roles=roles, licensed_label=licensed['title'] if licensed else None,
                                  agent_id=agent_id))
     relations = tuple(dict(entity_type='agency', entity_id=agency_id, agency_id=agency_id, agent_id=agent_id,
-                           agent_name=name, relation_type='agent_agency') for agent_id, name in members.items()) if identified else ()
-    return relations, json.dumps(listings, ensure_ascii=False, separators=(',', ':')) if listings else None
+                           agent_name=name, relation_type='agent_agency') for agent_id, name in members.items())
+    return relations, json.dumps(listings, ensure_ascii=False, separators=(',', ':')) if listings else None, unresolved
 
 
 def _profiles(capture, identity, outcome):
@@ -336,15 +385,15 @@ def _profiles(capture, identity, outcome):
                            else 'h1.data-header__headline-wrapper')
     name = headings[0].get_text(' ', strip=True) if len(headings) == 1 else ''
     results = []
-    identified = agency or bool(soup.select('link[rel~=canonical], meta[property="og:url"]'))
     staff = ()
+    unresolved = False
     listing = staff_error = None
     if agency:
         try:
-            staff, listing = _staff(soup, identity['entity_id'])
+            staff, listing, unresolved = _staff(soup, identity['entity_id'])
         except AgencyError as exc:
             staff_error = exc.reason
-    if name and name not in _MISSING and identified:
+    if name and name not in _MISSING:
         count = _count(soup) if agency else None
         results.append(outcome(_PROFILE, capture, 'observed_present', 'published_profile',
                                [dict(identity, name=name, client_count=count, staff_listing_json=listing)]))
@@ -354,8 +403,9 @@ def _profiles(capture, identity, outcome):
         if staff_error:
             results.append(outcome(_AFFILIATIONS, capture, 'error', staff_error))
         else:
+            reason = 'published_personnel_links_partial_identity' if unresolved else 'published_personnel_links'
             results.append(outcome(_AFFILIATIONS, capture, 'observed_present' if staff else 'unknown',
-                                   'published_personnel_links' if staff else 'personnel_identity_not_published', staff))
+                                   reason if staff else 'personnel_identity_not_published', staff))
     return tuple(results)
 
 
@@ -385,7 +435,7 @@ def extract(captures, scope, *, extracted_at, universe_version):
 
     def outcome(entity, capture, status, reason, records=(), proof=None):
         return make_outcome(entity, capture, scope, status=status, reason=f'{endpoint}:{reason}',
-                            records=records, proof=proof, parser_revision='agency-sections-v2',
+                            records=records, proof=proof, parser_revision='agency-sections-v3',
                             extracted_at=extracted_at, universe_version=universe_version)
 
     for capture in captures:
@@ -414,7 +464,9 @@ def extract(captures, scope, *, extracted_at, universe_version):
             raise AgencyError('unexpected_profile_page')
         return _profiles(first, identity, outcome)
     except (ValueError, UnicodeError) as exc:
-        return tuple(outcome(entity, first, 'error', getattr(exc, 'reason', 'invalid_source_data')) for entity in entities)
+        reason = getattr(exc, 'reason', 'invalid_source_data')
+        status = 'unknown' if reason == 'representative_page_identity_missing' else 'error'
+        return tuple(outcome(entity, first, status, reason) for entity in entities)
 
 
 def agency_directory_route(url):
@@ -531,20 +583,26 @@ def _directory_page(capture, number):
     rows, count, region = _directory_rows(soup, query, number)
     links = set()
     highest = number
+    declared = set()
     for link in region.select('.pager a[href], .tm-pagination a[href]'):
         url = _absolute(link['href'])
         term, page = agency_directory_route(url)
         item = link.find_parent('li')
         classes = item.get('class', ()) if item else ()
-        if term != query or (('next' in (link.get('rel') or ()) or 'tm-pagination__list-item--icon-next-page' in classes)
+        rel = link.get('rel') or ()
+        if term != query or (('next' in rel or 'next' in classes or 'tm-pagination__list-item--icon-next-page' in classes)
                              and page != number + 1):
             raise AgencyError('directory_pager_scope_mismatch')
+        if 'last' in rel or {'last', 'tm-pagination__list-item--icon-last', 'tm-pagination__list-item--icon-last-page'}.intersection(classes):
+            declared.add(page)
         if page == number + 1:
             links.add(url)
         highest = max(highest, page)
     if len(links) > 1 or (highest > number and not links):
         raise AgencyError('directory_pager_incomplete')
-    return rows, count, next(iter(links), None)
+    if len(declared) > 1 or declared and highest not in declared:
+        raise AgencyError('directory_pager_last_mismatch')
+    return rows, count, (next(iter(links), None), highest, next(iter(declared), None))
 
 
 def _directory_rows(soup, query, number):
@@ -603,6 +661,7 @@ def _directory_rows(soup, query, number):
 
 def _directory_walk(captures):
     following = captures[0].url
+    bounds = _WalkBounds()
     total = None
     agencies = set()
     pages = []
@@ -611,7 +670,9 @@ def _directory_walk(captures):
         if capture.endpoint != 'agency_directory' or capture.url != following or capture.capture_id in capture_ids:
             raise AgencyError('directory_walk_broken')
         capture_ids.add(capture.capture_id)
-        rows, expected, following = _directory_page(capture, number)
+        rows, expected, pager = _directory_page(capture, number)
+        bounds.check(number, *pager)
+        following = pager[0]
         if (number > 1 and total != expected) or (not rows and (expected or number != 1 or following is not None)):
             raise AgencyError('directory_hits_changed')
         total = expected

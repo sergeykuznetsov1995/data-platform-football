@@ -50,12 +50,51 @@ def test_published_career_counts_for_three_teams_are_not_rosters_or_callups():
 
 
 def test_team_lookup_retains_three_independent_published_level_ids_and_names():
-    result, = observe('national_team_reference', TEAMS_URL, recorded('argentina-national-teams.json.gz'))
-    assert result.status == 'observed_present'
-    assert [(r['national_team_id'], r['national_team_name'], r['national_team_type_id']) for r in result.rows] == [
+    results = observe('national_team_reference', TEAMS_URL, recorded('argentina-national-teams.json.gz'))
+    assert all(outcome.status == 'observed_present' and len(outcome.rows) == 1 for outcome in results)
+    rows = [outcome.rows[0] for outcome in results]
+    assert [(r['national_team_id'], r['national_team_name'], r['national_team_type_id']) for r in rows] == [
         ('11940', 'Argentina U20', '4'), ('3437', 'Argentina', '1'), ('53819', 'Argentina Olympic Team', '14'),
     ]
-    assert all(r['source_url'] == TEAMS_URL and r['main_national_team_id'] == '3437' for r in result.rows)
+    assert all(r['source_url'] == TEAMS_URL and r['main_national_team_id'] == '3437' for r in rows)
+
+
+def test_overlap_at_same_clock_cannot_replace_another_packets_team(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+    from scrapers.transfermarkt.orchestrator import CoreRun, CoreScopePlan, SectionTarget
+    from tests.unit.scrapers.test_transfermarkt_native_writer import CoreDB, CoreWriter
+
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+    teams = {str(row['id']): row for row in recorded('argentina-national-teams.json.gz')['data']}
+    db = CoreDB()
+    def run(ids, cycle, clock=CLOCK):
+        url = API + '/clubs?' + '&'.join('ids%5B%5D=' + team for team in ids)
+        value = {'success': True, 'data': [teams[team] for team in ids]}
+        body = json.dumps(value).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        def fetch(requested, **options):
+            assert requested == url and options['as_json']
+            return FetchOutcome(status=FetchStatus.OK, value=value, raw_capture_id=digest, raw_body_hash=digest,
+                                raw_fetched_at=clock, status_code=200)
+        def load(capture_id, requested):
+            assert (capture_id, requested) == (digest, url)
+            return body, SimpleNamespace(url=url, endpoint='national_team_reference', content_hash=digest, fetched_at=clock)
+        runner = CoreRun(fetch, request_raw_loader=load, extracted_at=EXTRACTED)
+        plan = CoreScopePlan('FIWC', '2526', 'national', cycle, section_targets=(SectionTarget('national_team_reference', url),))
+        return runner.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    read = 'SELECT national_team_id,team_packet FROM transfermarkt_national_team_level_observations ORDER BY 1,2'
+    first = run(('11940', '3437'), 'first')
+    before = db.sql.execute(read).fetchall()
+    assert first.receipt['receipt_readback'] and len(before) == 2
+    with pytest.raises(RuntimeError):
+        run(('53819', '3437'), 'second')
+    assert db.sql.execute(read).fetchall() == before
+    assert run(('11940', '3437'), 'first').receipts == first.receipts
+    later = run(('53819', '3437'), 'later', '2026-10-15T10:00:00.000000+00:00')
+    assert later.receipt['receipt_readback'] and len(db.sql.execute(read).fetchall()) == 4
 
 
 @pytest.mark.parametrize('endpoint,url', [
@@ -128,11 +167,19 @@ def test_native_plan_carries_metric_types_keys_and_separate_capture_lineage():
     assert career_plan.natural_keys == ('player_id', 'national_team_id', 'period', 'metric', 'observed_at')
     assert 'metric_value bigint' in career_plan.ddl and 'national_debut date' in career_plan.ddl
     assert all(r['raw_capture_id'] == result.capture.capture_id and r['source_url'] == CAREER_URL for r in career_plan.rows)
-    reference, = observe('national_team_reference', TEAMS_URL, recorded('argentina-national-teams.json.gz'))
-    references = core.plan_for_outcome(reference, captured_at=CLOCK,
-                                       scope_values=lane.scope_from_url(reference.capture.endpoint, TEAMS_URL))
-    assert len(references.rows) == 3 and references.rows[0]['raw_capture_id'] != career_plan.rows[0]['raw_capture_id']
-    assert core.build_core_dq((result, reference))['passed']
+    references = observe('national_team_reference', TEAMS_URL, recorded('argentina-national-teams.json.gz'))
+    assert len(references) == 3 and core.build_core_dq((result, *references))['passed']
+    for item in references:
+        row, = item.rows
+        plan = core.plan_for_outcome(item, captured_at=CLOCK, scope_values={'national_team_id': row['national_team_id']})
+        assert plan.scope_columns == ('national_team_id',)
+        assert row['raw_capture_id'] != career_plan.rows[0]['raw_capture_id']
+    with pytest.raises(ValueError, match='row_scope_mismatch'):
+        core.plan_for_outcome(references[0], captured_at=CLOCK, scope_values={'national_team_id': '999'})
+    first = references[0]
+    first.rows[0]['team_packet'] = '999'
+    with pytest.raises(ValueError, match='row_scope_mismatch'):
+        core.plan_for_outcome(first, captured_at=CLOCK, scope_values={'national_team_id': '11940'})
 
 
 def test_explicit_club_tooltip_preserves_documented_callup_flag_without_inventing_a_callup_id():
@@ -268,4 +315,4 @@ def test_agencies_and_national_teams_full_core_run_readback_and_replay(tmp_path,
             ('11940', 14), ('3437', 125), ('53819', 2)]
         assert db.sql.execute('SELECT national_team_id, national_team_type_id FROM transfermarkt_national_team_level_observations '
                               'ORDER BY national_team_id').fetchall() == [('11940', '4'), ('3437', '1'), ('53819', '14')]
-        assert db.sql.execute('SELECT count(*) FROM transfermarkt_core_receipts_v1').fetchone() == (13,)
+        assert db.sql.execute('SELECT count(*) FROM transfermarkt_core_receipts_v1').fetchone() == (15,)

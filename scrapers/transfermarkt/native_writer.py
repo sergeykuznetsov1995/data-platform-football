@@ -556,7 +556,7 @@ class NativeWritePlan:
         urls = {page[0] for page in self.pages} | {row['source_url'] for row in self.rows}
         urls.add(evidence.get('source_url', first['source_url']))
         for url in urls:
-            core._check_scope_against_capture(self.entity, scope, SimpleNamespace(url=url, endpoint=endpoint))
+            core._check_scope_against_capture(self.entity, scope, SimpleNamespace(url=url, endpoint=endpoint), rows=self.rows)
         if self.entity == 'club_value_observations' and any(
                 row['competition_id'] != core._club_value_competition(row['source_url'])
                 for row in self.rows):

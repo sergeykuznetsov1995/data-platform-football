@@ -888,7 +888,7 @@ def plan_for_outcome(
                       else capture.captured_at if capture is not None else None)
     if evidence_clock is not None and captured_at != evidence_clock:
         raise CoreParseError('captured_at_differs_from_evidence')
-    _check_scope_against_capture(entity, scope_values, capture)
+    _check_scope_against_capture(entity, scope_values, capture, rows=outcome.rows)
     _check_pages_against_scope(entity, scope_values, outcome.pages)
     evidence = ()
     if capture is not None:
@@ -980,15 +980,15 @@ def saison_year(season: str) -> int:
     return int(season) - 1
 
 
-def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture) -> None:
+def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], capture, *, rows=()) -> None:
     """Empty outcomes have no rows to cross-check; the capture URL still names
     the entity it belongs to, so a swapped club/player scope fails here."""
     if capture is not None:
-        _check_scope_against_url(entity, scope_values, capture.url, capture.endpoint)
+        _check_scope_against_url(entity, scope_values, capture.url, capture.endpoint, rows=rows)
 
 
 def _check_scope_against_url(
-    entity: str, scope_values: Mapping[str, str], source_url: str, source_endpoint: str,
+    entity: str, scope_values: Mapping[str, str], source_url: str, source_endpoint: str, *, rows=(),
 ) -> None:
     if entity in section_catalog.TABLES:
         if entity not in section_catalog.ENTITIES.get(source_endpoint, ()):
@@ -1000,7 +1000,10 @@ def _check_scope_against_url(
             )
         except ValueError as exc:
             raise CoreParseError('row_scope_mismatch') from exc
-        if dict(scope_values) != section_catalog.entity_scope(entity, source_endpoint, expected):
+        if dict(scope_values) not in section_catalog.entity_scopes(entity, source_endpoint, expected):
+            raise CoreParseError('row_scope_mismatch')
+        if source_endpoint == 'national_team_reference' and any(
+                not isinstance(row, Mapping) or row.get('team_packet') != expected['team_packet'] for row in rows):
             raise CoreParseError('row_scope_mismatch')
         return
     url = urlsplit(source_url)

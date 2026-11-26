@@ -39,7 +39,8 @@ def row(player, *, age='29', amount='€2.50m'):
 
 
 def client_page(rows, *, total=3, pager='', name='Alpha'):
-    return (f'<h1 class="data-header__headline-wrapper">{name}</h1><h2>Key Facts</h2><span>Players: {total}</span>'
+    return (f'<meta property="og:url" content="{AGENCY}"><h1 class="data-header__headline-wrapper">{name}</h1>'
+            f'<h2>Key Facts</h2><span>Players: {total}</span>'
             '<div class="grid-view"><table class="items"><thead><tr><th>Player</th><th>Age</th><th>Nat.</th>'
             '<th>Current club</th><th>Market value</th></tr></thead><tbody>'
             + rows + '</tbody></table>' + pager + '</div>')
@@ -148,6 +149,46 @@ def test_failed_or_wrong_profile_never_becomes_authoritative_empty():
     assert observe(capture('agent_profile', PERSON, wrong))[0].status == 'error'
 
 
+def test_referee_document_cannot_supply_an_agency_profile_or_staff():
+    referee = (FIXTURES.parent / 'referees/profile.html').read_text()
+    staff = ('<div class="box"><h2 class="content-box-headline">Staff</h2><table class="items"><tr><td>'
+             '<a href="/alex/profil/berater/42">Alex</a></td></tr></table></div>')
+    for body in (referee, referee + staff, f'<meta property="og:url" content="{AGENCY}">' + referee + staff,
+                 '<h2 class="advisor-header__headline">Alpha</h2>' + staff):
+        for endpoint in ('agency_profile', 'agency_clients'):
+            assert all(not o.rows and o.status not in core.CONCLUSIVE_CORE_STATUSES
+                       for o in observe(capture(endpoint, AGENCY, body)))
+
+
+def test_confirmed_agency_preserves_known_links_and_unresolved_staff_from_the_same_table():
+    staff = ('<div class="box"><h2 class="content-box-headline">Staff</h2><table class="items"><tbody>'
+             '<tr><td><a href="/alex/profil/berater/42"><strong class="employee-label">Alex</strong></a>'
+             '<span>(Agent)</span></td></tr><tr><td><strong class="employee-label">Another staff member</strong></td></tr>'
+             '</tbody></table></div>')
+    profile, relations = observe(capture('agency_profile', AGENCY, client_page('', total=0) + staff))
+    assert [(r['agent_id'], r['agency_id'], r['agent_name']) for r in relations.rows] == [('42', '47', 'Alex')]
+    assert relations.status == 'observed_present' and 'partial' in relations.status_reason
+    assert [(r['source_name'], r['source_roles'], r['agent_id']) for r in json.loads(profile.rows[0]['staff_listing_json'])] == [
+        ('Alex', ['Agent'], '42'), ('Another staff member', [], None)]
+    assert core.plan_for_outcome(relations, captured_at=relations.capture.captured_at,
+                                 scope_values={'entity_type': 'agency', 'entity_id': '47'}).rows
+    nameless, bound_staff = observe(capture('agency_profile', AGENCY, f'<meta property="og:url" content="{AGENCY}">' + staff))
+    assert not nameless.rows and [(r['agent_id'], r['agency_id']) for r in bound_staff.rows] == [('42', '47')]
+    for meta in ('', f'<meta property="og:url" content="{PERSON}">', f'<meta property="og:url" content="{AGENCY}">'
+                 '<tm-subnavigation controller="berater" id="48" section="berater"></tm-subnavigation>',
+                 f'<meta property="og:url" content="{AGENCY}">'
+                 '<tm-subnavigation controller="schiedsrichter" id="47" section="schiedsrichter"></tm-subnavigation>'):
+        assert all(not o.rows for o in observe(capture('agency_profile', AGENCY, meta + staff)))
+
+
+def test_agency_navigation_confirms_the_same_id_as_the_agency_header():
+    html = ('<tm-subnavigation controller="berater" section="berater" id="47"></tm-subnavigation>'
+            '<h2 class="advisor-header__headline">Alpha</h2>')
+    profile, staff = observe(capture('agency_profile', AGENCY, html))
+    assert profile.rows[0]['entity_id'] == '47' and profile.rows[0]['name'] == 'Alpha' and not staff.rows
+    assert all(not o.rows for o in observe(capture('agency_profile', AGENCY, html.replace('id="47"', 'id="48"'))))
+
+
 # The original .co.uk search archive at SchubmannM/footy-world-xi-validator-web
 # c332da0e, footy_validator/tests/fixtures.py:267–364, has 22 hits, 10 on page 1.
 # This separately authored two-row fixture uses its published agency IDs and names;
@@ -190,6 +231,45 @@ def test_search_reconciles_only_its_own_pager_and_full_query_count():
     assert all(not o.rows for o in observe(capture('agency_directory', SEARCH, search_page(entries, hits=22))))
 
 
+@pytest.mark.parametrize('endpoint', ['agency_clients', 'agency_directory'])
+@pytest.mark.parametrize('declared_last', [False, True])
+def test_walk_remembers_pages_announced_earlier_and_rejects_conflicting_last(endpoint, declared_last):
+    is_client = endpoint == 'agency_clients'
+    base = AGENCY if is_client else SEARCH
+
+    def url(number):
+        return base if number == 1 else base + (f'/page/{number}' if is_client else f'&page={number}')
+
+    def page(number, ids, pager):
+        html = (client_page(''.join(row(i) for i in ids), total=3, pager=pager) if is_client else
+                search_page([(i, f'Agency {i}', f'Agent {i}') for i in ids], hits=3, pager=pager))
+        return capture(endpoint, url(number), html, minute=number)
+
+    def link(number, kind):
+        return f'<li class="{kind}"><a href="{url(number).replace("&", "&amp;")}">{number}</a></li>'
+
+    def pager(*links):
+        return '<div class="pager"><ul>' + ''.join(links) + '</ul></div>'
+
+    first = page(1, ['101'], pager(link(2, 'next'), link(3, 'last' if declared_last else 'page')))
+    entities = {'agency_client_observations', 'agency_client_page_observations'} if is_client else {'agency_directory_observations'}
+    for partial in (page(2, ['102', '103'], ''), page(2, ['102', '103'], pager(link(2, 'last')))):
+        facts = [o for o in observe(first, partial) if o.entity in entities]
+        assert facts and all(not o.rows and o.status not in core.CONCLUSIVE_CORE_STATUSES for o in facts)
+    complete = observe(first, page(2, ['102'], pager(link(3, 'next'))), page(3, ['103'], ''))
+    business = [o for o in complete if o.entity == ('agency_client_observations' if is_client else 'agency_directory_observations')]
+    assert [(r['page_number'], r['player_id' if is_client else 'agency_id']) for o in business for r in o.rows] == [
+        (1, '101'), (2, '102'), (3, '103')]
+    if declared_last:
+        moved = observe(first, page(2, ['102'], pager(link(3, 'next'), link(4, 'last'))), page(3, ['103'], ''))
+        assert all(not o.rows for o in moved if o.entity in entities)
+    else:
+        first_window = page(1, ['101'], pager(link(2, 'next')))
+        last_window = page(2, ['102'], pager(link(3, 'next'), link(3, 'last')))
+        expanded = observe(first_window, last_window, page(3, ['103'], ''))
+        assert sum(len(o.rows) for o in expanded if o.entity == business[0].entity) == 3
+
+
 @pytest.mark.parametrize('bad', [SEARCH.replace('.com', '.co.uk'), SEARCH + '&sort=foo', SEARCH + '&page=00',
     SEARCH + '&query=q', SEARCH.replace('x=0','x=7'), SEARCH.replace('%20', '%0a'), SEARCH + '#',
     SEARCH.replace('Thomas%20Muller', '%2Flogin'), SEARCH.replace('x=0&y=0', 'x=0')])
@@ -228,6 +308,41 @@ def test_fpa_has_13_player_clients_and_published_staff_names_without_person_ids(
     assert staff[5] == dict(source_name='Marcelo Sander', source_roles=['Agent'], licensed_label=None, agent_id=None)
     assert relations.status == 'unknown' and not relations.rows
     assert all(o.status == 'unavailable' and not o.rows for o in observe(capture('agency_clients', FPA, 'Checking...', status=202)))
+
+
+@pytest.mark.parametrize('old,new', [
+    ('/spieler/707759', '/spieler/987654321'), ('<span>707759</span><span>464190</span>', '<span>464190</span><span>707759</span>'),
+    ('<span>707759</span>', '<span>707759</span><span>707759</span>'), ('<span>707759</span>', '707759'),
+    ('<div class="keys"', '<div class="keys"></div><div class="keys"'),
+])
+def test_contradictory_client_inventory_discards_the_entire_walk_but_preserves_the_agency_profile(old, new):
+    html = (FIXTURES / 'fpa-770.html').read_text().replace(old, new)
+    clients, page, profile, _ = observe(capture('agency_clients', FPA, html))
+    assert clients.status == page.status == 'error' and not clients.rows and not page.rows
+    assert profile.status == 'observed_present' and profile.rows[0]['entity_id'] == '770'
+
+
+@pytest.mark.parametrize('players,keys,complete', [
+    ([], [], True), ([], ['101'], False), (['101'], [], False),
+    (['101', '101'], ['101'], False), (['101', '101'], ['101', '101'], True),
+])
+def test_optional_client_key_grid_cross_checks_empty_and_repeated_ids_before_deduplication(players, keys, complete):
+    inventory = '<div class="keys">' + ''.join(f'<span>{key}</span>' for key in keys) + '</div>'
+    html = client_page(''.join(row(player) for player in players), total=len(set(players)), pager=inventory)
+    clients, page, *_ = observe(capture('agency_clients', AGENCY, html))
+    if complete:
+        assert clients.status in core.CONCLUSIVE_CORE_STATUSES and page.rows[0]['source_row_count'] == len(players)
+    else:
+        assert not clients.rows and not page.rows and clients.status == page.status == 'error'
+
+
+def test_a_conflicting_second_page_suppresses_client_records_from_both_pages():
+    first, second = pair()
+    inventory = '<div class="keys"><span>102</span><span>999</span></div>'
+    bad = capture('agency_clients', second.url, client_page(row('102') + row('103'), pager=PREV + inventory), minute=1)
+    results = observe(first, bad)
+    assert all(o.status == 'error' and not o.rows for o in results if o.entity in {
+        'agency_client_observations', 'agency_client_page_observations'})
 
 
 def test_statistics_rows_keep_the_published_filter_next_url_and_only_this_page():

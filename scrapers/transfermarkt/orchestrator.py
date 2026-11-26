@@ -325,11 +325,11 @@ def _target_requests(plan: CoreScopePlan):
         if endpoint in module.PAGINATED and module.page_number(endpoint, target.url) != 1:
             raise ValueError(f'{endpoint}:first_page_missing')
         for entity in module.ENDPOINT_ENTITIES[endpoint]:
-            physical_scope = section_catalog.entity_scope(entity, endpoint, values)
-            identity = (entity, tuple(sorted(physical_scope.items())))
-            if identity in seen:
-                raise ValueError(f'{endpoint}:duplicate_section_target')
-            seen.add(identity)
+            for physical_scope in section_catalog.entity_scopes(entity, endpoint, values):
+                identity = entity, tuple(sorted(physical_scope.items()))
+                if identity in seen:
+                    raise ValueError(f'{endpoint}:duplicate_section_target')
+                seen.add(identity)
         club = ClubTarget(values['club_id'], '') if 'club_id' in values else None
         yield _Request(endpoint, target.url, section_scope=values, club=club,
                        player_id=values.get('player_id', ''), competition_id=values.get('competition_id', ''),
@@ -593,7 +593,14 @@ def _outcome_scope_values(outcome, request, plan):
     # identity. Only explicit fan-out sections (one capture, many row scopes)
     # derive the scope from their rows.
     if request.section_scope is not None:
-        return section_catalog.entity_scope(outcome.entity, request.label, request.section_scope)
+        allowed = section_catalog.entity_scopes(outcome.entity, request.label, request.section_scope)
+        if len(allowed) == 1:
+            return allowed[0]
+        if outcome.rows:
+            values = {key: outcome.rows[0][key] for key in core.CORE_SCOPE_COLUMNS[outcome.entity]}
+            if values in allowed:
+                return values
+        raise CoreRunError(f'{outcome.entity} does not identify a requested owner')
     requested = None
     try:
         requested = request.scope_values(plan)

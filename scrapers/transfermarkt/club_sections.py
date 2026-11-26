@@ -78,6 +78,32 @@ def _country_names():
     return {country.country_id: country.country for country in load_countries()}
 
 
+def _is_club_profile(data, profile):
+    # Both source documents can publish a name and the same numeric ID.
+    if {'clubId', 'capacity', 'internationalCapacity', 'buildingDetails', 'isHistorical'}.intersection(data):
+        return False
+    link = re.fullmatch(r'/[A-Za-z0-9_-]+/startseite/verein/([1-9][0-9]*)/?', profile.url or '')
+    if link is not None:
+        return link[1] == profile.club_id
+    source_text = (profile.short_name, profile.abbreviation, profile.club_code, profile.official_name, profile.image,
+                   profile.address_line_1, profile.address_line_2, profile.country_id)
+    return (profile.is_national_team is not None or bool(profile.colors)
+            or any(value and value.strip() for value in source_text))
+
+
+def _is_club_stadium(data, stadium):
+    if {'baseDetails', 'preferences', 'squadDetails', 'crestUrl', 'relativeUrl', 'isSpecialClub'}.intersection(data):
+        return False
+    measures = (stadium.capacity, stadium.international_capacity, stadium.build_year, stadium.renovation_year,
+                stadium.field_length, stadium.field_width)
+    if any(value is not None for value in measures) or (stadium.field_surface or '').strip():
+        return True
+    # A sparse venue can publish its owning club alongside its location, images or historical flag.
+    return 'clubId' in data and (
+        any(value is not None for value in (stadium.latitude, stadium.longitude, stadium.source_is_historical))
+        or bool(stadium.address_line_1 or stadium.address_line_2 or stadium.country_id or stadium.images))
+
+
 def confirm_stadium_absence(outcomes, profile):
     """Pair a durable stadium 404 with the verified profile in this run."""
     stadium = outcomes[0].capture
@@ -110,7 +136,7 @@ def extract(captures, scope, *, extracted_at, universe_version):
     capture, = captures
     endpoint = capture.endpoint
     entities = ENDPOINT_ENTITIES[endpoint]
-    revision = staff.STAFF_PARSER_REVISION if endpoint == 'club_staff' else 'club-stadiums-v1'
+    revision = staff.STAFF_PARSER_REVISION if endpoint == 'club_staff' else 'club-stadiums-v2'
 
     def outcomes(status, reason, tables=None):
         return tuple(make_outcome(
@@ -138,11 +164,15 @@ def extract(captures, scope, *, extracted_at, universe_version):
         if endpoint == 'club_profile':
             profile = club_stadiums.parse_club_profile(payload, club_id=club_id, observed_at=clock.isoformat(),
                                                        country_names=_country_names())
+            if not _is_club_profile(payload['data'], profile):
+                return outcomes('error', 'club_profile:unverified_response_type')
             record = asdict(profile)
             record['colors'] = json.dumps(profile.colors, ensure_ascii=False, separators=(',', ':'))
             return outcomes('observed_present', 'club_profile:published', {entities[0]: [record]})
         observation = club_stadiums.parse_club_stadium(payload, club_id=club_id, observed_at=clock.isoformat(),
                                                        country_names=_country_names())
+        if not _is_club_stadium(payload['data'], observation.stadium):
+            return outcomes('error', 'club_stadium:unverified_response_type')
         venue = asdict(observation.stadium)
         stadium_id = observation.stadium.stadium_id
         # Without a source ID this key identifies only this club's observation.

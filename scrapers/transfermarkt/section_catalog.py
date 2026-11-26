@@ -22,8 +22,10 @@ def source_scope(endpoint, url, *, edition_id='', competition_id=''):
     return module.scope_from_url(endpoint, url, edition_id=edition_id, competition_id=competition_id)
 
 
-def entity_scope(entity, endpoint, target_scope):
-    """One agency response also owns the profile of the agency in its URL."""
+def entity_scopes(entity, endpoint, target_scope):
+    """Physical owners allowed by a source URL, including each club in a lookup."""
+    if endpoint == 'national_team_reference':
+        return tuple({'national_team_id': team} for team in target_scope['team_packet'].split(','))
     if endpoint == 'agency_clients':
-        return agency_sections.scope_for_entity(entity, endpoint, target_scope)
-    return target_scope
+        return (agency_sections.scope_for_entity(entity, endpoint, target_scope),)
+    return (target_scope,)

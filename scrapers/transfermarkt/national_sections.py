@@ -37,7 +37,7 @@ TABLES = {
         {'metric_value': 'bigint', 'national_debut': 'date', 'national_last_game': 'date'}),
     _TEAMS: ObservationTable(
         ('team_packet', 'national_team_id', 'national_team_name', 'national_team_type_id', 'main_national_team_id'),
-        ('national_team_id', 'observed_at'), ('team_packet',)),
+        ('national_team_id', 'observed_at'), ('national_team_id',)),
     _SQUADS: ObservationTable((*_ROSTER_SCOPE, 'player_id'), (*_ROSTER_SCOPE, 'player_id', 'observed_at'),
                               _ROSTER_SCOPE),
     _CALLUPS: ObservationTable((*_ROSTER_SCOPE, 'player_id', 'callup_id'), ('callup_id', 'observed_at'),
@@ -162,7 +162,7 @@ def _references(data, team_packet):
                                 main_national_team_id=_identifier(main) if main is not None else None)
     if set(records) != set(team_packet.split(',')):
         raise ValueError('national_reference_inventory_mismatch')
-    return 'observed_present', 'published_national_team_types', tuple(records.values()), None
+    return tuple(records.values())
 
 
 def _club_callup_flags(capture, club_id):
@@ -255,10 +255,11 @@ def extract(captures, scope, *, extracted_at, universe_version):
     capture, = captures
     endpoint = capture.endpoint
     entities = ENDPOINT_ENTITIES[endpoint]
+    revision = 'national-team-reference-v3' if endpoint == 'national_team_reference' else 'national-sections-v2'
 
     def outcome(entity, status, reason, records=(), proof=None):
         return make_outcome(entity, capture, scope, status=status, reason=f'{endpoint}:{reason}', records=records,
-                            proof=proof, parser_revision='national-sections-v2', extracted_at=extracted_at,
+                            proof=proof, parser_revision=revision, extracted_at=extracted_at,
                             universe_version=universe_version)
 
     if capture.status_code != 200:
@@ -285,7 +286,10 @@ def extract(captures, scope, *, extracted_at, universe_version):
                 raise ValueError('national_career_player_mismatch')
             result = _career(payload.get('data'), fields['player_id'])
         else:
-            result = _references(payload.get('data'), fields['team_packet'])
+            # A lookup packet proves each team's identity. Each team owns its
+            # observations even if another request groups it with different teams.
+            teams = _references(payload.get('data'), fields['team_packet'])
+            return tuple(outcome(_TEAMS, 'observed_present', 'published_national_team_types', (team,)) for team in teams)
         return (outcome(entities[0], *result),)
     except (ValueError, UnicodeError) as exc:
         return tuple(outcome(entity, 'error', str(exc)) for entity in entities)

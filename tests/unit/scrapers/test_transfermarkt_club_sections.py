@@ -200,7 +200,7 @@ def test_t7_country_names_use_the_static_country_file(country_id, name):
         'id': 127, 'name': 'SC Paderborn', 'baseDetails': {'superiorClub': {'location': location}},
     }}))
     stadium, _ = extract(capture('club_stadium', url + '/stadium', {'success': True, 'data': {
-        'name': 'Home', 'location': location,
+        'name': 'Home', 'capacity': 15000, 'location': location,
     }}))
     assert (profile.rows[0]['country_id'], profile.rows[0]['address_line_3']) == (str(country_id), name)
     assert (stadium.rows[0]['country_id'], stadium.rows[0]['country_name']) == (str(country_id), name)
@@ -212,8 +212,8 @@ def _stadium_pair(tmp_path, *, status=404, profile_id=127, profile_url_id=127, s
 
     url = f'{API}/club/127'
     profile = capture('club_profile', f'{API}/club/{profile_url_id}', {
-        'success': True, 'data': {'id': profile_id, 'name': 'SC Paderborn'}})
-    payload = {'success': True, 'data': {'name': 'Home'}} if status == 200 else b'Not found'
+        'success': True, 'data': {'id': profile_id, 'name': 'SC Paderborn', 'baseDetails': {'isNationalTeam': False}}})
+    payload = {'success': True, 'data': {'name': 'Home', 'capacity': 15000}} if status == 200 else b'Not found'
     stadium = replace(capture('club_stadium', url + '/stadium', profile.body if same_capture else payload),
                       captured_at='2026-11-26T08:59:59.000000+00:00', status_code=status)
     if same_capture:
@@ -366,3 +366,49 @@ def test_staff_rejects_a_contradictory_published_club(foreign):
         assert (outcome.status, outcome.status_reason, outcome.rows) == ('error', 'club_staff:club_mismatch', ())
     else:
         assert outcome.status == 'observed_present' and {row['club_id'] for row in outcome.rows} == {'127'}
+
+
+@pytest.mark.parametrize(('endpoint', 'fields'), [
+    ('club_stadium', {'baseDetails': {'isNationalTeam': False}}),
+    ('club_profile', {'capacity': 15000, 'buildingDetails': {'fieldWidth': 68}}),
+    ('club_stadium', {}),
+    ('club_profile', {}),
+    ('club_stadium', {'buildingDetails': {}}),
+    ('club_profile', {'baseDetails': {}}),
+    ('club_stadium', {'baseDetails': {'isNationalTeam': False}, 'capacity': 15000}),
+    ('club_profile', {'baseDetails': {'isNationalTeam': False}, 'capacity': 15000}),
+])
+def test_t7_unproven_or_conflicting_response_type_cannot_write(tmp_path, monkeypatch, endpoint, fields):
+    from dags.scripts import run_transfermarkt_core as cli
+    from tests.unit.scrapers.test_transfermarkt_orchestrator import _write_replay_manifest
+
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+    club_url = f'{API}/club/127'
+    stadium_url = club_url + '/stadium'
+    url = club_url if endpoint == 'club_profile' else stadium_url
+    sources = [capture(endpoint, url, {'success': True, 'data': {'id': 127, 'name': 'Paderborn', **fields}})]
+    if endpoint == 'club_profile':
+        sources.append(replace(capture('club_stadium', stadium_url, b'Not found'), status_code=404))
+    _write_replay_manifest(tmp_path, sources)
+    records = cli._load_records(tmp_path)
+    plan = CoreScopePlan('L1', '2627', 's', 'c', section_targets=tuple(
+        SectionTarget(source.endpoint, source.url) for source in sources))
+    db = CoreDB()
+    writer = CoreWriter(db)
+    result = CoreRun(cli._fixture_fetch(records), request_raw_loader=cli._fixture_raw_loader(records),
+                     extracted_at=CLOCK).run(plan, writer=writer, connection_factory=lambda: db)
+    assert not result.receipts and not writer.writes
+    assert all(item['status'] in {'error', 'unknown', 'unavailable'} and item['rows'] == 0 for item in result.outcomes)
+
+
+@pytest.mark.parametrize(('endpoint', 'fields'), [
+    ('club_profile', {'relativeUrl': '/sc-paderborn/startseite/verein/127'}),
+    ('club_stadium', {'buildingDetails': {'fieldLength': 105}}),
+    ('club_stadium', {'clubId': 127, 'location': {'countryId': 40}}),
+])
+def test_t7_sparse_payload_with_published_club_or_venue_fields_remains_conclusive(endpoint, fields):
+    url = f'{API}/club/127' + ('/stadium' if endpoint == 'club_stadium' else '')
+    outcomes = extract(capture(endpoint, url, {'success': True, 'data': {'id': 127, 'name': 'Home', **fields}}))
+    assert all(item.status == 'observed_present' and len(item.rows) == 1 for item in outcomes)
