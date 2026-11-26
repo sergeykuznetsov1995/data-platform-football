@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -884,6 +885,22 @@ def _transient_scope_failure(env: dict[str, str]) -> bool:
     return transient_scope_failure(env["SOFASCORE_SCOPE_RESULT_PATH"], env.get("SOFASCORE_SCOPE_RUN_ID", ""))
 
 
+def _refill_failure_dq(env: dict[str, str], started_at: float) -> dict[str, Any] | None:
+    """Read the report atomically written by this child, even when it exits red."""
+    try:
+        result = json.loads(Path(env["SOFASCORE_SCOPE_RESULT_PATH"]).read_text())
+        if not isinstance(result, dict) or result.get("run_id") != env["SOFASCORE_SCOPE_RUN_ID"]:
+            return None
+        scope = ":".join(str(result.get(k)) for k in ("campaign_id", "tournament_id", "source_season_id"))
+        stamp = datetime.fromisoformat(str(result.get("started_at")))
+        if scope != env["SOFASCORE_SCOPE_KEY"] or stamp.tzinfo is None or stamp.timestamp() < started_at:
+            return None
+    except (OSError, ValueError, OverflowError):
+        return None
+    dq = result.get("bronze_dq")
+    return dq if isinstance(dq, dict) else None
+
+
 def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
     """Execute an independently signed continuation under the original deadline."""
     deadline = float(env["SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH"])
@@ -907,6 +924,7 @@ def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
         "--run-id", env["SOFASCORE_SCOPE_RUN_ID"],
     ]
     started = time.monotonic()
+    started_at = time.time()
     child = subprocess.Popen(
         command, cwd="/opt/airflow", start_new_session=True,
         env={**os.environ, **env, "AIRFLOW_CTX_DAG_ID": DAG_ID,
@@ -934,10 +952,14 @@ def _execute_refill_scope(env: dict[str, str]) -> dict[str, Any]:
             child.wait()
         raise
     if code:
-        return {"status": "transient_failure" if _transient_scope_failure(env) else "failed",
-                "errors": [f"scope cycle exit_code={code}"],
-                "elapsed_s": time.monotonic() - started,
-                "scope_key": env["SOFASCORE_SCOPE_KEY"]}
+        outcome = {"status": "transient_failure" if _transient_scope_failure(env) else "failed",
+                   "errors": [f"scope cycle exit_code={code}"],
+                   "elapsed_s": time.monotonic() - started,
+                   "scope_key": env["SOFASCORE_SCOPE_KEY"]}
+        dq = _refill_failure_dq(env, started_at)
+        if dq is not None:
+            outcome["bronze_dq"] = dq
+        return outcome
     return _validate_refresh_scope(env)
 
 
@@ -1181,6 +1203,58 @@ def _validation_xcoms(ti: Any, **filters: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _initial_window_evidence(
+    context: dict[str, Any], mapped: list[dict[str, Any]], refill: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # Physical receipts include retries that have no separate Airflow return.
+    # Their absence must not erase a validator's independently saved result.
+    attempts = list(refill.get("initial_outcomes") or [])
+    outcomes = attempts.copy()
+    dq_reports = []
+    archive_by_scope = defaultdict(list)
+    scope_by_run = {}
+    for attempt in attempts:
+        scope = attempt.get("scope_key")
+        report = attempt.get("bronze_dq")
+        if scope:
+            scope_by_run[attempt.get("run_id")] = scope
+            archive_by_scope[scope].append(report)
+        if isinstance(report, dict):
+            dq_reports.append(report)
+
+    for item in mapped:
+        scope = item.get("scope_key")
+        if scope not in archive_by_scope:
+            outcomes.append(item)
+        report = item.get("bronze_dq")
+        if isinstance(report, dict) and report not in archive_by_scope.get(scope, ()):
+            dq_reports.append(report)
+
+    ti = context.get("ti")
+    if ti is None:
+        return outcomes, dq_reports
+    task_instances = context.get("task_instances")
+    if task_instances is None and context.get("dag_run") is not None:
+        task_instances = context["dag_run"].get_task_instances()
+    if task_instances is None:
+        pushed = _validation_xcoms(ti, key="bronze_dq")
+        dq_reports += [report for report in pushed if report not in dq_reports]
+        return outcomes, dq_reports
+
+    # Failed validators push before raising. Each key's bulk pull independently
+    # skips missing XComs. Use the real index, also used by the archived plan.
+    run_ids = refill.get("expected_scope_run_ids") or []
+    for task in task_instances:
+        if task.task_id != "validate_refresh_scope" or _task_state(task) != "failed":
+            continue
+        index = task.map_index
+        scope = scope_by_run.get(run_ids[index]) if 0 <= index < len(run_ids) else None
+        for report in _validation_xcoms(ti, key="bronze_dq", map_indexes=index):
+            if report not in archive_by_scope.get(scope, ()):
+                dq_reports.append(report)
+    return outcomes, dq_reports
+
+
 def _window_summary(
     context: dict[str, Any] | None = None, **keywords: Any
 ) -> dict[str, Any]:
@@ -1190,34 +1264,13 @@ def _window_summary(
         context = keywords
     elif keywords:
         context = {**context, **keywords}
-    outcomes: list[Any] = []
-    dq_reports: list[Any] = []
+    mapped = []
     refill_reason = None
     refill = None
     season_fields = None
     ti = context.get("ti")
     if ti is not None:
-        outcomes = _validation_xcoms(ti)
-        dq_reports = [
-            item["bronze_dq"] for item in outcomes if isinstance(item.get("bronze_dq"), dict)
-        ]
-        # A failed validator pushes its report before raising and has no return
-        # value. Airflow omits absent XComs, so list offsets are not map indexes.
-        task_instances = context.get("task_instances")
-        if task_instances is None and context.get("dag_run") is not None:
-            task_instances = context["dag_run"].get_task_instances()
-        if task_instances is None:
-            # A standalone summary has no task states. Keep pushed reports that
-            # are absent from the return values (including a lone failed report).
-            pushed = _validation_xcoms(ti, key="bronze_dq")
-            dq_reports += [report for report in pushed if report not in dq_reports]
-        else:
-            failed_indexes = [
-                task.map_index for task in task_instances
-                if task.task_id == "validate_refresh_scope" and _task_state(task) == "failed"
-            ]
-            if failed_indexes:
-                dq_reports.extend(_validation_xcoms(ti, key="bronze_dq", map_indexes=failed_indexes))
+        mapped = _validation_xcoms(ti)
         try:
             refill = ti.xcom_pull(task_ids="refill_refresh_window")
         except Exception as exc:
@@ -1242,18 +1295,9 @@ def _window_summary(
         else:
             if isinstance(persisted, dict) and persisted.get("run_id") == str(run_id):
                 refill = persisted
-    initial_transient = sum(1 for item in outcomes if item.get("status") == "transient_failure")
+    initial_transient = sum(1 for item in mapped if item.get("status") == "transient_failure")
+    outcomes, dq_reports = _initial_window_evidence(context, mapped, refill if isinstance(refill, dict) else {})
     if isinstance(refill, dict):
-        if "initial_outcomes" in refill:
-            # A failed mapped validation may yield no XCom at all. Physical
-            # attempt receipts retain retries and replace, rather than double
-            # count, the successful mapped-task XComs; their DQ reports ride
-            # the same replacement (#1371).
-            outcomes = list(refill["initial_outcomes"])
-            dq_reports = [
-                item["bronze_dq"] for item in outcomes
-                if isinstance(item, dict) and isinstance(item.get("bronze_dq"), dict)
-            ]
         refill_outcomes = refill.get("outcomes") or []
         outcomes.extend(refill_outcomes)
         dq_reports.extend(

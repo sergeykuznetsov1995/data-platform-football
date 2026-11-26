@@ -44,8 +44,11 @@ class FakeTI:
         if isinstance(task_ids, (list, tuple)):
             return [self.xcom_pull(task_ids=task_id, key=key, **kwargs) for task_id in task_ids]
         rows = self.pulls.get((task_ids, key), self.pulls.get(key))
-        if kwargs.get("map_indexes") is not None and isinstance(rows, list):
-            return [rows[i] for i in kwargs["map_indexes"] if rows[i] is not None]
+        indexes = kwargs.get("map_indexes")
+        if indexes is not None and isinstance(rows, list):
+            if isinstance(indexes, int):
+                return rows[indexes]
+            return [rows[i] for i in indexes if rows[i] is not None]
         return rows
 
 
@@ -200,6 +203,70 @@ def test_sparse_mapped_xcom_keeps_failed_report_between_successes(capsys):
     assert summary["bronze_dq"]["checks"] == 10
     assert summary["bronze_dq"]["failed"] == 1
     assert summary["bronze_dq"]["violations"] == ["child-season mismatch"]
+
+
+@pytest.mark.parametrize("include_failed_receipt", [False, True])
+def test_partial_attempt_archive_preserves_retries_and_missing_validations(include_failed_receipt):
+    good, bad = _report(checks=5), _report("failed", checks=3)
+    first = {"scope_key": "c:1:1", "elapsed_s": 2, "bronze_dq": good}
+    last = {"scope_key": "c:3:3", "elapsed_s": 3, "bronze_dq": good}
+    # Two attempts for the first group, no receipt for the last.
+    attempts = [dict(first, run_id="r-0") for _ in range(2)]
+    if include_failed_receipt:
+        attempts.append({"scope_key": "c:2:2", "run_id": "r-1", "bronze_dq": bad})
+    ti = FakeTI({
+        ("validate_refresh_scope", "return_value"): UserList([first, last]),
+        ("validate_refresh_scope", "bronze_dq"): [None, bad],
+        ("refill_refresh_window", "return_value"): {
+            "initial_outcomes": attempts, "expected_scope_run_ids": ["r-0", "r-1", "r-2"],
+        },
+    })
+
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("success", "failed", "success"))
+
+    assert summary["window_used_s"] == 7
+    assert summary["bronze_dq"]["scopes"] == 4
+    assert summary["bronze_dq"]["checks"] == 18
+    assert summary["bronze_dq"]["status"] == "failed"
+    assert summary["bronze_dq"]["violations"] == ["child-season mismatch"]
+
+
+@pytest.mark.parametrize("mismatch", [None, "run_id", "source_season_id", "stale", "missing"])
+def test_failed_refill_preserves_only_its_own_dq_report(tmp_path, monkeypatch, mismatch):
+    from datetime import datetime, timedelta, timezone
+
+    report = _report("failed", checks=3)
+    result = _result(report, status="failed")
+    env = _env(tmp_path, result)
+    env.update({
+        "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": "4000000000",
+        "SOFASCORE_SCOPE_TIMEOUT_S": "60", "SOFASCORE_CAMPAIGN_SNAPSHOT": "snapshot",
+        "SOFASCORE_EXPECTED_SNAPSHOT_ID": "snapshot-id", "SOFASCORE_SCOPE_OUTPUT_DIR": str(tmp_path),
+        "SOFASCORE_WORKLOAD_ARTIFACT": "artifact",
+    })
+    path = tmp_path / "scope-result.json"
+
+    def finish(**kwargs):
+        started = datetime.now(timezone.utc)
+        if mismatch == "stale":
+            started -= timedelta(days=1)
+        result["started_at"] = started.isoformat()
+        if mismatch in ("run_id", "source_season_id"):
+            result[mismatch] = "other"
+        if mismatch == "missing":
+            path.unlink()
+        else:
+            path.write_text(json.dumps(result))
+        return 1
+
+    monkeypatch.setattr(refresh.subprocess, "Popen", lambda *a, **k: SimpleNamespace(wait=finish))
+    outcome = refresh._execute_refill_scope(env)
+    assert outcome["status"] == "failed"
+    assert outcome.get("bronze_dq") == (report if mismatch is None else None)
+    if mismatch is None:
+        ti = FakeTI({("refill_refresh_window", "return_value"): {"outcomes": [outcome]}})
+        dq = refresh._window_summary(ti=ti)["bronze_dq"]
+        assert (dq["status"], dq["checks"], dq["violations"]) == ("failed", 3, ["child-season mismatch"])
 
 
 def test_refresh_propagates_validation_failure_even_if_scope_process_succeeded():

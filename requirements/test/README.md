@@ -27,6 +27,9 @@ Ruff's pin prevents upstream rule changes from silently changing the merge gate;
 FBref's day-14 lineup tests and SofaScore's SQL tests use sqlglot to parse
 Trino queries and duckdb to execute them on fixture data. The FBref profile
 uses the same Python 3.11 wheel versions and hashes as the SofaScore unit job.
+The SofaScore test that imports the master DAG also loads the Transfermarkt HTML
+parsers. Its profile takes Beautiful Soup 4.15.0 and Soup Sieve 2.10 from the
+FBref Python 3.11 lock. [CI failure on 26 November](https://github.com/sergeykuznetsov1995/data-platform-football/actions/runs/45890098729/job/140150358036).
 
 ## Local preparation
 
