@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import partial
 import hashlib
-from itertools import batched
+from itertools import islice
 import json
 import re
 from typing import Any
@@ -312,7 +312,7 @@ def _target_requests(plan: CoreScopePlan):
         yield _Request("referee_profile", url, referee_id=url.rsplit('/', 1)[-1]), None
     player_ids = (_canonical_target_id(value, 'representation:player_id_invalid')
                   for value in plan.representation_player_ids)
-    for batch in batched(player_ids, _REPRESENTATION_PACKET_LIMIT):
+    while batch := tuple(islice(player_ids, _REPRESENTATION_PACKET_LIMIT)):
         yield _Request("representation", representation_url(batch), player_ids=batch), None
     seen = set()
     for target in plan.section_targets:
