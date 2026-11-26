@@ -360,19 +360,23 @@ def _staff(soup, agency_id):
     unresolved = False
     for tr in body.find_all('tr', recursive=False):
         agent_id, name = _links(tr, _AGENT, '/profil/berater/')
-        if agent_id and name and members.setdefault(agent_id, name) != name:
-            raise AgencyError('conflicting_agency_staff')
-        unresolved |= not (agent_id and name)
         labels = tr.select('strong.employee-label')
-        if len(labels) == 1 and (listed_name := labels[0].get_text(' ', strip=True)):
+        listed_name = labels[0].get_text(' ', strip=True) if len(labels) == 1 else ''
+        if listed_name not in _MISSING:
             if agent_id and name and listed_name != name:
                 raise AgencyError('conflicting_agency_staff')
+            name = listed_name
             cell = labels[0].find_parent('td') or labels[0].parent
             roles = [match[1] for span in cell.find_all('span', recursive=False)
                      if (match := re.fullmatch(r'\(([^()]+)\)', span.get_text(' ', strip=True)))]
             licensed = cell.select_one('.licensed__label[title="Officially licensed"]')
             listings.append(dict(source_name=listed_name, source_roles=roles, licensed_label=licensed['title'] if licensed else None,
                                  agent_id=agent_id))
+        if agent_id and name:
+            if members.setdefault(agent_id, name) != name:
+                raise AgencyError('conflicting_agency_staff')
+        else:
+            unresolved = True
     relations = tuple(dict(entity_type='agency', entity_id=agency_id, agency_id=agency_id, agent_id=agent_id,
                            agent_name=name, relation_type='agent_agency') for agent_id, name in members.items())
     return relations, json.dumps(listings, ensure_ascii=False, separators=(',', ':')) if listings else None, unresolved
@@ -435,7 +439,7 @@ def extract(captures, scope, *, extracted_at, universe_version):
 
     def outcome(entity, capture, status, reason, records=(), proof=None):
         return make_outcome(entity, capture, scope, status=status, reason=f'{endpoint}:{reason}',
-                            records=records, proof=proof, parser_revision='agency-sections-v3',
+                            records=records, proof=proof, parser_revision='agency-sections-v4',
                             extracted_at=extracted_at, universe_version=universe_version)
 
     for capture in captures:

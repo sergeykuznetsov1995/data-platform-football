@@ -160,9 +160,13 @@ def test_referee_document_cannot_supply_an_agency_profile_or_staff():
                        for o in observe(capture(endpoint, AGENCY, body)))
 
 
-def test_confirmed_agency_preserves_known_links_and_unresolved_staff_from_the_same_table():
+@pytest.mark.parametrize('employee_cells', [
+    '<td><a href="/alex/profil/berater/42"><strong class="employee-label">Alex</strong></a>',
+    '<td><a href="/alex/profil/berater/42"><img alt="Alex"></a></td><td><strong class="employee-label">Alex</strong>',
+])
+def test_confirmed_agency_preserves_known_links_and_unresolved_staff_from_the_same_table(employee_cells):
     staff = ('<div class="box"><h2 class="content-box-headline">Staff</h2><table class="items"><tbody>'
-             '<tr><td><a href="/alex/profil/berater/42"><strong class="employee-label">Alex</strong></a>'
+             f'<tr>{employee_cells}'
              '<span>(Agent)</span></td></tr><tr><td><strong class="employee-label">Another staff member</strong></td></tr>'
              '</tbody></table></div>')
     profile, relations = observe(capture('agency_profile', AGENCY, client_page('', total=0) + staff))
@@ -179,6 +183,20 @@ def test_confirmed_agency_preserves_known_links_and_unresolved_staff_from_the_sa
                  f'<meta property="og:url" content="{AGENCY}">'
                  '<tm-subnavigation controller="schiedsrichter" id="47" section="schiedsrichter"></tm-subnavigation>'):
         assert all(not o.rows for o in observe(capture('agency_profile', AGENCY, meta + staff)))
+
+
+@pytest.mark.parametrize('link_text, labels, status', [
+    ('A different person', ['Alex'], 'error'),
+    ('', ['Alex', 'Another person'], 'unknown'),
+    ('', ['?'], 'unknown'),
+    ('', [], 'unknown'),
+])
+def test_separate_staff_name_requires_unique_row_evidence(link_text, labels, status):
+    names = ''.join(f'<strong class="employee-label">{name}</strong>' for name in labels)
+    staff = ('<div class="box"><h2 class="content-box-headline">Staff</h2><table class="items"><tr>'
+             f'<td><a href="/alex/profil/berater/42">{link_text}</a></td><td>{names}</td></tr></table></div>')
+    _, relations = observe(capture('agency_profile', AGENCY, client_page('', total=0) + staff))
+    assert relations.status == status and not relations.rows
 
 
 def test_agency_navigation_confirms_the_same_id_as_the_agency_header():
