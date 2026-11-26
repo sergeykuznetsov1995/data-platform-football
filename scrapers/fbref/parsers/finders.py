@@ -349,15 +349,17 @@ def parse_lineup_table(
 
         # Extract team name from first <th> header
         team_name = 'Unknown'
+        formation = None
         team_header = div.find('th')
         if not team_header:
             team_header = div.find(['h2', 'h3'])
         if team_header:
             header_text = team_header.get_text(strip=True)
-            # Strip formation like "(4-3-3)" from team name
-            team_name = re.sub(r'\s*\([\d\-]+\)\s*$', '', header_text).strip()
-            if not team_name:
-                team_name = header_text
+            formation_suffix = re.search(r'\s*\((\d+(?:[-–‑]\d+)+)\)\s*$', header_text)
+            team_name = header_text
+            if formation_suffix:
+                formation = formation_suffix.group(1)
+                team_name = header_text[:formation_suffix.start()].strip() or header_text
 
         # Parse table rows; track starter/bench via "Bench" header
         is_bench = False
@@ -399,6 +401,7 @@ def parse_lineup_table(
 
             lineups.append({
                 'team': team_name,
+                'formation': formation,
                 'player': player_name,
                 'player_id': player_id,
                 'is_starter': not is_bench,

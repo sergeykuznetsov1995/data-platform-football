@@ -49,6 +49,7 @@ def test_all_ten_saved_matches_replay_offline_with_manifests(tmp_path):
         "match_managers": 20,
         "match_officials": 10,
         "match_keeper_stats": 20,
+        "match_meta": 10,
     }
 
     # A second pass has no loader at all. Loading and parsing therefore cannot

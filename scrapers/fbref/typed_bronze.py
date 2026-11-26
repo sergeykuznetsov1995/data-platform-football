@@ -31,6 +31,7 @@ import pandas as pd
 import pyarrow as pa
 from bs4 import BeautifulSoup
 
+from scrapers.base.sql_validator import validate_catalog_qualified_name
 from scrapers.fbref.constants import LEAGUE_IDS
 from scrapers.fbref.discovery import has_valid_zero_table_season_signature
 from scrapers.fbref.html_parser import (
@@ -49,15 +50,24 @@ from scrapers.fbref.match_parser import (
     parse_match_html as parse_existing_match_html,
 )
 from scrapers.fbref.page_document import response_owns_target_page
+from scrapers.fbref.season_tables import standings_result
+from scrapers.schemas.fbref import FBREF_SQUAD_ROSTER_SCHEMA, FBREF_STANDINGS_SCHEMA
 
 
+# v8 (#1330/#1331): page-scoped standings/rosters, scorebox and formation,
+# and availability dates from the original fetch. Old receipts stay versioned.
 # v7 (#1331): all tables from a shared HTML comment reach the typed datasets.
 # v4 (#949): paired with PAGE_DOCUMENT_VERSION v4.  c75879b started propagating
 # the dataset absence reason into manifest.error_message without bumping the
 # version, so reason-less v3 typed manifests (restricted shot_events, empty
 # match_player_stats, not_applicable player_stats) block acceptance evidence
 # classification and cannot be overwritten.  A fresh version re-materialises them.
-from scrapers.fbref.policy import TYPED_BRONZE_PARSER_VERSION  # canonical definition
+from scrapers.fbref.policy import (
+    EMPTY_MATCH_DATA_REVIEW_INTERVAL,
+    MATCH_DATASET_NAMES,
+    RESTRICTED_DATA_REVIEW_INTERVAL,
+    TYPED_BRONZE_PARSER_VERSION,
+)
 
 # Output compatibility only.  This mapping is intentionally derived from the
 # legacy aliases instead of being duplicated as another source of crawl scope.
@@ -69,24 +79,15 @@ COMPATIBILITY_LEAGUE_BY_COMPETITION_ID: Mapping[str, str] = MappingProxyType(
 )
 
 MATCH_DATASET_TABLES: Mapping[str, str] = MappingProxyType(
-    {
-        "shot_events": "fbref_shot_events",
-        "match_events": "fbref_match_events",
-        "lineups": "fbref_lineups",
-        "match_team_stats": "fbref_match_team_stats",
-        "match_managers": "fbref_match_managers",
-        "match_officials": "fbref_match_officials",
-        "match_keeper_stats": "fbref_match_keeper_stats",
-        # Keep legacy player data last among typed data tables. Independent
-        # dataset-availability evidence is the actual final commit marker.
-        "match_player_stats": "fbref_match_player_stats",
-    }
+    {name: f"fbref_{name}" for name in MATCH_DATASET_NAMES}
 )
 MATCH_COMPLETION_DATASET = "match_player_stats"
 MATCH_AVAILABILITY_TABLE = "fbref_dataset_availability"
+SQUAD_ROSTER_TABLE = "fbref_squad_roster"
 
 SEASON_DATASET_TABLES: Mapping[str, str] = MappingProxyType(
     {
+        "standings": "fbref_standings",
         "player_stats": "fbref_player_stats",
         "team_stats": "fbref_team_stats",
         "player_shooting": "fbref_player_shooting",
@@ -218,6 +219,16 @@ def _persistence_action(result: DatasetParseResult) -> str:
 
 class _TrinoManager(Protocol):
     """Small persistence surface used by :class:`FBrefTypedBronzeWriter`."""
+
+    catalog: str
+
+    def insert_dataframe(self, schema: str, table: str, df: pd.DataFrame, *, column_types: Mapping[str, str]) -> int: ...
+
+    def execute_query(self, sql: str) -> list: ...
+
+    def _execute_replacement(self, sql: str) -> None: ...
+
+    def drop_table(self, schema: str, table: str, if_exists: bool = True) -> None: ...
 
     def table_exists(self, schema: str, table: str) -> bool: ...
 
@@ -561,6 +572,7 @@ def parse_season_stats_html(
     context: TypedSourceContext,
     stat_route: str,
     canonical_url: Optional[str] = None,
+    include_standings: bool = False,
 ) -> Dict[str, DatasetParseResult]:
     """Parse stable typed datasets from one already-discovered season page."""
 
@@ -576,6 +588,12 @@ def parse_season_stats_html(
     results: Dict[str, DatasetParseResult] = {}
     try:
         comment_tables = extract_tables_from_comments(soup)
+        if include_standings:
+            results["standings"] = standings_result(
+                [*soup.find_all("table"), *_comment_table_values(comment_tables)], soup=soup,
+                canonical_url=canonical_url, competition_id=context.source_competition_id,
+                season_id=context.source_season_id,
+            )
         has_any_table = soup.find("table") is not None or bool(comment_tables)
         # Two proofs, one verdict: the season signature (heading/canonical plus
         # a competition-history backlink) and the target's own canonical
@@ -777,10 +795,10 @@ class FBrefTypedBronzeWriter:
         return columns
 
     def _ensure_table(
-        self, table: str, frame: pd.DataFrame
+        self, table: str, frame: pd.DataFrame, *, schema: Optional[pa.Schema] = None,
     ) -> Dict[str, str]:
         arrow_schema = pa.Table.from_pandas(
-            frame, preserve_index=False
+            frame, schema=schema, preserve_index=False
         ).schema
         columns = self.manager.arrow_schema_to_trino(arrow_schema)
         if table not in self._known_tables and not self.manager.table_exists(
@@ -818,11 +836,11 @@ class FBrefTypedBronzeWriter:
         frame: pd.DataFrame,
         *,
         dataset: str,
-        context: TypedSourceContext,
+        context: Optional[TypedSourceContext],
         run_id: str,
         ingested_at: datetime,
     ) -> pd.DataFrame:
-        output = _apply_source_context(frame, context)
+        output = frame if context is None else _apply_source_context(frame, context)
         output["_source"] = "fbref"
         output["_entity_type"] = dataset
         output["_ingested_at"] = ingested_at
@@ -1036,6 +1054,7 @@ class FBrefTypedBronzeWriter:
                         getattr(result.status, "value", result.status)
                     ).casefold(),
                     "reason": result.reason,
+                    "source_observed_at": item.parsed.source_observed_at,
                 }
                 for name, result in item.parsed.datasets.items()
                 if str(result.reason or "").casefold()
@@ -1136,6 +1155,17 @@ class FBrefTypedBronzeWriter:
         availability = pd.concat(
             availability_frames, ignore_index=True, sort=False
         )
+        # Keep UTC TIMESTAMP columns even when every row in a batch is NULL.
+        # A replay of old bytes retains the deadline of the original fetch.
+        observed = pd.to_datetime(availability["source_observed_at"], utc=True).dt.tz_convert(None)
+        availability["source_observed_at"] = observed
+        zero_rows = availability["availability"].isin(_CLEAR_TO_EMPTY_STATUSES)
+        review = (observed + EMPTY_MATCH_DATA_REVIEW_INTERVAL).where(zero_rows)
+        restricted = zero_rows & (
+            availability["dataset"].eq("shot_events")
+            | availability["availability"].eq(DatasetStatus.RESTRICTED.value)
+        )
+        availability["review_after"] = review.mask(restricted, observed + RESTRICTED_DATA_REVIEW_INTERVAL)
         pa.Table.from_pandas(availability, preserve_index=False)
         availability_filter = " OR ".join(
             "match_id = "
@@ -1253,6 +1283,93 @@ class FBrefTypedBronzeWriter:
         validated = self._validate_match_batch(materialized)
         return self._persist_validated_match_batch(validated)
 
+    def persist_table_snapshot(
+        self,
+        result: DatasetParseResult,
+        *,
+        source_target_id: str,
+        season_id: Optional[str],
+        context: Optional[TypedSourceContext],
+        run_id: str,
+    ) -> Dict[str, int]:
+        """Replace this source page's edition without comparing nullable data cells."""
+        dataset = result.dataset
+        tables = {
+            "squad_roster": (SQUAD_ROSTER_TABLE, FBREF_SQUAD_ROSTER_SCHEMA),
+            "standings": (SEASON_DATASET_TABLES["standings"], FBREF_STANDINGS_SCHEMA),
+        }
+        if dataset not in tables or not source_target_id:
+            raise TypedBronzePersistenceError("Source table snapshot requires dataset and target identity")
+        if dataset == "standings" and (context is None or context.source_season_id != season_id):
+            raise TypedBronzePersistenceError("Standings require source competition and season")
+        action = _persistence_action(result)
+        if action == "skip":
+            return {}
+        table, schema = tables[dataset]
+        scope = {"source_target_id": source_target_id, "source_season_id": season_id}
+        if context is not None:
+            scope["source_competition_id"] = context.source_competition_id
+
+        def predicate(prefix):
+            return " AND ".join(
+                f"{prefix}{name} IS NULL" if value is None else f"{prefix}{name} = {_sql_string(value)}"
+                for name, value in scope.items()
+            )
+
+        if action == "clear":
+            return {dataset: self._persist_empty(table=table, delete_filter=predicate(""))}
+
+        frame = result.frame
+        assert frame is not None
+        if context is None:
+            native_seasons = frame["source_season_id"]
+            same_edition = native_seasons.isna() if season_id is None else native_seasons.eq(season_id).fillna(False)
+            if not same_edition.all():
+                raise TypedBronzePersistenceError("Roster rows belong to a different edition")
+            frame = frame.copy()
+            frame["league"] = frame["source_competition_id"].map(
+                lambda cid: compatibility_league_alias(str(cid)) if pd.notna(cid) else None
+            ).astype("string")
+            year = int(season_id[:4]) if season_id else None
+            frame["season"] = pd.Series(year, index=frame.index, dtype="Int64")
+        frame = self._decorate(
+            frame, dataset=dataset, context=context, run_id=run_id,
+            ingested_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        for name, value in scope.items():
+            frame[name] = pd.Series(value, index=frame.index, dtype="string")
+        target_types = self._ensure_table(table, frame, schema=schema)
+        self._require_textual_scope_columns(table, target_types, tuple(scope))
+        columns = {name: target_types[name] for name in frame.columns}
+        stage = f"{table}__stg_{_staging_identity(run_id, source_target_id, dataset)}"
+        qualified = validate_catalog_qualified_name(self.manager.catalog, self.schema, table)
+        qualified_stage = validate_catalog_qualified_name(self.manager.catalog, self.schema, stage)
+        self.manager.create_iceberg_table(self.schema, stage, columns)
+        try:
+            inserted = self.manager.insert_dataframe(self.schema, stage, frame, column_types=columns)
+            staged = self.manager.execute_query(f"SELECT count(*) FROM {qualified_stage}")[0][0]
+            if staged != len(frame) or inserted != len(frame):
+                raise TypedBronzePersistenceError(f"Incomplete stage for {table}: {staged} of {len(frame)}")
+        except Exception:
+            self.manager.drop_table(self.schema, stage, if_exists=True)
+            raise
+
+        # Exactly one source marker matches all old rows within this scope,
+        # including rows from an ambiguous previous commit of this same MERGE.
+        # The insert branch can therefore be replayed without duplicating rows.
+        names = ", ".join(f'"{name}"' for name in columns)
+        values = ", ".join(f's."{name}"' for name in columns)
+        self.manager._execute_replacement(
+            f"MERGE INTO {qualified} t USING (SELECT false AS remove_scope, {names} FROM {qualified_stage} "
+            f"UNION ALL SELECT true AS remove_scope, {names} FROM (SELECT * FROM {qualified_stage} LIMIT 1)) s "
+            f"ON s.remove_scope AND t.source_target_id = s.source_target_id AND {predicate('t.')} "
+            f"WHEN MATCHED THEN DELETE "
+            f"WHEN NOT MATCHED AND NOT s.remove_scope THEN INSERT ({names}) VALUES ({values})"
+        )
+        # A failed final commit retains the validated stage, as for the existing writer.
+        self.manager.drop_table(self.schema, stage, if_exists=True)
+        return {dataset: len(frame)}
+
     def persist_season_stats(
         self,
         parsed: Mapping[str, DatasetParseResult],
@@ -1260,6 +1377,7 @@ class FBrefTypedBronzeWriter:
         context: TypedSourceContext,
         run_id: str,
         target_identity: str,
+        source_target_id: Optional[str] = None,
     ) -> Dict[str, int]:
         parser_errors = [
             name
@@ -1271,6 +1389,8 @@ class FBrefTypedBronzeWriter:
             raise TypedBronzePersistenceError(
                 f"Refusing season persistence; parser errors: {parser_errors}"
             )
+        if "standings" in parsed and not source_target_id:
+            raise TypedBronzePersistenceError("Standings require their stable source target ID")
         actions: Dict[str, str] = {}
         for dataset, result in parsed.items():
             action = _persistence_action(result)
@@ -1287,6 +1407,12 @@ class FBrefTypedBronzeWriter:
         for dataset, result in parsed.items():
             action = actions.get(dataset)
             if action is None:
+                continue
+            if dataset == "standings":
+                counts.update(self.persist_table_snapshot(
+                    result, source_target_id=source_target_id,
+                    season_id=context.source_season_id, context=context, run_id=run_id,
+                ))
                 continue
             table = SEASON_DATASET_TABLES[dataset]
             delete_filter = _source_partition_filter(context)
@@ -1346,7 +1472,10 @@ class FBrefTypedBronzeAdapter:
         target_identity: str,
         enabled_datasets: Optional[set[str]] = None,
         require_player_contract: bool = True,
+        source_observed_at: Optional[datetime] = None,
     ) -> tuple[MatchParseResult, Dict[str, int]]:
+        if source_observed_at is not None and source_observed_at.utcoffset() is None:
+            raise ValueError("source_observed_at requires an explicit timezone")
         parsed = parse_match_html(
             html,
             match_id=match_id,
@@ -1354,6 +1483,7 @@ class FBrefTypedBronzeAdapter:
             enabled_datasets=enabled_datasets,
             require_player_contract=require_player_contract,
         )
+        parsed.source_observed_at = source_observed_at
         counts = self.writer.persist_match(
             parsed,
             match_id=match_id,
@@ -1392,6 +1522,7 @@ __all__ = [
     "MATCH_AVAILABILITY_TABLE",
     "MATCH_DATASET_TABLES",
     "SEASON_DATASET_TABLES",
+    "SQUAD_ROSTER_TABLE",
     "SEASON_ROUTE_DATASETS",
     "TYPED_BRONZE_PARSER_VERSION",
     "TypedBronzeError",

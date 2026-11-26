@@ -105,6 +105,17 @@ def test_current_cohort_is_deterministic_and_covers_every_required_slot():
 
 
 @pytest.mark.unit
+def test_squad_slot_requires_roster_not_wages_or_matchlogs():
+    candidates = _current_candidates()
+    other = dict(next(row for row in candidates if row["page_kind"] == "squad"))
+    other.update(target_id="000-wages", canonical_url="https://fbref.com/en/squads/abc/wages/Club")
+    candidates.append(other)
+    cohort = acceptance.select_acceptance_cohort(candidates, scope="current")
+    assert next(m["target_id"] for m in cohort["members"] if m["slot"] == "squad") == "squad"
+    assert "000-wages" not in cohort["target_ids"]
+
+
+@pytest.mark.unit
 def test_selector_fails_closed_without_explicit_empty_player_evidence():
     candidates = [
         row
@@ -543,6 +554,16 @@ def _strict_evidence(*, replay: bool = False) -> dict:
                 "validation_status": "succeeded",
                 "row_count": 1,
                 "dataset": "typed:player_stats",
+                "empty_reason": None,
+            },
+            {
+                "availability": "available",
+                "target_id": "target-1",
+                "parse_status": "succeeded",
+                "persistence_status": "succeeded",
+                "validation_status": "succeeded",
+                "row_count": 1,
+                "dataset": "typed:standings",
                 "empty_reason": None,
             },
             {

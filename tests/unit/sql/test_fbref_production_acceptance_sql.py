@@ -95,7 +95,7 @@ def test_canary_sql_is_read_only_and_has_exact_profile_scope():
     executable = _without_comments(CANARY_SQL)
 
     assert ":control_run_id" in executable
-    assert executable.count(";") == 5
+    assert executable.count(";") == 6
     assert not re.search(
         r"\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|MERGE|CALL)\b",
         executable,
@@ -195,12 +195,18 @@ def test_optional_typed_tables_never_break_trino_planning_when_absent():
     assert "physical_requirement = 'required'" in SQL
 
 
-def test_policy_skipped_and_direct_match_seasons_are_explicitly_exempt():
-    from scrapers.fbref.constants import UNAVAILABLE_SEASON_STAT_ROUTES
+def test_policy_skipped_routes_require_current_evidence_and_direct_matches_are_explicit():
+    from scrapers.fbref.policy import RESTRICTED_DATA_REVIEW_INTERVAL, SEASON_ROUTE_REVIEW_DATES
 
-    for route in UNAVAILABLE_SEASON_STAT_ROUTES:
+    for route, observed in SEASON_ROUTE_REVIEW_DATES.items():
         assert f"'{route}', 'policy_exempt'" in SQL
-    assert "PASS_POLICY_EXEMPT" in SQL
+        assert f"('{route}', DATE '{observed}')" in CONTROL_SQL
+    assert f"as_of_utc < observed_on + {RESTRICTED_DATA_REVIEW_INTERVAL.days}" in CONTROL_SQL
+    assert "WHEN NOT claimed THEN 'OUTSIDE_COHORT'" in CONTROL_SQL
+    assert "required_routes ? stat_route" in CONTROL_SQL
+    for companion in (SQL, CANARY_SQL):
+        assert "PASS_POLICY_EXEMPT" not in companion
+        assert "VERIFY_POSTGRES_DATED_ROUTE_REVIEW" in companion
     assert "PASS_DIRECT_MATCH_ONLY" in SQL
     assert "VERIFY_POSTGRES_DISCOVERED_ROUTE_MANIFEST" in SQL
 
@@ -279,10 +285,10 @@ def test_postgres_dataset_matrices_use_only_exact_run_fetches():
         )
         assert "processing.content_hash = run_fetch.content_hash" in matrix
         assert (
-            "processing.parser_version = 'fbref-page-document-v4'" in matrix
+            "processing.parser_version = 'fbref-page-document-v6'" in matrix
         )
         assert (
-            "processing.typed_parser_version = 'fbref-typed-bronze-v6'"
+            "processing.typed_parser_version = 'fbref-typed-bronze-v8'"
             in matrix
         )
         assert (
@@ -301,7 +307,7 @@ def test_postgres_dataset_matrices_use_only_exact_run_fetches():
         "observation.logical_refresh_id = direct.logical_refresh_id"
         in match_matrix
     )
-    assert match_matrix.count("('match_") == 6
+    assert match_matrix.split("-- These are the last documented", 1)[0].count("('match_") == 7
     assert "('shot_events')" in match_matrix
     assert "('lineups')" in match_matrix
 
@@ -316,7 +322,7 @@ def test_postgres_replay_uses_audited_source_run_evidence():
     assert "evidence_run.status = 'succeeded'" in control_gate
     assert "evidence_run.run_type IN ('current', 'backfill')" in control_gate
     assert "evidence_run.request_limit = 4096" in control_gate
-    assert "evidence_run.byte_limit = 2048 * 1048576" in control_gate
+    assert "evidence_run.byte_limit = 2048::bigint * 1048576" in control_gate
     assert "->> 'run_type' = run_type" in control_gate
     assert "->> 'zero_delta_required'" in control_gate
     assert "run_type = 'replay' THEN 'true' ELSE 'false'" in control_gate
@@ -349,6 +355,25 @@ def test_match_matrix_anti_joins_exact_expected_match_ids():
         "         AND coalesce(availability.availability_matches, 0) = 0"
     ) in match_matrix
     assert "VERIFY_POSTGRES_DIRECT_MATCH_IDENTITIES" in match_matrix
+
+
+def test_datagrip_and_report_use_the_same_page_receipts_and_physical_checks():
+    from scripts.report_fbref_bronze_acceptance import PAGE_READBACK_SQL, PAGE_RECEIPTS_SQL
+    from scrapers.fbref.policy import (
+        DISCOVERY_PARSER_VERSION, PAGE_DOCUMENT_VERSION, SQUAD_NON_ROSTER_PATH, TYPED_BRONZE_PARSER_VERSION,
+    )
+
+    assert PAGE_RECEIPTS_SQL.strip() + ";" in CONTROL_SQL
+    for version in (DISCOVERY_PARSER_VERSION, PAGE_DOCUMENT_VERSION, TYPED_BRONZE_PARSER_VERSION):
+        assert version in PAGE_RECEIPTS_SQL
+    assert SQUAD_NON_ROSTER_PATH in PAGE_RECEIPTS_SQL
+    assert "required.dataset = 'standings' AND frontier.page_kind IN ('season', 'standings')" in CONTROL_SQL
+    assert "required.dataset <> 'standings'" in CONTROL_SQL
+    for companion in (SQL, CANARY_SQL):
+        assert PAGE_READBACK_SQL.strip().replace("'", "''") in companion
+        assert "('squad_roster', 'fbref_squad_roster', 'source_target_id')" in companion
+        assert "('standings', 'fbref_standings', 'source_target_id')" in companion
+        assert "('match_meta', 'fbref_match_meta', '''fbref:match:'' || match_id')" in companion
 
 
 def test_production_acceptance_does_not_require_retired_silver():

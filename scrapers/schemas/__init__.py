@@ -2,6 +2,8 @@
 
 from scrapers.schemas.common import METADATA_FIELDS
 from scrapers.schemas.fbref import (
+    FBREF_STANDINGS_SCHEMA,
+    FBREF_SQUAD_ROSTER_SCHEMA,
     FBREF_SCHEDULE_SCHEMA,
     FBREF_PLAYER_STATS_SCHEMA,
     FBREF_TEAM_STATS_SCHEMA,
@@ -17,6 +19,8 @@ from scrapers.schemas.whoscored import WHOSCORED_EVENTS_SPADL_SCHEMA
 __all__ = [
     'METADATA_FIELDS',
     # FBref schemas
+    'FBREF_STANDINGS_SCHEMA',
+    'FBREF_SQUAD_ROSTER_SCHEMA',
     'FBREF_SCHEDULE_SCHEMA',
     'FBREF_PLAYER_STATS_SCHEMA',
     'FBREF_TEAM_STATS_SCHEMA',

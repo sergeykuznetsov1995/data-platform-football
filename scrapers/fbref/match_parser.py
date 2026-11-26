@@ -22,11 +22,12 @@ from scrapers.fbref.html_parser import (
     parse_shots_table,
     parse_team_match_stats_table,
 )
+from scrapers.fbref.parsers.match_meta import parse_match_meta
 from scrapers.fbref.parsers.table_parser import _comment_table_values
 
 
-# v4 (#1331): all tables from each HTML comment reach the typed match path.
-MATCH_PARSER_VERSION = "fbref-match-parser-v4"
+# v5 (#1331): persist scorebox metadata and preserve lineup formations.
+MATCH_PARSER_VERSION = "fbref-match-parser-v5"
 MATCH_COMPLETION_CONTRACT_VERSION = "match-v3-scored-page-marker-last"
 COMPETITION_SOURCE_DATASET_UNAVAILABLE = "competition_source_dataset_unavailable"
 
@@ -61,6 +62,9 @@ class MatchParseResult:
     status: DatasetStatus
     datasets: Dict[str, DatasetParseResult]
     has_score: bool = False
+    # Original fetch time, supplied by the raw-first pipeline. Parsing saved
+    # HTML again never renews the evidence that a dataset is unavailable.
+    source_observed_at: Optional[datetime] = None
 
     @property
     def has_errors(self) -> bool:
@@ -247,6 +251,7 @@ def _match_source_evidence(soup, comment_tables) -> Dict[str, tuple[bool, bool]]
     )
 
     return {
+        "match_meta": (scorebox is not None, bool(scorebox and scorebox.get_text(" ", strip=True))),
         "shot_events": (
             bool(shot_tables or soup.find(id="all_shots")),
             any(_table_has_rows(table) for table in shot_tables),
@@ -302,6 +307,7 @@ def parse_match_html(
     soup = BeautifulSoup(html, "html.parser")
     parsers = {
         "extract_tables": extract_tables_from_comments,
+        "match_meta": parse_match_meta,
         "shot_events": parse_shots_table,
         "match_events": parse_events_from_scorebox,
         "lineups": parse_lineup_table,
@@ -390,6 +396,7 @@ def parse_match_html(
 
     shots_restricted = soup.find(id="all_shots") is not None
     datasets = {
+        "match_meta": run("match_meta", lambda: parsers["match_meta"](soup)),
         "shot_events": run(
             "shot_events",
             lambda: parsers["shot_events"](soup, comment_tables),

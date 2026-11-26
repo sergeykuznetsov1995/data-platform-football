@@ -496,15 +496,16 @@ def test_comparison_rejects_a_column_name_that_breaks_out_of_its_quotes():
 
 
 @pytest.mark.unit
-def test_all_12_tables_use_dynamic_columns_and_bidirectional_except_all():
+def test_all_match_tables_use_dynamic_columns_and_bidirectional_except_all():
     manager = _DifferentialManager()
 
     diffs = _bidirectional_table_diffs(manager, "sequential", "batch")
 
-    assert len(BENCHMARK_TABLES) == 12
+    assert len(BENCHMARK_TABLES) == 13
+    assert "fbref_match_meta" in BENCHMARK_TABLES
     assert set(diffs) == set(BENCHMARK_TABLES)
     queries = [sql for sql, _params in manager.queries]
-    assert len(queries) == 24
+    assert len(queries) == 2 * len(BENCHMARK_TABLES)
     assert all("EXCEPT ALL" in sql for sql in queries)
     assert all(
         ('"target_id"' in sql and '"run_id"' in sql)
@@ -541,8 +542,8 @@ def test_distinct_control_run_ids_are_verified_then_canonicalized_in_diffs():
         for sql, params in manager.queries
         if "EXCEPT ALL" in sql
     ]
-    assert len(lineage_queries) == 24
-    assert len(diff_queries) == 24
+    assert len(lineage_queries) == 2 * len(BENCHMARK_TABLES)
+    assert len(diff_queries) == 2 * len(BENCHMARK_TABLES)
     assert all("CASE WHEN" in sql for sql, _params in diff_queries)
     assert all("__fbref_acceptance_run__" in sql for sql, _params in diff_queries)
     assert any(RUN_ONE_ID in params for _sql, params in diff_queries)
@@ -595,7 +596,7 @@ def test_snapshot_evidence_is_collected_for_every_table():
     snapshots = _snapshot_ids(manager, "batch")
 
     assert snapshots == {table: 101 for table in BENCHMARK_TABLES}
-    assert len(manager.queries) == 12
+    assert len(manager.queries) == len(BENCHMARK_TABLES)
     assert all('$snapshots"' in sql for sql, _params in manager.queries)
 
 
@@ -655,7 +656,7 @@ class _DirectControl:
                 "last_content_hash": "a" * 64,
                 "content_hash": "a" * 64,
                 "parser_version": "generic-v1",
-                "typed_parser_version": "typed-v1",
+                "typed_parser_version": "fbref-typed-bronze-v8",
                 "stateful_parser_version": "stateful-v1",
                 "observation_status": "succeeded",
                 "generic_status": "succeeded",
@@ -672,7 +673,7 @@ class _DirectControl:
                 "target_id": "fbref:match:m1",
                 "replay_target_id": replay_target_id,
                 "content_hash": "a" * 64,
-                "parser_version": "typed-v1",
+                "parser_version": "fbref-typed-bronze-v8",
                 "dataset": f"typed:{dataset}",
                 "availability": "available",
                 "parse_status": "succeeded",
@@ -689,6 +690,7 @@ class _DirectControl:
                 "match_managers",
                 "match_officials",
                 "match_keeper_stats",
+                "match_meta",
                 "match_player_stats",
             )
         ]
@@ -787,7 +789,7 @@ def test_control_evidence_uses_anchored_actual_replay_effects():
     )
     assert evidence.valid is True
     assert evidence.logical_refreshes == 1
-    assert evidence.dataset_manifests == 8
+    assert evidence.dataset_manifests == 9
     assert evidence.match_targets == 1
     assert evidence.match_keys_sha256
     assert evidence.observation_sha256
@@ -989,7 +991,7 @@ def test_real_pipeline_evidence_has_no_trino_writes_and_one_strict_verdict():
 
     assert rendered["passed"] is True
     assert rendered["matches"] == 1
-    assert len(rendered["table_diffs"]) == 12
+    assert set(rendered["table_diffs"]) == set(BENCHMARK_TABLES)
     assert rendered["sentinels_preserved"] is True
     assert rendered["control_equivalent"] is True
     assert rendered["sequential"]["snapshots_before"]

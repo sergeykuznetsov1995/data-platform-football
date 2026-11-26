@@ -21,9 +21,8 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Callable, Iterable, Mapping, Optional, Sequence
-from urllib.parse import urlparse, urlsplit
+from urllib.parse import urlparse
 
-from scrapers.fbref.policy import CURRENT_ENRICHMENT
 from scrapers.base.trino_manager import TrinoError
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
@@ -85,6 +84,8 @@ from scrapers.fbref.page_document import (
     response_owns_target_page,
 )
 from scrapers.fbref.report_observations import schedule_observations
+from scrapers.fbref.policy import CURRENT_ENRICHMENT, MATCH_TYPED_MANIFESTS
+from scrapers.fbref.policy import is_squad_non_roster_url as _is_squad_non_roster_url
 from scrapers.fbref.raw_store import (
     PageTarget,
     RawFetchRecord,
@@ -126,6 +127,7 @@ from scrapers.fbref.typed_bronze import (
     parse_season_stats_html as parse_typed_season_stats_html,
     typed_result_requires_persistence,
 )
+from scrapers.fbref.season_tables import parse_squad_roster_html, parse_standings_html
 from scrapers.fbref.match_parser import (
     COMPETITION_SOURCE_DATASET_UNAVAILABLE,
     IncompleteMatchPageError,
@@ -341,36 +343,12 @@ logger = logging.getLogger(__name__)
 # that cost the scope rollup 19M rows.  The daily and backfill DAG page-kind
 # lists are the fetch filter; this set is the seed filter (#1321).
 SEED_EXCLUDED_PAGE_KINDS = frozenset({"player", "matchlog"})
-# ``discover_page_links`` labels every ``/en/squads/<id>/...`` page ``squad``
-# (discovery.py routes on ``route[0] == "squads"`` alone), so the sub-kind is
-# visible only in the URL path.  Team match logs, goal logs, club history and
-# wage tables are not squads in the sense decision 3 keeps -- only the roster
-# is.  ``roster``/``roster_details``/``all_comps`` stay in scope.
-SQUAD_NON_ROSTER_URL_SEGMENTS = ("matchlogs", "goallogs", "history", "wages")
 
 
-def _is_squad_non_roster_url(canonical_url: str) -> bool:
-    """Tell a squad sub-kind page from its roster by the URL path segments.
-
-    Matching whole path segments and not a substring keeps display slugs such
-    as ``Arsenal-Wages-Stats`` or ``...-Scores-and-Fixtures`` out of the
-    filter: only the structural ``/wages/`` or ``/matchlogs/`` component of the
-    route below ``/en/squads/<squad_id>/`` marks a non-roster page.
-    """
-
-    segments = [
-        segment
-        for segment in urlsplit(canonical_url).path.split("/")
-        if segment
-    ]
-    if "squads" not in segments:
-        return False
-    # Skip the squad id itself: a squad whose id happened to read ``history``
-    # would still be a roster page.
-    tail = segments[segments.index("squads") + 2:]
-    return any(
-        segment in SQUAD_NON_ROSTER_URL_SEGMENTS for segment in tail
-    )
+def _has_typed_output(page_kind: str, canonical_url: str) -> bool:
+    if page_kind == "squad":
+        return not _is_squad_non_roster_url(canonical_url)
+    return page_kind in {"schedule", "season", "season_stats", "standings", "match"}
 
 
 def _out_of_scope_seed_reason(link: DiscoveredPageLink) -> Optional[str]:
@@ -1913,7 +1891,11 @@ def _acceptance_coverage_errors(
         if page_kind == "schedule":
             required_typed = {"typed:schedule"}
         elif page_kind == "season":
-            required_typed = {"typed:player_stats", "typed:team_stats"}
+            required_typed = {"typed:player_stats", "typed:team_stats", "typed:standings"}
+        elif page_kind == "squad" and not _is_squad_non_roster_url(str(target.get("canonical_url") or "")):
+            required_typed = {"typed:squad_roster"}
+        elif page_kind == "standings":
+            required_typed = {"typed:standings"}
         elif page_kind == "season_stats":
             route = str(
                 (target.get("source_ids") or {}).get("stat_route") or ""
@@ -1930,17 +1912,20 @@ def _acceptance_coverage_errors(
                 "keepers": {"typed:keeper_keeper"},
             }.get(route, set())
         elif page_kind == "match":
-            required_typed = {
-                "typed:shot_events", "typed:match_events", "typed:lineups",
-                "typed:match_team_stats", "typed:match_managers",
-                "typed:match_officials", "typed:match_keeper_stats",
-                "typed:match_player_stats", "typed:__complete__",
-            }
+            required_typed = MATCH_TYPED_MANIFESTS | {"typed:__complete__"}
         completion = manifests_by_target.get(target_id, {}).get("typed:__complete__", {})
         scored_match = page_kind == "match" and completion.get("error_message") == "scored_match_requires_rows"
         for dataset_name in sorted(required_typed):
             requires_rows = scored_match and dataset_name in {"typed:match_events", "typed:lineups"}
             manifest = manifests_by_target.get(target_id, {}).get(dataset_name, {})
+            meta_required = dataset_name == "typed:match_meta" and (
+                scored_match or manifest.get("availability") == "available"
+            )
+            if meta_required and (
+                manifest.get("availability") != "available" or int(manifest.get("row_count") or 0) != 1
+            ):
+                missing_target_manifests.append(f"{target_id}:{dataset_name}")
+                continue
             source_unavailable = requires_rows and (
                 str(manifest.get("availability") or "").casefold()
                 == "not_applicable"
@@ -1953,6 +1938,7 @@ def _acceptance_coverage_errors(
                 dataset_name,
                 allow_skipped=(
                     dataset_name != "typed:__complete__"
+                    and not meta_required
                     and (not requires_rows or source_unavailable)
                 ),
             ) or (requires_rows and not source_unavailable and (
@@ -1986,7 +1972,6 @@ def _acceptance_coverage_errors(
     # after generic persistence and validation complete.  Typed page kinds
     # additionally require the final completion marker, so a stale-observation
     # marker or a partial set of typed datasets cannot satisfy acceptance.
-    typed_page_kinds = {"schedule", "season", "season_stats", "match"}
     missing_page_completions = []
     missing_typed_completions = []
     for target_id in expected_ids:
@@ -2012,7 +1997,9 @@ def _acceptance_coverage_errors(
             if isinstance(target, Mapping)
             else ""
         )
-        if page_kind not in typed_page_kinds:
+        if not isinstance(target, Mapping) or not _has_typed_output(
+            page_kind, str(target.get("canonical_url") or "")
+        ):
             continue
         typed_completions = [
             item
@@ -5886,22 +5873,12 @@ class FBrefPipeline:
         control=None,
     ) -> None:
         control_store = self.control if control is None else control
-        seen_tables: set[tuple[str, str]] = set()
         for table in page.tables:
-            identity = (table.table_id, table.source_location)
-            dataset = f"table:{table.table_id}:{table.source_location}"
-            if identity in seen_tables:
-                # FBref may repeat a source ID within the same DOM/comment.
-                # Preserve the first table's already-committed legacy key;
-                # later instances have independent rows/availability and must
-                # not overwrite that immutable verdict during raw recovery.
-                dataset += f":instance:{table.table_instance_id}"
-            seen_tables.add(identity)
             control_store.record_dataset_manifest(
                 target_id=record.target_id,
                 content_hash=record.content_hash,
                 parser_version=page.parser_version,
-                dataset=dataset,
+                dataset=table.dataset,
                 availability=table.availability.value,
                 parse_status="succeeded",
                 persistence_status="succeeded",
@@ -5941,6 +5918,7 @@ class FBrefPipeline:
         parsed = self._parse_match_with_source_availability(
             html, match_id=match_id, context=context
         )
+        parsed.source_observed_at = _as_utc(record.fetched_at)
         return parsed, match_id, context
 
     def _parse_match_with_source_availability(
@@ -6102,15 +6080,27 @@ class FBrefPipeline:
         html: str,
         record: RawFetchRecord,
     ) -> None:
-        context = self._typed_context(record)
-        if context is None:
+        context = self._typed_context(record) if record.page_kind != "squad" else None
+        if context is None and record.page_kind != "squad":
             raise TypedBronzeError(
                 "Typed page requires source competition_id and season_id"
             )
         parsed: Mapping[str, object]
         counts: Optional[Mapping[str, int]] = None
         try:
-            if record.page_kind == "schedule":
+            if record.page_kind == "squad":
+                roster, season_id = parse_squad_roster_html(
+                    html, canonical_url=record.canonical_url,
+                    squad_id=str(record.source_ids.get("squad_id") or ""),
+                )
+                parsed = {"squad_roster": roster}
+                if roster.status.value == "error":
+                    raise TypedBronzeError(roster.error_message or "squad roster parse")
+                counts = self.typed_adapter.writer.persist_table_snapshot(
+                    roster, source_target_id=record.target_id, season_id=season_id,
+                    context=None, run_id=run_id,
+                )
+            elif record.page_kind == "schedule":
                 schedule = parse_typed_schedule_html(html, context=context)
                 parsed = {"schedule": schedule}
                 if schedule.status.value == "error":
@@ -6123,18 +6113,22 @@ class FBrefPipeline:
                     run_id=run_id,
                     target_identity=record.logical_refresh_id,
                 )
-            elif record.page_kind in {"season", "season_stats"}:
-                stat_route = (
-                    "standard"
-                    if record.page_kind == "season"
-                    else str(record.source_ids.get("stat_route") or "")
-                )
-                parsed = parse_typed_season_stats_html(
-                    html,
-                    context=context,
-                    stat_route=stat_route,
-                    canonical_url=record.canonical_url,
-                )
+            elif record.page_kind in {"season", "season_stats", "standings"}:
+                if record.page_kind == "standings":
+                    parsed = {"standings": parse_standings_html(
+                        html, canonical_url=record.canonical_url, competition_id=context.source_competition_id,
+                        season_id=context.source_season_id,
+                    )}
+                else:
+                    parsed = parse_typed_season_stats_html(
+                        html, context=context,
+                        stat_route=(
+                            "standard" if record.page_kind == "season"
+                            else str(record.source_ids.get("stat_route") or "")
+                        ),
+                        canonical_url=record.canonical_url,
+                        include_standings=record.page_kind == "season",
+                    )
                 if any(item.status.value == "error" for item in parsed.values()):
                     raise TypedBronzeError("Typed season parser failed")
                 counts = self.typed_adapter.writer.persist_season_stats(
@@ -6142,6 +6136,7 @@ class FBrefPipeline:
                     context=context,
                     run_id=run_id,
                     target_identity=record.logical_refresh_id,
+                    source_target_id=record.target_id,
                 )
             elif record.page_kind == "match":
                 match_id = record.source_ids.get("match_id")
@@ -6152,6 +6147,7 @@ class FBrefPipeline:
                     match_id=str(match_id),
                     context=context,
                 )
+                match.source_observed_at = _as_utc(record.fetched_at)
                 parsed = match.datasets
                 if match.has_errors:
                     if any(d.error_type == "IncompleteMatchPageError" for d in match.datasets.values()):
@@ -6185,14 +6181,9 @@ class FBrefPipeline:
     ) -> bool:
         """Promote typed data only from the newest fenced raw observation."""
 
-        if record.page_kind not in {
-            "schedule",
-            "season",
-            "season_stats",
-            "match",
-        }:
+        if not _has_typed_output(record.page_kind, record.canonical_url):
             return False
-        if self._typed_context(record) is None:
+        if record.page_kind != "squad" and self._typed_context(record) is None:
             raise TypedBronzeError(
                 "Typed page requires source competition_id and season_id"
             )
@@ -6786,12 +6777,7 @@ class FBrefPipeline:
         """Finish one supplied lease under an already-held frontier verdict."""
 
         work_started = self.stage_clock()
-        typed_page = record.page_kind in {
-            "schedule",
-            "season",
-            "season_stats",
-            "match",
-        }
+        typed_page = _has_typed_output(record.page_kind, record.canonical_url)
         if record.page_kind == "schedule":
             self._record_schedule_report_observations(html, record)
         if is_latest is None:
@@ -6831,10 +6817,6 @@ class FBrefPipeline:
                         )
                         self._record_typed_completion(record, has_score=typed_match.has_score)
                 else:
-                    if self._typed_context(record) is None:
-                        raise TypedBronzeError(
-                            "Typed page requires source competition_id and season_id"
-                        )
                     self._persist_typed(run_id, html, record)
                 typed_promoted = 1
                 if progress is not None:

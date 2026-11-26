@@ -11,15 +11,17 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections import Counter
-from dataclasses import asdict, dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from bs4 import BeautifulSoup, Comment, Tag
 
 
+# v6 (#1331): logical table/row/dataset identities are independent of the raw
+# snapshot and DOM/comment order. The physical table instance retains both.
 # v5 (#1331): tfoot rows are preserved as totals with an explicit is_total flag.
 # v4 (#949): the v3 label was reused across c75879b, which began emitting an
 # absence reason on empty/restricted/not_applicable page tables and on the
@@ -78,6 +80,12 @@ _RESTRICTED_RE = re.compile(
     re.IGNORECASE,
 )
 _PLAYER_ID_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
+_PLAYER_LINK_RE = re.compile(
+    r"^(?:https://(?:www\.)?fbref\.com)?/en/players/[0-9a-f]{8}/", re.IGNORECASE
+)
+_COMPETITION_HISTORY_LINK_RE = re.compile(
+    r"^(?:https://(?:www\.)?fbref\.com)?/en/comps/[0-9]+/history/", re.IGNORECASE
+)
 
 
 def _sha256(*parts: object) -> str:
@@ -358,6 +366,11 @@ class PageTable:
     header_paths: Tuple[Tuple[str, ...], ...]
     rows: Tuple[PageRow, ...]
     reason: Optional[str] = None
+    manifest_suffix: str = ""
+
+    @property
+    def dataset(self) -> str:
+        return f"table:{quote(self.table_id, safe='')}{self.manifest_suffix}"
 
     @property
     def row_count(self) -> int:
@@ -416,15 +429,15 @@ class PageDocument:
         return records
 
 
-def _documents(html: str) -> Iterable[Tuple[str, BeautifulSoup]]:
+def _documents(html: str) -> Iterable[Tuple[str, BeautifulSoup, Optional[Tag]]]:
     root = BeautifulSoup(html or "", "html.parser")
-    yield "dom", root
+    yield "dom", root, None
     for index, comment in enumerate(
         root.find_all(string=lambda value: isinstance(value, Comment))
     ):
         markup = str(comment)
         if "<table" in markup.lower():
-            yield f"comment:{index}", BeautifulSoup(markup, "html.parser")
+            yield f"comment:{index}", BeautifulSoup(markup, "html.parser"), comment.parent
 
 
 def _table_rows(table: Tag) -> Tuple[List[List[str]], List[Tuple[Tag, bool]]]:
@@ -474,19 +487,108 @@ def _table_rows(table: Tag) -> Tuple[List[List[str]], List[Tuple[Tag, bool]]]:
     return grid, data_rows
 
 
-def _is_known_table(table_id: str) -> bool:
+def _anonymous_table_id(
+    page_kind: str,
+    container: Optional[Tag],
+    caption: Optional[str],
+    schema_signature: str,
+) -> str:
+    # The first header of a match lineup contains the team and formation.
+    # FBref identifies the two logical lineups by their enclosing divs.
+    if page_kind == "match" and container is not None and container.name == "div":
+        container_id = container.get("id")
+        if container_id in ("a", "b") and "lineup" in (container.get("class") or ()):
+            return f"lineup_{container_id}"
+        if container_id == "team_stats":
+            return "team_stats"
+    if caption:
+        return "caption_" + _sha256(" ".join(caption.casefold().split()))[:20]
+    return "anon_" + schema_signature[:20]
+
+
+def _is_known_table(
+    table: Tag, table_id: str, data_stats: Tuple[str, ...], page_kind: str,
+) -> bool:
     lowered = table_id.lower()
+    if page_kind == "match" and not table.get("id"):
+        if lowered in ("lineup_a", "lineup_b"):
+            return table.find("a", href=_PLAYER_LINK_RE) is not None
+        if lowered == "team_stats":
+            return any(
+                _text(heading).casefold() in {"possession", "shots on target", "saves", "cards"}
+                for heading in table.find_all("th")
+            )
+    if page_kind == "competition_index" and lowered.startswith("comps_"):
+        # Source index sections describe named competitions and their seasons.
+        return {"league_name", "gender", "minseason", "maxseason"}.issubset(data_stats) and any(
+            _COMPETITION_HISTORY_LINK_RE.match(str(link["href"]))
+            for link in table.select('[data-stat="league_name"] a[href]')
+        )
+    if re.fullmatch(r"results[0-9-]+_(?:overall|home_away)", lowered):
+        # These source standings include group and playoff variants. Demand
+        # their identifying columns before classifying an unfamiliar layout.
+        return "rank" in data_stats and "team" in data_stats and (
+            "games" in data_stats or "home_games" in data_stats
+        )
     return any(lowered == prefix or lowered.startswith(prefix) for prefix in _KNOWN_TABLE_PREFIXES)
+
+
+def _with_manifest_suffix(table: PageTable, suffix: str) -> PageTable:
+    # Rows in repeated logical tables can describe exactly the same team.
+    # Apply the table discriminator to the rows and cells as well.
+    rows = []
+    for row in table.rows:
+        row_id = _sha256(row.row_id, suffix)
+        cells = tuple(
+            replace(cell, row_id=row_id, cell_id=_sha256(row_id, cell.cell_index, cell.data_stat or ""))
+            for cell in row.cells
+        )
+        rows.append(replace(row, row_id=row_id, cells=cells))
+    return replace(table, rows=tuple(rows), manifest_suffix=suffix)
+
+
+def _name_repeated_tables(tables: List[PageTable]) -> None:
+    """Disambiguate repeated IDs once, even if recovery later writes a prefix."""
+    by_id: dict[str, list[int]] = defaultdict(list)
+    for index, table in enumerate(tables):
+        by_id[table.table_id].append(index)
+
+    for indices in by_id.values():
+        if len(indices) == 1:
+            continue
+        counts: Counter[str] = Counter()
+        # Different captions on the same source ID identify different tables
+        # (e.g. Atlas group vs third-place ranking). If even the captions are
+        # identical, retain every instance; sort by evidence, not DOM position.
+        ordered = sorted(
+            indices,
+            key=lambda i: (
+                tables[i].availability == Availability.DUPLICATE,
+                tables[i].schema_signature,
+                tables[i].content_signature,
+            ),
+        )
+        for index in ordered:
+            table = tables[index]
+            caption = " ".join((table.caption or "").casefold().split())
+            suffix = ":caption:" + _sha256(caption)[:20] if caption else ""
+            counts[suffix] += 1
+            if counts[suffix] > 1:
+                suffix += f":instance:{counts[suffix]}"
+            if suffix:
+                tables[index] = _with_manifest_suffix(table, suffix)
 
 
 def _parse_table(
     table: Tag,
     *,
     target_id: str,
+    page_kind: str,
     content_hash: str,
     location: str,
+    comment_parent: Optional[Tag],
     ordinal: int,
-    seen_content: Mapping[str, str],
+    seen_content: Mapping[Tuple[str, str], str],
 ) -> PageTable:
     header_grid, row_candidates = _table_rows(table)
     width = max((len(row) for row in header_grid), default=0)
@@ -501,13 +603,16 @@ def _parse_table(
     ))
     schema_signature = _sha256(header_paths, data_stats)
     source_table_id = str(table.get("id") or "").strip() or None
-    table_id = source_table_id or f"anon_{ordinal}_{schema_signature[:12]}"
+    caption = _text(table.find("caption", recursive=False)) or None
+    container = table.parent
+    if container is None or container.name == "[document]":
+        container = comment_parent
+    table_id = source_table_id or _anonymous_table_id(page_kind, container, caption, schema_signature)
     markup = re.sub(r"\s+", " ", str(table)).strip()
     content_signature = hashlib.sha256(markup.encode("utf-8")).hexdigest()
     table_instance_id = _sha256(
         target_id, content_hash, location, ordinal, table_id
     )
-    caption = _text(table.find("caption")) or None
 
     rows: List[PageRow] = []
     identity_counts: Counter = Counter()
@@ -517,26 +622,27 @@ def _parse_table(
         if not direct_cells or not any(values):
             continue
         row_entities = _entity_ids(row)
-        stable_identity = row_entities or {
-            "values": "\x1f".join(values),
-            "ordinal": str(row_index),
-        }
+        # Use native row IDs or linked entities where possible. Season headers
+        # distinguish successive years for one club in player and wage tables.
+        source_row_id = str(row.get("id") or "").strip()
+        if source_row_id:
+            stable_identity = {"source_row_id": source_row_id}
+        elif row_entities:
+            stable_identity = dict(row_entities)
+            for cell, value in zip(direct_cells, values):
+                if cell.name == "th" and cell.get("data-stat") in ("season", "year", "year_id"):
+                    stable_identity["source_season"] = value
+                    break
+        else:
+            stable_identity = {"values": values}
         # Body IDs stay independent of totals even when tfoot precedes tbody.
         if is_total:
             stable_identity = {**stable_identity, "source_section": "tfoot"}
         identity = json.dumps(stable_identity, sort_keys=True)
-        # FBref repeats the same entities across rows of one table: a player's
-        # standard stats carry two rows for the same club, his wages table one
-        # row per season for the same club. Entity identity alone is therefore
-        # not a key — the colliding row_ids reached Iceberg as duplicate MERGE
-        # source rows (MERGE_TARGET_ROW_MULTIPLE_MATCHES) and the page could not
-        # be written at all. The first occurrence keeps its id, so rows already
-        # in Bronze stay addressable; later ones carry their occurrence.
+        # Even source keys can repeat. Keep each occurrence addressable.
         occurrence = identity_counts[identity]
         identity_counts[identity] += 1
-        row_id = _sha256(table_instance_id, identity) if occurrence == 0 else (
-            _sha256(table_instance_id, identity, occurrence)
-        )
+        row_id = _sha256(target_id, table_id, identity, occurrence)
         cells: List[PageCell] = []
         for cell_index, cell in enumerate(direct_cells):
             data_stat = str(cell.get("data-stat") or "").strip() or None
@@ -558,7 +664,7 @@ def _parse_table(
             is_total=is_total,
         ))
 
-    duplicate_of = seen_content.get(content_signature)
+    duplicate_of = seen_content.get((table_id, content_signature))
     semantic = bool(data_stats or any(header_paths))
     parent = table.parent if isinstance(table.parent, Tag) else None
     restriction_scope = (
@@ -579,7 +685,7 @@ def _parse_table(
     elif not rows:
         availability = Availability.EMPTY
         reason = "semantic_table_has_no_rows"
-    elif _is_known_table(table_id):
+    elif _is_known_table(table, table_id, data_stats, page_kind):
         availability = Availability.AVAILABLE
         reason = None
     else:
@@ -620,16 +726,18 @@ def parse_page_document(
     raw_hash = content_hash or hashlib.sha256((html or "").encode("utf-8")).hexdigest()
     tables: List[PageTable] = []
     errors: List[str] = []
-    seen_content: Dict[str, str] = {}
+    seen_content: Dict[Tuple[str, str], str] = {}
     ordinal = 0
-    for location, document in _documents(html):
+    for location, document, comment_parent in _documents(html):
         for table in document.find_all("table"):
             try:
                 parsed = _parse_table(
                     table,
                     target_id=target_id,
+                    page_kind=page_kind,
                     content_hash=raw_hash,
                     location=location,
+                    comment_parent=comment_parent,
                     ordinal=ordinal,
                     seen_content=seen_content,
                 )
@@ -641,8 +749,10 @@ def parse_page_document(
                 continue
             tables.append(parsed)
             if parsed.availability != Availability.DUPLICATE:
-                seen_content[parsed.content_signature] = parsed.table_instance_id
+                seen_content[(parsed.table_id, parsed.content_signature)] = parsed.table_instance_id
             ordinal += 1
+
+    _name_repeated_tables(tables)
 
     # Generic Bronze inventories source structure; page-kind parsers own its
     # meaning. Competition card grids, single-match season pages and a stat

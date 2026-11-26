@@ -1,4 +1,8 @@
+import gzip
+from pathlib import Path
+
 import pytest
+from bs4 import BeautifulSoup, Comment
 
 from scrapers.fbref.page_document import (
     Availability,
@@ -212,10 +216,150 @@ def test_anonymous_table_id_and_identity_are_deterministic():
     first = parse_page_document(html, target_id="t", page_kind="player")
     second = parse_page_document(html, target_id="t", page_kind="player")
 
-    assert first.tables[0].table_id.startswith("anon_0_")
+    assert first.tables[0].table_id.startswith("anon_")
     assert first.tables[0].table_id == second.tables[0].table_id
     assert first.tables[0].table_instance_id == second.tables[0].table_instance_id
     assert first.tables[0].rows[0].row_id == second.tables[0].rows[0].row_id
+
+
+def test_real_match_table_ids_survive_formation_order_and_comment_changes():
+    fixture = Path(__file__).resolve().parents[2] / "fixtures/fbref/matches/2185fc64.html.gz"
+    original = gzip.decompress(fixture.read_bytes()).decode()
+    soup = BeautifulSoup(original, "html.parser")
+    home = soup.select_one("div.lineup#a")
+    home.th.string = "Chelsea (4-4-2)"
+    home.table.replace_with(Comment(str(home.table)))
+    soup.select_one("div.lineup#b").insert_before(soup.select_one("div#team_stats").extract())
+
+    def match_tables(html):
+        page = parse_page_document(html, target_id="fbref:match:2185fc64", page_kind="match")
+        assert not page.errors
+        return {table.table_id: table for table in page.tables}
+
+    before, after = match_tables(original), match_tables(str(soup))
+    assert before.keys() == after.keys()
+    for name in ("lineup_a", "lineup_b", "team_stats"):
+        assert before[name].dataset == after[name].dataset == f"table:{name}"
+        assert before[name].availability == after[name].availability == Availability.AVAILABLE
+        assert [r.row_id for r in before[name].rows] == [r.row_id for r in after[name].rows]
+        # The snapshots themselves remain addressable for audit and replay.
+        assert before[name].table_instance_id != after[name].table_instance_id
+    assert before["lineup_a"].header_paths != after["lineup_a"].header_paths
+    assert before["lineup_a"].source_location == "dom"
+    assert after["lineup_a"].source_location.startswith("comment:")
+
+    # Reorder this saved match's seven source tables inside a single comment.
+    # Keep explicit FBref lineup/team-stat containers around their anonymous tables.
+    tables = BeautifulSoup(original, "html.parser").find_all("table")
+    fragment = "".join(str(t if t.get("id") else t.parent) for t in reversed(tables))
+    in_comment = match_tables("<!-- unrelated -->" + "<!--" + fragment + "-->")
+    assert len(in_comment) == len(tables) == 7
+    assert in_comment.keys() == before.keys()
+    for name, table in in_comment.items():
+        assert table.source_location == "comment:1"
+        assert table.dataset == before[name].dataset
+        assert table.rows == before[name].rows
+
+
+def test_named_captioned_and_anonymous_table_datasets_do_not_depend_on_order():
+    named = '<table id="nations"><tr><th>Nation</th></tr><tr><td>MX</td></tr></table>'
+    captioned = "<table><caption>Group A</caption><tr><th>Pts</th></tr><tr><td>3</td></tr></table>"
+    anonymous = "<table><tr><th>City</th></tr><tr><td>Rome</td></tr></table>"
+
+    def identities(html):
+        page = parse_page_document(html, target_id="sample", page_kind="season")
+        return {t.rows[0].cells[0].raw_value: (t.table_id, t.dataset) for t in page.tables}
+
+    first = identities(named + "<!-- " + captioned + anonymous + " -->")
+    second = identities(anonymous + "<!-- arbitrary comment -->" + captioned + "<!-- " + named + " -->")
+    assert first == second
+    assert first["MX"] == ("nations", "table:nations")
+    assert len({name for _, name in first.values()}) == 3
+    assert identities(captioned.replace("Pts", "Points"))["3"] == first["3"]
+
+
+def test_duplicate_source_ids_keep_caption_identity_after_order_and_value_changes():
+    def standing(caption, points):
+        return (
+            '<table id="results2026311_overall"><caption>' + caption
+            + '</caption><tr><th data-stat="rank">Rank</th><th data-stat="team">Team</th>'
+            + '<th data-stat="games">MP</th></tr><tr><td>1</td><td>Atlas</td>'
+            + f"<td>{points}</td></tr></table>"
+        )
+
+    def by_caption(html):
+        page = parse_page_document(html, target_id="fbref:season:31:2026", page_kind="season")
+        assert all(t.availability == Availability.AVAILABLE for t in page.tables)
+        return {t.caption: t.dataset for t in page.tables}
+
+    a, b = standing("Group A", 3), standing("Group B", 1)
+    before = by_caption(a + "<!--" + b + "-->")
+    after = by_caption(b + "<!-- Other -->" + "<!--" + standing("Group A", 5) + "-->")
+    assert before == after
+    assert len(set(before.values())) == 2
+
+
+def test_literal_source_id_cannot_collide_with_a_manifest_instance_suffix():
+    def table(table_id):
+        return f'<table id="{table_id}"><tr><th>Key</th></tr><tr><td>A</td></tr></table>'
+
+    page = parse_page_document(
+        table("nations") * 2 + table("nations:instance:2"),
+        target_id="sample",
+        page_kind="season",
+    )
+    assert {t.dataset for t in page.tables} == {
+        "table:nations", "table:nations:instance:2", "table:nations%3Ainstance%3A2",
+    }
+
+
+def test_standings_id_alone_does_not_classify_unrecognised_rows():
+    page = parse_page_document(
+        '<table id="results2026311_overall"><tr><th>Advertisement</th></tr>'
+        "<tr><td>One</td></tr></table>", target_id="t", page_kind="season",
+    )
+    assert page.tables[0].availability == Availability.UNKNOWN
+
+
+def test_equal_lineup_markup_under_different_sides_is_not_a_duplicate():
+    html = (
+        '<table><tr><th>Side</th></tr><tr><td>'
+        '<a href="/en/players/abcdef12/Player">Player</a></td></tr></table>'
+    )
+    page = parse_page_document(
+        f'<div id="a" class="lineup">{html}</div><div id="b" class="lineup">{html}</div>',
+        target_id="match", page_kind="match",
+    )
+    assert [(t.dataset, t.availability) for t in page.tables] == [
+        ("table:lineup_a", Availability.AVAILABLE), ("table:lineup_b", Availability.AVAILABLE),
+    ]
+    assert page.tables[0].rows[0].row_id != page.tables[1].rows[0].row_id
+
+
+def test_match_containers_with_unrecognised_material_rows_stay_unknown():
+    table = "<table><tr><th>Notice</th></tr><tr><td>Generic text</td></tr></table>"
+    html = f'<div id="a" class="lineup">{table}</div><div id="team_stats">{table}</div>'
+    page = parse_page_document(html, target_id="match", page_kind="match")
+    assert [t.dataset for t in page.tables] == ["table:lineup_a", "table:team_stats"]
+    assert all(t.availability == Availability.UNKNOWN for t in page.tables)
+
+
+@pytest.mark.parametrize(
+    ("kind", "name_cell", "expected"),
+    [
+        ("competition_index", '<a href="/en/comps/9/history/Premier-League-Seasons">PL</a>', Availability.AVAILABLE),
+        ("competition_index", "Unlinked name", Availability.UNKNOWN),
+        ("competition_index", '<a href="https://example.org/en/comps/9/history/External">PL</a>', Availability.UNKNOWN),
+        ("squad", '<a href="/en/comps/9/history/Premier-League-Seasons">PL</a>', Availability.UNKNOWN),
+    ],
+)
+def test_index_section_requires_linked_competitions_and_source_fields(kind, name_cell, expected):
+    html = (
+        '<table id="comps_club"><tbody><tr><th data-stat="league_name">' + name_cell
+        + '</th><td data-stat="gender">M</td><td data-stat="minseason">1992</td>'
+        + '<td data-stat="maxseason">2026</td></tr></tbody></table>'
+    )
+    assert parse_page_document(html, target_id="t", page_kind=kind).tables[0].availability == expected
 
 
 def test_schema_signature_does_not_change_with_repeated_rows():
@@ -484,6 +628,13 @@ def test_rows_repeating_the_same_entities_get_distinct_ids():
     assert len(row_ids) == 2
     assert len(set(row_ids)) == 2
     assert len(merge_keys) == len(cells)
+
+    soup = BeautifulSoup(html, "html.parser")
+    first, second = soup.tbody.find_all("tr")
+    first.insert_before(second.extract())
+    second.find("td", attrs={"data-stat": "goals"}).string = "20"
+    reordered = parse_page_document(str(soup), target_id=page.target_id, page_kind=page.page_kind)
+    assert [r.row_id for r in reordered.tables[0].rows] == row_ids[::-1]
 
 
 # Shape of the real 1938 Austria squad response: a full 200 page whose only
