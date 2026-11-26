@@ -1,0 +1,18 @@
+[Unit]
+Description=SofaScore standings freshness from stored Bronze data
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/bin:/bin
+ExecStart=/usr/bin/python3 -I -B /opt/sofascore-standings-report/current/deploy/sofascore/standings_report.py --output /var/lib/sofascore-standings-report/latest.txt
+StateDirectory=sofascore-standings-report
+StateDirectoryMode=0755
+UMask=0022
+TimeoutStartSec=35min
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX

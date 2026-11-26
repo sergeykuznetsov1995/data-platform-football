@@ -1,0 +1,10 @@
+[Unit]
+Description=Check stored SofaScore standings every eight hours
+
+[Timer]
+OnActiveSec=20s
+OnUnitInactiveSec=8h
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
