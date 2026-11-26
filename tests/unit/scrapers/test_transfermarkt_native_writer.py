@@ -11217,3 +11217,52 @@ def test_r40_foreign_historical_marker_after_release(monkeypatch, replay, queued
     assert _r26_file_bytes(evidence) == evidence
     assert write_journal.scope_owner(held) is None and not write_journal.pending_intents({'run_id': 'run-1'})
     _r28_no_dml(db, writer, start)
+
+
+@pytest.mark.parametrize('replay', [False, True], ids=['direct', 'replay'])
+@pytest.mark.parametrize('conflict', [False, True], ids=['exact', 'held-conflict'])
+def test_closing_historical_page_checks_held_capture(monkeypatch, replay, conflict):
+    from tests.unit.scrapers.test_transfermarkt_sections import _attendance_plan
+
+    db = CoreDB()
+    url, _, page = _walk_pages()
+    earlier = _attendance_plan((page(url, 'single_page.html', EARLIER, 'earlier'),))
+    historical = write(db, [earlier], run_id='earlier', clock=EARLIER)['walks'][0]['receipt_id']
+    db.sql.execute('DELETE FROM transfermarkt_core_pages_v1 WHERE receipt_id=?', (historical,))
+    attendance = _attendance_plan((page(url, 'single_page.html', CLOCK, 'current'),))
+    representation, = _representation_packet(('7',), CLOCK)
+    write(db, [representation], run_id='prior-sibling')
+    plans = [attendance, representation]
+    release = write_journal.release_scope
+
+    def stop_after_first_release(scope, owner):
+        release(scope, owner)
+        _r22_stop()
+
+    with monkeypatch.context() as patch:
+        _capture_returned_queries(patch, db, [native_writer.CORE_PAGES_TABLE])
+        saved = _r37_capture_settlement(patch, 'settled-statements',
+                                        lambda key: key == [native_writer.CORE_PAGES_TABLE, historical])
+        patch.setattr(write_journal, 'release_scope', stop_after_first_release)
+        with pytest.raises(OSError):
+            write(db, plans)
+    (descriptor, body), = write_journal.pending_intents({})
+    ack = write_journal.read_receipt(body['identity']['digest'])
+    operation, _, _, marker, _ = saved
+    for path in (operation, marker):
+        path.write_bytes(saved[path])
+    assert write_journal.scope_owner(native_writer._target_scope(attendance)) is None
+    guard = write_journal._scope_owner_path(native_writer._target_scope(representation))
+    evidence = _r26_file_bytes([guard, descriptor, operation, marker])
+    assert all(evidence.values())
+    writer, start = CoreWriter(db), len(db.events)
+    if conflict:
+        db.sql.execute(f"UPDATE {RECEIPTS} SET row_count=0 WHERE run_id='prior-sibling'")
+        with pytest.raises(RuntimeError):
+            _r20_recover(db, writer, plans, replay)
+        assert _r26_file_bytes(evidence) == evidence
+        _r28_no_dml(db, writer, start)
+    else:
+        assert _r20_recover(db, writer, plans, replay) == ack
+        assert not any(path.exists() for path in evidence)
+        assert not writer.writes and not _r33_data_mutations(db, start, plans)

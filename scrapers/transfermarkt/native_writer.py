@@ -3702,14 +3702,15 @@ def _release_packet(plans, owner, paths):
         write_journal.finish_intent(path)
 
 
-def _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, warehouse, universe_version, *, predecessors=()):
+def _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, warehouse, universe_version,
+                             *, predecessors=(), capture_history=False):
     """Verify every reserved member, or just the guards left after release started."""
     reserved = write_journal._record_path('reserving-bundles', receipt_ids[0]).exists()
     scopes = {_target_scope(plan) for plan in plans}
     owned = scopes if reserved else {scope for scope in scopes if write_journal.scope_owner(scope) == receipt_ids[0]}
     _verify_member_cells(connection_factory, plans, receipt_ids, stored, warehouse, universe_version,
                          owned, check_statements=True, scope_only=owned != scopes,
-                         predecessors=predecessors)
+                         predecessors=predecessors, capture_history=capture_history)
 
 
 def _verify_member_cells(connection_factory, plans, receipt_ids, stored, warehouse, universe_version,
@@ -5107,7 +5108,10 @@ def _commit_bundle(
                     for path in paths:
                         write_journal.finish_intent(path)
                 else:
-                    _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, identity, universe_version)
+                    # Retiring a released page must not discard the last guard of
+                    # a sibling whose earlier receipt contradicts its capture.
+                    _verify_remaining_owners(connection_factory, plans, receipt_ids, stored, identity,
+                                             universe_version, capture_history=bool(released_pages))
                     _retire_predecessors(released_pages)
                     _release_packet(plans, receipt_ids[0], paths)
                 if journaled:
