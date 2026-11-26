@@ -110,6 +110,7 @@ def prepare(**_: Any) -> None:
 
 def plan_wave(**context: Any) -> list[dict[str, Any]]:
     from scrapers.espn import editions_store, grouped_wave, wave
+    from scrapers.espn.freshness_source import CORE_SCOPE_KEY
     from scrapers.espn.denominator import load_denominator
 
     now = datetime.now(timezone.utc)
@@ -164,6 +165,10 @@ def plan_wave(**context: Any) -> list[dict[str, Any]]:
         groups = grouped_wave.group_works(plan.works)
     except ValueError as exc:
         raise AirflowFailException(f"ESPN invalid wave plan: {exc}") from exc
+    if midnight and since is None and str(context.get("run_id", "")).startswith("scheduled__"):
+        context["ti"].xcom_push(key=CORE_SCOPE_KEY, value={
+            "day": now.date().isoformat(), "out_of_season": list(plan.out_of_season),
+        })
     return [{"works": [work.to_xcom() for work in group]} for group in groups]
 
 

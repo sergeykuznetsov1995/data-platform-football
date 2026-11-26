@@ -27,6 +27,7 @@ from scrapers.espn.criterion import (
     targets_literal,
 )
 from scrapers.espn.denominator import load_denominator
+from scrapers.espn.freshness_source import SourceDay
 
 pytestmark = pytest.mark.unit
 
@@ -87,9 +88,10 @@ def meter():
             render_daily_criterion_sql(day, TARGETS), read="trino", write="duckdb"
         )[0].replace("iceberg.bronze.", "bronze.")
         rows = con.execute(sql).fetchall()
-        return day_result(day, rows), {row[0]: row[1:] for row in rows}
+        return day_result(day, rows, SourceDay()), {row[0]: row[1:6] for row in rows}
 
     run.load = load
+    run.connection = con
     return run
 
 
@@ -195,9 +197,9 @@ def test_streak_threshold_uses_the_exact_ratio_not_the_rounded_pct():
     assert pct(0, 0) is None
 
 
-def test_summary_line_names_zero_played_as_no_data():
+def test_summary_line_names_confirmed_neutral_day():
     empty = render_summary_line(DayResult(DAY, 0, 0), 0)
-    assert empty == "• ESPN за сутки 11.10: нет сыгранных в новых таблицах ⚠️ (серия 0)"
+    assert empty == "• ESPN за сутки 11.10: нет матчей со сроком публикации (серия 0)"
     assert "%" not in empty
     line = render_summary_line(DayResult(DAY, 200, 199, withdrawn=2, unchecked=1), 3)
     assert line == (

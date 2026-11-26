@@ -19,7 +19,7 @@ import uuid
 
 from . import urls
 from .attempts import attempt_covered
-from .criterion import meets, render_daily_criterion_sql
+from .criterion import read_day
 from .gate import TransportGate, default_state_path
 from .history import live_debt
 from .pace import PaceWindow, evaluate
@@ -56,9 +56,10 @@ AND team_stats_state IN ('captured', 'valid_empty') ORDER BY event_id""")
 
 def read_freshness(trino, targets, now):
     day = (now.date() - timedelta(days=1)).isoformat()
-    rows = trino.execute_query(render_daily_criterion_sql(day, targets))
-    due, ok = sum(int(r[1]) for r in rows), sum(int(r[2]) for r in rows)
-    return dict(day=day, due=due, ok=ok, eligible=meets(ok, due), checked_at=now.timestamp())
+    result = read_day(trino, day, targets)
+    return dict(day=day, due=result.due, ok=result.ok, state=result.state, eligible=result.eligible,
+                coverage_gaps=list(result.coverage_gaps), missing_ids=list(result.missing_ids),
+                checked_at=now.timestamp())
 
 
 def validate_state(state, policy_hash, workload_hash):
@@ -100,11 +101,12 @@ class MeasurementStopped(RuntimeError):
 class Controller:
     def __init__(self, *, gate, journal, store, ids, trino, targets, client_factory,
                  stop_file, history_stop=None, now=now_utc, monotonic=time.monotonic,
-                 max_step=2, benchmark_fn=None, io_factory=None):
+                 max_step=2, benchmark_fn=None, io_factory=None, freshness_targets=None):
         if max_step not in (2, 3):
             raise ValueError('acceptance maximum must be S2; S3 only with explicit opt-in')
         self.gate, self.journal, self.store = gate, journal, store
         self.ids, self.trino, self.targets = tuple(ids), trino, tuple(targets)
+        self.freshness_targets = self.targets if freshness_targets is None else tuple(freshness_targets)
         self.client_factory = client_factory
         self.stop_file = Path(stop_file)
         self.history_stop = Path(history_stop) if history_stop is not None else None
@@ -125,7 +127,8 @@ class Controller:
         if io_factory is not None:
             from .pace_io import PaceIO
             self.io = PaceIO(factory=io_factory, gate=gate, journal=journal, store=store,
-                             targets=self.targets, now=now, read_freshness=read_freshness)
+                             targets=self.targets, freshness_targets=self.freshness_targets,
+                             now=now, read_freshness=read_freshness)
         self.io_started = False
 
     def _main_thread(self):
@@ -226,7 +229,7 @@ class Controller:
         try:
             debt = live_debt(self.trino, self.targets, now)
             if force or now.timestamp() - self.freshness.get('checked_at', 0) >= FRESHNESS_SECONDS:
-                self.freshness = read_freshness(self.trino, self.targets, now)
+                self.freshness = read_freshness(self.trino, self.freshness_targets, now)
         except Exception as exc:
             known, error = False, type(exc).__name__
             self.freshness = {}
@@ -455,7 +458,7 @@ class Controller:
 
     def _final_freshness(self):
         if self.io is None:
-            return read_freshness(self.trino, self.targets, self.now())
+            return read_freshness(self.trino, self.freshness_targets, self.now())
         requested = self.now().timestamp()
         previous = self.io.snapshot('freshness') or {}
         sequence = previous.get('sequence', 0)
@@ -749,8 +752,10 @@ def _run_owned(args, store, stop_file, parser):
             from .pace_benchmark import benchmark
             return benchmark(trino, store, args.state_dir, ids,
                              count=args.benchmark_count, step=step)
+        denominator = load_denominator()
         controller = Controller(gate=gate, journal=journal, store=store, ids=ids,
-                                trino=trino, targets=sorted(load_denominator().live_targets()),
+                                trino=trino, targets=sorted(denominator.live_targets()),
+                                freshness_targets=sorted(denominator.targets()),
                                 client_factory=factory, stop_file=stop_file,
                                 history_stop=args.state_dir / 'history.off', max_step=3 if args.allow_s3 else 2,
                                 benchmark_fn=boundary_benchmark if args.benchmark_at_boundaries else None,

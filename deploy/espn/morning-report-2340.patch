@@ -1,0 +1,340 @@
+--- a/morning_report.py
++++ b/morning_report.py
+@@ -3060,18 +3060,16 @@
+ # 3 суток) и две строки перепроверки (downgrade_rejected за сутки, дозаполнено по лигам) вместо
+ # заглушки. #1507: строка старого контура убрана — паузу dag_espn_current ловит paused()
+ # (METADBS/EXPECTED_RUNNING → espn-live), недоступную metadb и пропавший DAG — _espn_contour_line(),
+ # простой bronze — freshness() по espn_match и сторож espn_stall_watch.py.
+-# Пакет /root/espn-deliveries/1506/summary (README: установка, откат). Тексты ESPN_DAILY_SQL,
+-# ESPN_WAVES_SQL, ESPN_QUALITY_SQL, ESPN_LOADS_SQL, ESPN_RECHECK_SQL и список ESPN_TARGETS —
++# Суточный результат и приёмка используют один модуль scrapers.espn.criterion (#2340).
++# Тексты ESPN_WAVES_SQL, ESPN_QUALITY_SQL, ESPN_LOADS_SQL, ESPN_RECHECK_SQL —
+ # дословная копия scrapers/espn/criterion.py, scrapers/espn/quality.py и
+ # configs/espn/denominator.tsv (master 3b137cc4); менять только вместе с ними. Форматы
+ # строк повторяют criterion.render_summary_line / render_wave_line и quality.render_quality_lines
+ # / render_recheck_lines (тест пакета).
+ ESPN_METADB = "espn-live-airflow-metadb-1"
+-ESPN_DAILY_STATE = "/root/watchdog/state/espn_daily_criterion.json"
+-ESPN_TARGET_PCT = Decimal("99")
+-ESPN_MILESTONE = 3
++ESPN_DAILY_STATE = "/root/watchdog/state/espn_daily_criterion_v2.json"
+ ESPN_WAVE_P95_LIMIT_S = 3600
+ ESPN_SHARE_CHECKS = ("valid_empty", "source_malformed", "lineup_anomaly")
+ ESPN_SHARE_LIMIT_PCT = 20
+ ESPN_SHARE_MIN = 5
+@@ -3079,217 +3077,8 @@
+ ESPN_LOADS_WEEK_TENTHS = 11
+ ESPN_LOADS_WEEK_DAYS = 7
+ ESPN_LOADS_PEAK_DAYS = 3
+ ESPN_SENTINEL = "__sentinel__"
+-ESPN_TARGETS = (
+-    'afc.asian.cup',
+-    'afc.champions',
+-    'afc.champions_qual',
+-    'afc.cup',
+-    'afc.cup_qual',
+-    'afc.cupq',
+-    'afc.saff.championship',
+-    'aff.championship',
+-    'arg.1',
+-    'arg.2',
+-    'arg.3',
+-    'arg.copa',
+-    'arg.copa_de_la_superliga',
+-    'arg.supercopa',
+-    'arg.supercopa.internacional',
+-    'arg.trofeo_de_la_campeones',
+-    'aus.1',
+-    'aut.1',
+-    'bel.1',
+-    'bel.promotion.relegation',
+-    'bol.1',
+-    'bol.copa',
+-    'bol.ply.rel',
+-    'bra.1',
+-    'bra.2',
+-    'bra.camp.carioca',
+-    'bra.camp.gaucho',
+-    'bra.camp.mineiro',
+-    'bra.camp.paulista',
+-    'bra.copa_do_brazil',
+-    'bra.supercopa_do_brazil',
+-    'caf.champions',
+-    'caf.championship',
+-    'caf.championship_qual',
+-    'caf.confed',
+-    'caf.cosafa',
+-    'caf.nations',
+-    'caf.nations_qual',
+-    'campeones.cup',
+-    'chi.1',
+-    'chi.1.promotion.relegation',
+-    'chi.copa_chi',
+-    'chi.super_cup',
+-    'chn.1',
+-    'chn.1.promotion.relegation',
+-    'col.1',
+-    'col.copa',
+-    'col.superliga',
+-    'concacaf.central.american.cup',
+-    'concacaf.champions',
+-    'concacaf.champions_cup',
+-    'concacaf.confederations_playoff',
+-    'concacaf.gold',
+-    'concacaf.gold_qual',
+-    'concacaf.leagues.cup',
+-    'concacaf.nations.league',
+-    'conmebol.america',
+-    'conmebol.libertadores',
+-    'conmebol.recopa',
+-    'conmebol.sudamericana',
+-    'crc.1',
+-    'den.1',
+-    'ecu.1',
+-    'eng.1',
+-    'eng.2',
+-    'eng.3',
+-    'eng.4',
+-    'eng.5',
+-    'eng.charity',
+-    'eng.fa',
+-    'eng.fa_qual',
+-    'eng.league_cup',
+-    'eng.trophy',
+-    'esp.1',
+-    'esp.2',
+-    'esp.copa_del_rey',
+-    'esp.super_cup',
+-    'fifa.cwc',
+-    'fifa.intercontinental_cup',
+-    'fifa.wcq.ply',
+-    'fifa.world',
+-    'fifa.worldq.afc',
+-    'fifa.worldq.caf',
+-    'fifa.worldq.concacaf',
+-    'fifa.worldq.conmebol',
+-    'fifa.worldq.ofc',
+-    'fifa.worldq.uefa',
+-    'fra.1',
+-    'fra.1.promotion.relegation',
+-    'fra.2',
+-    'fra.coupe_de_france',
+-    'fra.super_cup',
+-    'ger.1',
+-    'ger.2',
+-    'ger.2.promotion.relegation',
+-    'ger.dfb_pokal',
+-    'ger.playoff.relegation',
+-    'ger.super_cup',
+-    'global.club_challenge',
+-    'global.finalissima',
+-    'global.gulf_cup',
+-    'gre.1',
+-    'gua.1',
+-    'hon.1',
+-    'ind.1',
+-    'ind.2',
+-    'ita.1',
+-    'ita.2',
+-    'ita.coppa_italia',
+-    'ita.super_cup',
+-    'jpn.1',
+-    'ksa.1',
+-    'ksa.kings.cup',
+-    'mex.1',
+-    'mex.2',
+-    'mex.campeon',
+-    'ned.1',
+-    'ned.2',
+-    'ned.3.promotion.relegation',
+-    'ned.cup',
+-    'ned.playoff.relegation',
+-    'ned.supercup',
+-    'nor.1',
+-    'nor.1.promotion.relegation',
+-    'par.1',
+-    'par.1.supercopa',
+-    'per.1',
+-    'por.1',
+-    'por.1.promotion.relegation',
+-    'por.taca.portugal',
+-    'rsa.1',
+-    'rus.1',
+-    'rus.1.promotion.relegation',
+-    'sco.1',
+-    'sco.1.promotion.relegation',
+-    'sco.2',
+-    'sco.2.promotion.relegation',
+-    'sco.challenge',
+-    'sco.cis',
+-    'sco.tennents',
+-    'sco.tennents_qual',
+-    'slv.1',
+-    'swe.1',
+-    'swe.1.promotion.relegation',
+-    'tur.1',
+-    'uefa.champions',
+-    'uefa.champions_qual',
+-    'uefa.euro',
+-    'uefa.europa',
+-    'uefa.europa.conf',
+-    'uefa.europa.conf_qual',
+-    'uefa.europa_qual',
+-    'uefa.euroq',
+-    'uefa.nations',
+-    'uefa.super_cup',
+-    'uru.1',
+-    'uru.2',
+-    'usa.1',
+-    'usa.open',
+-    'usa.usl.1',
+-    'usa.usl.l1',
+-    'usa.usl.l1.cup',
+-    'ven.1',
+-)
+-ESPN_DAILY_SQL = """WITH
+-m AS (
+-    SELECT competition_slug, event_id, kickoff, status, played_final,
+-           terminal_nonplayed, disposition, lineup_state, team_stats_state,
+-           first_published_at, status_checked_at,
+-           kickoff + INTERVAL '26' HOUR AS deadline
+-    FROM iceberg.bronze.espn_match
+-    WHERE duplicate_of IS NULL
+-      AND competition_slug IN ({targets})
+-      AND kickoff + INTERVAL '26' HOUR >= TIMESTAMP '{day} 00:00:00'
+-      AND kickoff + INTERVAL '26' HOUR < TIMESTAMP '{day} 00:00:00' + INTERVAL '1' DAY
+-),
+-graded AS (
+-    SELECT competition_slug,
+-           coalesce(disposition = 'withdrawn', false) AS withdrawn,
+-           NOT coalesce(disposition = 'withdrawn', false)
+-               AND coalesce(
+-                   (terminal_nonplayed OR status = 'STATUS_POSTPONED')
+-                   AND status_checked_at > kickoff,
+-                   false
+-               ) AS nonplayed,
+-           coalesce(
+-               played_final
+-               AND lineup_state IN ('captured', 'valid_empty')
+-               AND team_stats_state IN ('captured', 'valid_empty')
+-               AND first_published_at <= deadline,
+-               false
+-           ) AS ok,
+-           coalesce(
+-               NOT played_final
+-               AND coalesce(status_checked_at < kickoff + INTERVAL '2' HOUR, true),
+-               false
+-           ) AS unchecked
+-    FROM m
+-)
+-SELECT competition_slug,
+-       count_if(NOT withdrawn AND NOT nonplayed) AS due,
+-       count_if(NOT withdrawn AND NOT nonplayed AND ok) AS ok,
+-       count_if(withdrawn) AS withdrawn,
+-       count_if(nonplayed) AS nonplayed,
+-       count_if(NOT withdrawn AND NOT nonplayed AND unchecked) AS unchecked
+-FROM graded
+-GROUP BY competition_slug
+-ORDER BY competition_slug"""
+ ESPN_WAVES_SQL = """SELECT count(*) AS waves,
+        count_if(state = 'red') AS red_waves,
+        CAST(approx_percentile(duration_s, 0.95) AS bigint) AS p95_s,
+        max(duration_s) AS max_s
+@@ -3433,37 +3222,8 @@
+ def _espn_dd(d):
+     return f"{d[8:10]}.{d[5:7]}"
+
+
+-def _espn_pct(ok, due):
+-    return (Decimal(100) * Decimal(ok) / Decimal(due)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+-
+-
+-def _espn_meets(ok, due):
+-    # Порог — по точному отношению, не по округлённому (95/96 = 99,0 % после округления, но < 99 %).
+-    return due > 0 and Decimal(100) * ok >= ESPN_TARGET_PCT * due
+-
+-
+-def _espn_format_day(rec, d, streak):
+-    """= criterion.render_summary_line(DayResult(d, due, ok, withdrawn, nonplayed, unchecked), streak)."""
+-    dd = _espn_dd(d)
+-    extra = []
+-    if rec.get("withdrawn"):
+-        extra.append(f"снято с календаря {rec['withdrawn']}")
+-    if rec.get("nonplayed"):
+-        extra.append(f"перенесено/отменено {rec['nonplayed']}")
+-    tail = f" ({'; '.join(extra)})" if extra else ""
+-    if rec["due"] <= 0:
+-        return f"• ESPN за сутки {dd}: нет сыгранных в новых таблицах ⚠️ (серия {streak}){tail}"
+-    flag = "✅" if _espn_meets(rec["ok"], rec["due"]) else "‼️"
+-    line = (f"• ESPN: сыгранных за сутки {dd} {rec['due']}, ≤ 24 ч {_espn_pct(rec['ok'], rec['due']):.1f} % "
+-            f"({rec['ok']}/{rec['due']}), серия {streak} дн. "
+-            f"(веха 1: {ESPN_MILESTONE} дня ≥ {ESPN_TARGET_PCT} %) {flag}")
+-    if rec.get("unchecked"):
+-        line += f"; статус не перепроверен после kickoff + 2 ч: {rec['unchecked']}"
+-    return line + tail
+-
+-
+ def _espn_iso_add(iso, days):
+     return (datetime.fromisoformat(iso).date() + timedelta(days=days)).isoformat()
+
+
+@@ -3520,37 +3280,33 @@
+             state = json.load(fh)
+     except (OSError, ValueError):
+         state = {}
+     days = state.setdefault("days", {})
+-    rec = days.get(d)
+-    if rec is not None:
+-        return _espn_format_day(rec, d, rec["streak"]), True
+-    targets = ", ".join(f"'{slug}'" for slug in ESPN_TARGETS)
+-    rows = _espn_rows(ESPN_DAILY_SQL.format(day=d, targets=targets), 6, "0, 0, 0, 0, 0")
+-    carry = _espn_carry(state, d)
+-    if rows is None:
++    if d in days:
++        return days[d]["line"], True
++    try:
++        command = ["docker", "exec", "-w", "/tmp", "espn-live-airflow-scheduler-1",
++                   "python", "-B", "-m", "scrapers.espn.criterion", d, str(_espn_carry(state, d))]
++        completed = subprocess.run(command, capture_output=True, text=True, timeout=240, check=True)
++        rec = json.loads(completed.stdout)
++        if rec["day"] != d or rec["state"] not in {"unknown", "neutral", "measured"}:
++            raise ValueError("invalid ESPN deadline result")
++        line = rec["line"]
++    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+         if _espn_missing("bronze", "espn_match"):
+-            return (f"• ESPN за сутки {_espn_dd(d)}: нет сыгранных в новых таблицах ⚠️ "
+-                    "(таблиц нового контура ещё нет — #1507)"), False
+-        return f"• ESPN за сутки {_espn_dd(d)}: не посчитано ⚠️ (серия {carry})", True
+-    rec = {key: sum(int(r[i]) for r in rows)
+-           for i, key in enumerate(("due", "ok", "withdrawn", "nonplayed", "unchecked"), start=1)}
+-    if rec["due"] <= 0:
+-        line = _espn_format_day(rec, d, carry)
+-        if "--dry-run" not in sys.argv:
+-            _espn_mark_neutral(state, d)
+-            if not _espn_save_state(state):
+-                line += " (state не записан ⚠️)"
++            return f"• ESPN за сутки {_espn_dd(d)}: таблицы матчей ещё нет ⚠️", False
++        return f"• ESPN за сутки {_espn_dd(d)}: охват неизвестен, серия 0 ⚠️", True
++    if rec["state"] == "unknown" or "--dry-run" in sys.argv:
+         return line, True
+-    rec["streak"] = carry + 1 if _espn_meets(rec["ok"], rec["due"]) else 0
+-    line = _espn_format_day(rec, d, rec["streak"])
+-    if "--dry-run" not in sys.argv:
+-        days[d] = rec
++    if rec["state"] == "neutral":
++        _espn_mark_neutral(state, d)
++    elif not state.get("last_day") or d >= state["last_day"]:
+         state.update({"streak": rec["streak"], "last_day": d})
+-        for k in sorted(days)[:-30]:
+-            days.pop(k, None)
+-        if not _espn_save_state(state):
+-            line += " (state не записан ⚠️)"
++    days[d] = rec
++    for k in sorted(days)[:-30]:
++        days.pop(k, None)
++    if not _espn_save_state(state):
++        line += " (state не записан ⚠️)"
+     return line, True
+
+
+ def _espn_waves(d):

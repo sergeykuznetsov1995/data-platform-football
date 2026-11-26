@@ -570,6 +570,7 @@ class WavePlan:
     days: tuple[date, ...]
     topup_days: tuple[date, ...]
     status_checks: int
+    out_of_season: tuple[str, ...] = ()
 
 
 def _fetch(client, request: urls.EspnRequest, *, force_refresh: bool):
@@ -930,18 +931,19 @@ def plan_wave(
     status_errors: dict[str, str] = {}
     core_days: dict[str, set[date]] = {}
     core_added = 0
+    out_of_season = []
     if check_core or window is not None:
         first, last = window or (today - timedelta(days=CORE_DAYS - 1), today)
         for competition in sorted(targets.values(), key=lambda item: item.slug):
             # A window is read for every tournament: an event of a season with
             # no open edition is on no parsed day and comes back unlisted (red).
-            if competition.slug not in usable or (
-                window is None
-                and not any(
-                    edition.start_date <= last and edition.end_date >= first
-                    for edition in competition.open_editions()
-                )
+            if competition.slug not in usable:
+                continue
+            if window is None and not any(
+                edition.start_date <= last and edition.end_date >= first
+                for edition in competition.open_editions()
             ):
+                out_of_season.append(competition.slug)
                 continue
             try:
                 added, unlisted = _core_missing(
@@ -1125,7 +1127,7 @@ def plan_wave(
         len(rechecks),
         [day.isoformat() for day in days],
     )
-    return WavePlan(tuple(works), days, tuple(topup), len(absent))
+    return WavePlan(tuple(works), days, tuple(topup), len(absent), tuple(out_of_season))
 
 
 # ---------------------------------------------------------------- run
