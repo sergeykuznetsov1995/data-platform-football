@@ -119,17 +119,22 @@ def test_missing_match_is_named_by_report_and_acceptance(archive, meter):
 
 
 @pytest.mark.parametrize(
-    "latest_kickoff, expected_ok",
-    [("2026-10-10T15:01Z", 1), ("2026-10-10T18:30Z", 0)],
+    "latest_kickoff, publication_hours, expected_ok",
+    [
+        ("2026-10-10T15:01Z", 3, 1),
+        ("2026-10-10T18:30Z", 3, 0),
+        ("2026-10-10T15:00Z", -1, 0),
+        ("2026-10-10T15:00Z", 26, 1),
+    ],
 )
-def test_final_publication_against_corrected_kickoff(
-    archive, meter, latest_kickoff, expected_ok
+def test_final_publication_uses_latest_kickoff(
+    archive, meter, latest_kickoff, publication_hours, expected_ok
 ):
     archive.board(-2)
     archive.board(-1, played(81, latest_kickoff))
     archive.core(81)
-    # Bronze originally scheduled 15:00 and published the final result at 18:00.
-    meter.load([_row(81, published=timedelta(hours=3))])
+    # Publication time is relative to the original 15:00 kickoff in Bronze.
+    meter.load([_row(81, published=timedelta(hours=publication_hours))])
     day = criterion.read_day(archive, DAY, {TARGET})
     assert (day.ok, day.due, day.state) == (expected_ok, 1, "measured")
 

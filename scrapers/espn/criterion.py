@@ -19,8 +19,7 @@ report and the acceptance reader call the same closed-day calculation.
   ``team_stats_state`` in (captured, valid_empty) and ``first_published_at``
   (start of the match commit of the batch that first published the match
   that way, after its children; a republication never moves it)
-  ``<= deadline``. If the source corrected the kickoff, a final result
-  published before the corrected kickoff cannot establish timely coverage.
+  falls between the latest kickoff and its deadline, inclusive.
 * Everything else in ``due`` is a miss: no data, late, a Summary still
   pending or malformed, and a match whose status was not read after
   ``kickoff + 2 h`` (``unchecked`` — a stopped collection shows up here
@@ -81,10 +80,9 @@ graded AS (
     SELECT *,
            NOT withdrawn AND NOT nonplayed AND kickoff IS NOT NULL AS due,
            coalesce(played_final AND (NOT use_source OR source_played)
-                    AND (bronze_kickoff = kickoff OR first_published_at >= kickoff)
                     AND lineup_state IN ('captured', 'valid_empty')
                     AND team_stats_state IN ('captured', 'valid_empty')
-                    AND first_published_at <= kickoff + INTERVAL '26' HOUR, false) AS ok,
+                    AND first_published_at BETWEEN kickoff AND kickoff + INTERVAL '26' HOUR, false) AS ok,
            coalesce(NOT played_final, true) AND
                coalesce(status_checked_at < kickoff + INTERVAL '2' HOUR, true) AS unchecked
     FROM m
