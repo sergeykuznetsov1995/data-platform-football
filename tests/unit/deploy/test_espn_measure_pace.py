@@ -40,7 +40,7 @@ class Trino:
             raise RuntimeError('offline')
         if 'AS debt' in sql:
             return [[self.debt]]
-        return [['eng.1', 100, 100, 0, 0, 0]]
+        return [['eng.1', 100, 100, 0, 0, 0, None, 0]]
 
 
 class Journal:
@@ -58,7 +58,11 @@ class Journal:
 
 
 @pytest.fixture
-def controller(tmp_path):
+def controller(tmp_path, monkeypatch):
+    # The pace tests supply a certified schedule. Archive and SQL integration
+    # run together in test_espn_freshness_source.
+    from scrapers.espn.freshness_source import SourceDay
+    monkeypatch.setattr("scrapers.espn.criterion.read_source_day", lambda *_: SourceDay())
     clock = Clock()
     policy = load_transport_policy()
     policy = replace(policy, pace=replace(policy.pace, minimum_window_seconds=(300, 300, 86400)))
@@ -502,23 +506,23 @@ def test_checkout_wrapper_help_from_arbitrary_directory(tmp_path):
 
 
 @pytest.mark.parametrize('protection', ['reset', 'history_freeze'])
-def test_final_acceptance_rechecks_gate_atomically_after_freshness_sql(controller, protection):
+def test_final_acceptance_rechecks_gate_atomically_after_freshness_sql(controller, protection, monkeypatch):
     c = controller
     for _ in range(2):
         fill_window(c)
         c.decide()
     fill_window(c, 86400)
-    original_query = c.trino.execute_query
-    def freshness_with_concurrent_protection(sql, *args):
-        result = original_query(sql, *args)
-        if 'AS deadline' in sql:
-            if protection == 'reset':
-                c.gate.report(c.gate.acquire('core'), status=429)
-            else:
-                with c.gate._state() as state:
-                    state['history_frozen_until'] = c.clock().timestamp() + 1800
+    from scrapers.espn import measure_pace
+    read_day = measure_pace.read_day
+    def freshness_with_concurrent_protection(*args):
+        result = read_day(*args)
+        if protection == 'reset':
+            c.gate.report(c.gate.acquire('core'), status=429)
+        else:
+            with c.gate._state() as state:
+                state['history_frozen_until'] = c.clock().timestamp() + 1800
         return result
-    c.trino.execute_query = freshness_with_concurrent_protection
+    monkeypatch.setattr(measure_pace, "read_day", freshness_with_concurrent_protection)
     report = c.decide()
     assert report['reason'] in ('stale_revision', 'protection_active')
     assert c.state['status'] != 'complete'
@@ -672,7 +676,7 @@ class AsyncSQL:
         self.closed = False
     def execute_query(self, sql):
         assert threading.get_ident() == self.owner
-        return [[0]] if 'AS debt' in sql else [['eng.1', 100, 100, 0, 0, 0]]
+        return [[0]] if 'AS debt' in sql else [['eng.1', 100, 100, 0, 0, 0, None, 0]]
     def close(self):
         assert threading.get_ident() == self.owner
         self.closed = True
@@ -1755,3 +1759,18 @@ def test_final_drain_uses_large_batches(tmp_path, monkeypatch):
                                PaceStore(tmp_path / 'pace.sqlite3'), lambda: START + timedelta(seconds=10),
                                START + timedelta(seconds=10))
     assert result['published'] == 2500 and result['pending'] == 0 and len(merges) == 2
+
+def test_measurement_grades_the_report_targets_and_preserves_the_live_debt_scope(controller, monkeypatch):
+    from scrapers.espn import criterion, measure_pace
+
+    c = controller
+    targets_seen = []
+    def recorded_day(trino, day, targets):
+        targets_seen.append(set(targets))
+        return criterion.DayResult(day, 2, 1)
+
+    c.freshness_targets = ('eng.1', 'ind.2')
+    monkeypatch.setattr(measure_pace, "read_day", recorded_day)
+    assert c._final_freshness()["state"] == "measured"
+    assert targets_seen == [{"eng.1", "ind.2"}]
+    assert c.targets == ("eng.1",)

@@ -218,7 +218,7 @@ def planned(dag_module, monkeypatch):
 
     def plan_wave(**kwargs):
         seen.update(kwargs)
-        return SimpleNamespace(works=())
+        return SimpleNamespace(works=(), out_of_season=("cup",))
 
     monkeypatch.setattr(wave, "plan_wave", plan_wave)
     monkeypatch.setattr(wave, "live_rows", lambda denominator: [])
@@ -403,8 +403,25 @@ def test_plan_wave_without_conf_plans_the_usual_wave(dag_module, planned) -> Non
     dag_module.plan_wave(**_plan_context())
     assert (planned["since"], planned["until"]) == (None, None)
     planned.clear()
-    dag_module.plan_wave(dag_run=SimpleNamespace(), run_id="scheduled__x")
+    from datetime import datetime, timezone
+    dag_module.plan_wave(dag_run=SimpleNamespace(), run_id="scheduled__x",
+                         data_interval_end=datetime(2026, 11, 25, 6, tzinfo=timezone.utc))
     assert (planned["since"], planned["until"]) == (None, None)
+
+
+@pytest.mark.unit
+def test_midnight_plan_records_which_targets_were_outside_the_calendar(dag_module, planned):
+    from datetime import datetime, timezone
+    from scrapers.espn.freshness_source import CORE_SCOPE_KEY
+
+    pushed = {}
+    boundary = datetime(2026, 11, 25, tzinfo=timezone.utc)
+    task = SimpleNamespace(xcom_push=lambda *, key, value: pushed.update({key: value}))
+    dag_module.plan_wave(run_id="scheduled__2026-11-24T18:00:00+00:00",
+                         dag_run=SimpleNamespace(), ti=task, data_interval_end=boundary)
+    assert planned["check_core"]
+    assert pushed == {CORE_SCOPE_KEY: {"day": planned["now"].date().isoformat(),
+                                       "out_of_season": ["cup"]}}
 
 
 @pytest.mark.unit
