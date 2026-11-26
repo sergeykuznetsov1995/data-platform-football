@@ -323,6 +323,122 @@ def _write_replay_manifest(root, captures):
     (root / 'manifest.json').write_text(json.dumps({'fixtures': fixtures}))
 
 
+@pytest.mark.parametrize('writing', [False, True], ids=['parse', 'write'])
+def test_cli_require_complete_rejects_partial_replay(tmp_path, monkeypatch, writing):
+    from dags.scripts import run_transfermarkt_core as cli
+
+    missing = replace(_load('transfer_events'), status_code=503)
+    _write_replay_manifest(tmp_path, [_load('squad'), missing])
+    output = tmp_path / 'report.json'
+    args = ['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
+            '--season', '2627', '--report-out', str(output)]
+    if writing:
+        db = CoreDB()
+        options = {'writer': CoreWriter(db), 'connection_factory': lambda: db}
+        monkeypatch.setattr(cli, '_write_options', lambda args: options)
+        args.append('--write')
+
+    assert cli.main(args) == 0
+    report = json.loads(output.read_text())
+    assert 'completion' not in report
+    assert report['dq']['passed'] is True
+    assert report['dq']['outcome_status_counts'] == {'observed_present': 3, 'unavailable': 1}
+    if writing:
+        assert len(report['receipts']) == 1
+        assert report['receipts'][0]['verified'] is True
+    assert cli.main([*args, '--require-complete']) == 1
+    assert json.loads(output.read_text())['completion']['passed'] is False
+
+
+@pytest.mark.parametrize('damage', ['none', 'missing_member', 'duplicate_member', 'wrong_run',
+                                    'missing_physical_proof', 'missing_receipt_readback', 'wrong_capture',
+                                    'wrong_bundle', 'reordered_plan_hashes', 'unrelated_receipt',
+                                    'legacy_identity', 'alias_identity'])
+def test_cli_require_complete_checks_each_written_outcome(tmp_path, monkeypatch, damage):
+    from dags.scripts import run_transfermarkt_core as cli
+
+    _write_replay_manifest(tmp_path, [_load('squad')])
+    db = CoreDB()
+    options = {'writer': CoreWriter(db), 'connection_factory': lambda: db}
+    monkeypatch.setattr(cli, '_write_options', lambda args: options)
+    write_bundle = orchestrator.native_writer.write_core_bundle
+
+    def write_with_damaged_receipt(*args, **kwargs):
+        receipt = write_bundle(*args, **kwargs)
+        if damage == 'missing_member':
+            receipt['plans'].pop()
+        elif damage == 'duplicate_member':
+            receipt['plans'][-1] = receipt['plans'][0]
+        elif damage == 'wrong_run':
+            receipt['run_id'] = 'other-run'
+        elif damage == 'missing_physical_proof':
+            receipt['plans'][0].pop('physical_hash')
+        elif damage == 'missing_receipt_readback':
+            receipt['receipt_readback'] = False
+        elif damage == 'wrong_capture':
+            db.sql.execute("UPDATE transfermarkt_core_receipts_v1 SET source_capture_id = ? "
+                           "WHERE entity = 'squad_memberships'", ('a' * 64,))
+        elif damage == 'wrong_bundle':
+            receipt['identity']['digest'] = 'a' * 64
+        elif damage == 'reordered_plan_hashes':
+            receipt['identity']['plan_hashes'].reverse()
+        elif damage == 'legacy_identity':
+            receipt.pop('identity')
+        elif damage == 'alias_identity':
+            # An alias journal's descriptor digest differs from its original warehouse identity.
+            receipt['plan_sha256'] = receipt['descriptor_digest'] = 'a' * 64
+        elif damage == 'unrelated_receipt':
+            # A pinned extraction clock can produce other packets with the same run ID.
+            nw = orchestrator.native_writer
+            columns = ', '.join(nw.RECEIPT_COLUMNS)
+            record = dict(zip(nw.RECEIPT_COLUMNS, db.sql.execute(
+                f"SELECT {columns} FROM transfermarkt_core_receipts_v1 LIMIT 1").fetchone(), strict=True))
+            record['receipt_id'] = nw._receipt_id(record['plan_sha256'], receipt['run_id'], 'a' * 64)
+            db.sql.execute(f"INSERT INTO transfermarkt_core_receipts_v1 ({columns}) "
+                           f"VALUES ({', '.join('?' for _ in record)})", tuple(record.values()))
+        return receipt
+
+    monkeypatch.setattr(orchestrator.native_writer, 'write_core_bundle', write_with_damaged_receipt)
+    args = ['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
+            '--season', '2627', '--write', '--require-complete']
+    assert cli.main(args) == (0 if damage in {'none', 'unrelated_receipt', 'legacy_identity', 'alias_identity'} else 1)
+
+
+@pytest.mark.parametrize('legacy', [False, True], ids=['current', 'without_identity'])
+def test_final_readback_rejects_swapped_capture_ids_for_two_coach_profiles(legacy):
+    from dags.scripts.run_transfermarkt_core import completion_error
+
+    replay = _ReplayFetch({'coach_profile'})
+    plan = _plan(clubs=(), coach_profile_ids=(('139997', 'arturo-berroa'), ('7898', 'theodore-whitmore')))
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert len(report.receipts) == 2 and len({r['run_id'] for r in report.receipts}) == 1
+    if legacy:
+        for receipt in report.receipts:
+            receipt.pop('identity')
+    assert completion_error(report, lambda: db) is None
+
+    rows = db.sql.execute('SELECT receipt_id, source_capture_id, physical_hash FROM transfermarkt_core_receipts_v1 '
+                          'ORDER BY receipt_id').fetchall()
+    (id_a, source_a, hash_a), (id_b, source_b, hash_b) = rows
+    assert source_a != source_b and hash_a != hash_b
+    db.sql.executemany('UPDATE transfermarkt_core_receipts_v1 SET source_capture_id = ? WHERE receipt_id = ?',
+                       [(source_b, id_a), (source_a, id_b)])
+    assert completion_error(report, lambda: db) is not None
+
+
+def test_complete_replay_option_cannot_start_live_acquisition(monkeypatch):
+    from dags.scripts import run_transfermarkt_core as cli
+    from scrapers.transfermarkt import client
+
+    monkeypatch.setattr(client, 'TransfermarktHttpClient', lambda: pytest.fail('unexpected live acquisition'))
+    with pytest.raises(SystemExit) as failure:
+        cli.main(['live', '--league', 'GB1', '--season', '2627', '--scope-id', 's',
+                  '--cycle-id', 'c', '--player', '7', '--i-have-transport-permission', '--require-complete'])
+    assert failure.value.code == 2
+
+
 @pytest.mark.parametrize('malformed_first', [False, True])
 def test_offline_malformed_transfer_cannot_hide_capture_conflict(malformed_first, tmp_path, monkeypatch, capsys):
     # Round 9 finding 8
@@ -456,7 +572,8 @@ def test_failed_json_fetch_binds_its_supplied_evidence_before_writes(conflict):
         assert receipt['verified'] is True
 
 
-def test_offline_career_capture_aliases_keep_both_request_records(tmp_path, monkeypatch):
+@pytest.mark.parametrize('strict_args', [[], ['--require-complete']], ids=['default', 'require_complete'])
+def test_offline_career_capture_aliases_keep_both_request_records(tmp_path, monkeypatch, strict_args):
     # Round 10 finding 12
     from dags.scripts import run_transfermarkt_core as cli
     from scrapers.transfermarkt.native_writer import _timestamp
@@ -473,10 +590,12 @@ def test_offline_career_capture_aliases_keep_both_request_records(tmp_path, monk
     monkeypatch.setattr(cli, '_write_options', lambda args: options)
     path = tmp_path / 'report.json'
     assert cli.main(['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1', '--season', '2627',
-                     '--write', '--report-out', str(path)]) == 0
+                     '--write', '--report-out', str(path), *strict_args]) == 0
     report = json.loads(path.read_text())
     assert report['dq']['errors'] == []
     assert report['dq']['outcome_status_counts'] == {'observed_empty': 2}
+    if strict_args:
+        assert report['completion'] == {'passed': True, 'error': None}
     assert len(report['receipts']) == 2 and all(receipt['verified'] for receipt in report['receipts'])
     records = db.sql.execute('SELECT entity, captured_at, source_capture_id, source_body_hash '
                              'FROM transfermarkt_core_receipts_v1')

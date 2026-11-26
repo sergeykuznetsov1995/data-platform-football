@@ -1237,198 +1237,208 @@ def _daily_bronze_dq(**context) -> dict[str, Any]:
     return report
 
 
-with DAG(
-    dag_id='dag_ingest_transfermarkt',
-    default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
-    description='Bounded registry-driven Transfermarkt native-v2 ingest',
-    schedule=_current_schedule(),
-    start_date=datetime(2024, 1, 1),
-    catchup=False,
-    render_template_as_native_obj=True,
-    tags=DAG_TAGS.get(
-        'transfermarkt', ['scraping', 'transfermarkt', 'bronze', 'football'],
-    ),
-    max_active_runs=1,
-    params={
-        'scopes': Param(default=[], type='array'),
-        'leagues': Param(default=[], type='array'),
-        'season': Param(
-            default=None,
-            type=['null', 'integer'],
-            minimum=1900,
-            maximum=CURRENT_SEASON + 1,
-        ),
-        'registry_snapshot_id': Param(default='', type='string'),
-        'max_batch': Param(
-            default=MAX_SCOPE_BATCH, type='integer', minimum=1,
-            maximum=MAX_SCOPE_BATCH,
-        ),
-        'approval_journal': Param(default=APPROVAL_JOURNAL, type='string'),
-        'approval_bundles': Param(default={}, type='object'),
-        'mv_transfers_limit': Param(
-            default=MV_HISTORY_DAILY_LIMIT,
-            type='integer', minimum=1, maximum=MV_HISTORY_DAILY_LIMIT,
-        ),
-        'refresh_mode': Param(
-            default='auto', type='string',
-            enum=['auto', 'current', 'historical', 'force'],
-        ),
-        'coach_history_ttl_days': Param(
-            default=COACH_HISTORY_TTL_DAYS,
-            type='integer', minimum=1, maximum=90,
-        ),
-        'checkpoint_ttl_days': Param(
-            default=CHECKPOINT_TTL_DAYS,
-            type='integer', minimum=1, maximum=90,
-        ),
-        'proxy_lease_ttl_seconds': Param(
-            default=3600, type='integer', minimum=60, maximum=3600,
-        ),
-        'proxy_request_limit': Param(
-            default=PROXY_REQUEST_LIMIT,
-            type='integer', minimum=1, maximum=PROXY_REQUEST_LIMIT,
-        ),
-        'proxy_retry_limit': Param(
-            default=PROXY_RETRY_LIMIT,
-            type='integer', minimum=0, maximum=PROXY_RETRY_LIMIT,
-        ),
-        'entity_timeout_seconds': Param(
-            default=DEFAULT_ENTITY_TIMEOUT_SECONDS, type='integer',
-            minimum=60, maximum=DEFAULT_ENTITY_TIMEOUT_SECONDS,
-        ),
-    },
-    doc_md="""
-    The scheduled run reads only the promoted central competition registry.
-    Empty selectors mean all due eligible senior-men scopes, capped at eight.
-    A non-empty params.approval_bundles keeps the manual ritual: every mapped
-    child needs separate one-shot paid-proxy and production-write approvals.
-    Only a run_type=scheduled run with empty bundles and empty scopes/leagues
-    selectors, and TM_STANDING_POLICY_ENABLED=true, is instead covered by the
-    committed standing approval policy
-    (dags/configs/transfermarkt/standing_approval_policy.json), whose caps must
-    equal the pinned wrapper limits and whose sha256 is re-verified by each
-    child. Any manual trigger — with or without explicit selectors — and any
-    run without the gate still fails closed without exact one-shot bundles
-    (scripts/prepare_transfermarkt_scope_approvals.py issues them). Unknown
-    classification, missing approval, missing manifest, unknown provider
-    traffic, reader drift, or DQ failure blocks scope-set completion.
-    Silver/Gold are a second Airflow phase because their exact
-    one-shot approvals can only be issued after this DAG computes scope_set_id.
-    Scheduled empty selectors are capture-only; only an explicit bounded
-    scopes/leagues run can become promotion-ready.
-    """,
-) as dag:
-    daily_bronze_dq_task = PythonOperator(
-        task_id='daily_bronze_dq',
-        python_callable=_daily_bronze_dq,
-        pool='transfermarkt_control',
-        retries=1,
-        retry_delay=timedelta(minutes=5),
-        execution_timeout=timedelta(minutes=10),
-        do_xcom_push=False,
-        # Preserve #1393's single run notification; the audit records RED locally.
-        on_failure_callback=None,
-    )
+# The isolated Bronze release selects the new parser. Other deployments keep their
+# existing DAG graph until they explicitly migrate; a misspelled mode fails closed.
+_engine = os.environ.get("TM_INGEST_ENGINE", "native_v2")
+if _engine == "core":
+    from utils.transfermarkt_core_dag import build_core_dag
 
-    preflight_reader_route_task = PythonOperator(
-        task_id='preflight_reader_route_for_paid_cycle',
-        python_callable=_preflight_reader_route_for_paid_cycle,
-    )
+    dag = build_core_dag()
+elif _engine == "native_v2":
+    with DAG(
+        dag_id='dag_ingest_transfermarkt',
+        default_args={**SCRAPER_ARGS, 'pool': 'transfermarkt_control'},
+        description='Bounded registry-driven Transfermarkt native-v2 ingest',
+        schedule=_current_schedule(),
+        start_date=datetime(2024, 1, 1),
+        catchup=False,
+        render_template_as_native_obj=True,
+        tags=DAG_TAGS.get(
+            'transfermarkt', ['scraping', 'transfermarkt', 'bronze', 'football'],
+        ),
+        max_active_runs=1,
+        params={
+            'scopes': Param(default=[], type='array'),
+            'leagues': Param(default=[], type='array'),
+            'season': Param(
+                default=None,
+                type=['null', 'integer'],
+                minimum=1900,
+                maximum=CURRENT_SEASON + 1,
+            ),
+            'registry_snapshot_id': Param(default='', type='string'),
+            'max_batch': Param(
+                default=MAX_SCOPE_BATCH, type='integer', minimum=1,
+                maximum=MAX_SCOPE_BATCH,
+            ),
+            'approval_journal': Param(default=APPROVAL_JOURNAL, type='string'),
+            'approval_bundles': Param(default={}, type='object'),
+            'mv_transfers_limit': Param(
+                default=MV_HISTORY_DAILY_LIMIT,
+                type='integer', minimum=1, maximum=MV_HISTORY_DAILY_LIMIT,
+            ),
+            'refresh_mode': Param(
+                default='auto', type='string',
+                enum=['auto', 'current', 'historical', 'force'],
+            ),
+            'coach_history_ttl_days': Param(
+                default=COACH_HISTORY_TTL_DAYS,
+                type='integer', minimum=1, maximum=90,
+            ),
+            'checkpoint_ttl_days': Param(
+                default=CHECKPOINT_TTL_DAYS,
+                type='integer', minimum=1, maximum=90,
+            ),
+            'proxy_lease_ttl_seconds': Param(
+                default=3600, type='integer', minimum=60, maximum=3600,
+            ),
+            'proxy_request_limit': Param(
+                default=PROXY_REQUEST_LIMIT,
+                type='integer', minimum=1, maximum=PROXY_REQUEST_LIMIT,
+            ),
+            'proxy_retry_limit': Param(
+                default=PROXY_RETRY_LIMIT,
+                type='integer', minimum=0, maximum=PROXY_RETRY_LIMIT,
+            ),
+            'entity_timeout_seconds': Param(
+                default=DEFAULT_ENTITY_TIMEOUT_SECONDS, type='integer',
+                minimum=60, maximum=DEFAULT_ENTITY_TIMEOUT_SECONDS,
+            ),
+        },
+        doc_md="""
+        The scheduled run reads only the promoted central competition registry.
+        Empty selectors mean all due eligible senior-men scopes, capped at eight.
+        A non-empty params.approval_bundles keeps the manual ritual: every mapped
+        child needs separate one-shot paid-proxy and production-write approvals.
+        Only a run_type=scheduled run with empty bundles and empty scopes/leagues
+        selectors, and TM_STANDING_POLICY_ENABLED=true, is instead covered by the
+        committed standing approval policy
+        (dags/configs/transfermarkt/standing_approval_policy.json), whose caps must
+        equal the pinned wrapper limits and whose sha256 is re-verified by each
+        child. Any manual trigger — with or without explicit selectors — and any
+        run without the gate still fails closed without exact one-shot bundles
+        (scripts/prepare_transfermarkt_scope_approvals.py issues them). Unknown
+        classification, missing approval, missing manifest, unknown provider
+        traffic, reader drift, or DQ failure blocks scope-set completion.
+        Silver/Gold are a second Airflow phase because their exact
+        one-shot approvals can only be issued after this DAG computes scope_set_id.
+        Scheduled empty selectors are capture-only; only an explicit bounded
+        scopes/leagues run can become promotion-ready.
+        """,
+    ) as dag:
+        daily_bronze_dq_task = PythonOperator(
+            task_id='daily_bronze_dq',
+            python_callable=_daily_bronze_dq,
+            pool='transfermarkt_control',
+            retries=1,
+            retry_delay=timedelta(minutes=5),
+            execution_timeout=timedelta(minutes=10),
+            do_xcom_push=False,
+            # Preserve #1393's single run notification; the audit records RED locally.
+            on_failure_callback=None,
+        )
 
-    plan_exact_scopes_task = PythonOperator(
-        task_id='plan_exact_scopes',
-        python_callable=_plan_exact_scopes,
-        # #1389: the plan ends with the paid gateway probe — one probe per run,
-        # not one per retry.
-        retries=0,
-    )
+        preflight_reader_route_task = PythonOperator(
+            task_id='preflight_reader_route_for_paid_cycle',
+            python_callable=_preflight_reader_route_for_paid_cycle,
+        )
 
-    run_exact_child_cycle_task = TransfermarktBashOperator.partial(
-        task_id='run_exact_child_cycle',
-        bash_command=r'''set -euo pipefail
-cd /opt/airflow
-if [ -n "${TM_CURRENT_JOB:-}" ]; then
-  exec python dags/scripts/run_transfermarkt_current.py \
-    --job "$TM_CURRENT_JOB" --report "$TM_CURRENT_REPORT"
-fi
-case "$TM_APPROVAL_MODE" in
-  standing_policy)
-    approval_args=(
-      --standing-policy "$TM_STANDING_POLICY_PATH"
-      --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
-    )
-    ;;
-  one_shot)
-    approval_args=(
-      --approval-journal "$TM_APPROVAL_JOURNAL"
-      --paid-proxy-approval-packet-id "$TM_PAID_APPROVAL_PACKET_ID"
-      --paid-proxy-approval-packet-hash "$TM_PAID_APPROVAL_PACKET_HASH"
-      --production-write-approval-packet-id "$TM_WRITE_APPROVAL_PACKET_ID"
-      --production-write-approval-packet-hash "$TM_WRITE_APPROVAL_PACKET_HASH"
-    )
-    ;;
-  *)
-    echo "unknown TM_APPROVAL_MODE: $TM_APPROVAL_MODE" >&2
-    exit 1
-    ;;
-esac
-python dags/scripts/run_transfermarkt_scope_cycle.py \
-  --payload-json "$TM_SCOPE_PAYLOAD_JSON" \
-  --reader-revision "$TM_READER_REVISION" \
-  --candidate-slot "$TM_CANDIDATE_SLOT" \
-  --write-mode "$TM_WRITE_MODE" \
-  "${approval_args[@]}" \
-  --career-window-limit "$TM_MV_TRANSFERS_LIMIT" \
-  --refresh-mode "$TM_REFRESH_MODE" \
-  --coach-history-ttl-days "$TM_COACH_HISTORY_TTL_DAYS" \
-  --checkpoint-ttl-days "$TM_CHECKPOINT_TTL_DAYS" \
-  --lease-ttl-seconds "$TM_PROXY_LEASE_TTL_SECONDS" \
-  --entity-timeout-seconds "$TM_ENTITY_TIMEOUT_SECONDS" \
-  --cycle-budget-bytes "$TM_PROVIDER_HARD_CAP_BYTES" \
-  --soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES" \
-  --request-limit "$TM_PROXY_REQUEST_LIMIT" \
-  --retry-limit "$TM_PROXY_RETRY_LIMIT" \
-  --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
-  --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"
-if [ "${TM_CLUB_VALUES_ENABLED:-false}" = "true" ]; then
-  python dags/scripts/run_transfermarkt_club_values.py --mode current --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-result.json}"
-fi''',
-        append_env=True,
-        retries=0,
-        pool='transfermarkt_proxy',
-        pool_slots=1,
-        # The proxy permit scheduler also prioritises this traffic class, but
-        # Airflow should prefer the daily writer before either task reaches it.
-        priority_weight=100,
-        max_active_tis_per_dag=1,
-        # Derived from the budget canon, never a literal: the task supervises
-        # four entity subprocesses whose own timeouts sum to 18000 s (the
-        # career entities need 5400 s each at a full 650-attempt budget), plus
-        # the scope's ops MERGEs.  A shorter task timeout would SIGKILL a
-        # runner mid-crawl and lose its attempt-guard write and evidence.
-        # Scopes run strictly serially (max_active_tis_per_dag=1) and runs do
-        # not overlap or backfill (max_active_runs=1, catchup=False), so a
-        # long worst-case DagRun only delays the next scheduled one.
-        do_xcom_push=False,
-        # #1389: one TG per run — validate_scope_set reports the aggregate.
-        on_failure_callback=None,
-    ).expand_kwargs(
-        plan_exact_scopes_task.output.map(_child_operator_kwargs),
-        # SCRAPER_ARGS supplies a default execution_timeout. The controlled
-        # per-child mapping must override it for both current and one-shot.
-        strict=False,
-    )
+        plan_exact_scopes_task = PythonOperator(
+            task_id='plan_exact_scopes',
+            python_callable=_plan_exact_scopes,
+            # #1389: the plan ends with the paid gateway probe — one probe per run,
+            # not one per retry.
+            retries=0,
+        )
 
-    validate_scope_set_task = PythonOperator(
-        task_id='validate_scope_set',
-        python_callable=_validate_scope_set,
-        trigger_rule='all_done',
-        on_failure_callback=_scope_set_failure_callback,
-    )
+        run_exact_child_cycle_task = TransfermarktBashOperator.partial(
+            task_id='run_exact_child_cycle',
+            bash_command=r'''set -euo pipefail
+    cd /opt/airflow
+    if [ -n "${TM_CURRENT_JOB:-}" ]; then
+      exec python dags/scripts/run_transfermarkt_current.py \
+        --job "$TM_CURRENT_JOB" --report "$TM_CURRENT_REPORT"
+    fi
+    case "$TM_APPROVAL_MODE" in
+      standing_policy)
+        approval_args=(
+          --standing-policy "$TM_STANDING_POLICY_PATH"
+          --standing-policy-sha256 "$TM_STANDING_POLICY_SHA256"
+        )
+        ;;
+      one_shot)
+        approval_args=(
+          --approval-journal "$TM_APPROVAL_JOURNAL"
+          --paid-proxy-approval-packet-id "$TM_PAID_APPROVAL_PACKET_ID"
+          --paid-proxy-approval-packet-hash "$TM_PAID_APPROVAL_PACKET_HASH"
+          --production-write-approval-packet-id "$TM_WRITE_APPROVAL_PACKET_ID"
+          --production-write-approval-packet-hash "$TM_WRITE_APPROVAL_PACKET_HASH"
+        )
+        ;;
+      *)
+        echo "unknown TM_APPROVAL_MODE: $TM_APPROVAL_MODE" >&2
+        exit 1
+        ;;
+    esac
+    python dags/scripts/run_transfermarkt_scope_cycle.py \
+      --payload-json "$TM_SCOPE_PAYLOAD_JSON" \
+      --reader-revision "$TM_READER_REVISION" \
+      --candidate-slot "$TM_CANDIDATE_SLOT" \
+      --write-mode "$TM_WRITE_MODE" \
+      "${approval_args[@]}" \
+      --career-window-limit "$TM_MV_TRANSFERS_LIMIT" \
+      --refresh-mode "$TM_REFRESH_MODE" \
+      --coach-history-ttl-days "$TM_COACH_HISTORY_TTL_DAYS" \
+      --checkpoint-ttl-days "$TM_CHECKPOINT_TTL_DAYS" \
+      --lease-ttl-seconds "$TM_PROXY_LEASE_TTL_SECONDS" \
+      --entity-timeout-seconds "$TM_ENTITY_TIMEOUT_SECONDS" \
+      --cycle-budget-bytes "$TM_PROVIDER_HARD_CAP_BYTES" \
+      --soft-byte-stop-bytes "$TM_PROVIDER_SOFT_STOP_BYTES" \
+      --request-limit "$TM_PROXY_REQUEST_LIMIT" \
+      --retry-limit "$TM_PROXY_RETRY_LIMIT" \
+      --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
+      --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"
+    if [ "${TM_CLUB_VALUES_ENABLED:-false}" = "true" ]; then
+      python dags/scripts/run_transfermarkt_club_values.py --mode current --report "${TM_CLUB_VALUES_REPORT:-/opt/airflow/logs/transfermarkt-club-values/${TM_SCOPE_ID}-result.json}"
+    fi''',
+            append_env=True,
+            retries=0,
+            pool='transfermarkt_proxy',
+            pool_slots=1,
+            # The proxy permit scheduler also prioritises this traffic class, but
+            # Airflow should prefer the daily writer before either task reaches it.
+            priority_weight=100,
+            max_active_tis_per_dag=1,
+            # Derived from the budget canon, never a literal: the task supervises
+            # four entity subprocesses whose own timeouts sum to 18000 s (the
+            # career entities need 5400 s each at a full 650-attempt budget), plus
+            # the scope's ops MERGEs.  A shorter task timeout would SIGKILL a
+            # runner mid-crawl and lose its attempt-guard write and evidence.
+            # Scopes run strictly serially (max_active_tis_per_dag=1) and runs do
+            # not overlap or backfill (max_active_runs=1, catchup=False), so a
+            # long worst-case DagRun only delays the next scheduled one.
+            do_xcom_push=False,
+            # #1389: one TG per run — validate_scope_set reports the aggregate.
+            on_failure_callback=None,
+        ).expand_kwargs(
+            plan_exact_scopes_task.output.map(_child_operator_kwargs),
+            # SCRAPER_ARGS supplies a default execution_timeout. The controlled
+            # per-child mapping must override it for both current and one-shot.
+            strict=False,
+        )
 
-    (
-        preflight_reader_route_task
-        >> plan_exact_scopes_task
-        >> run_exact_child_cycle_task
-        >> validate_scope_set_task
-    )
+        validate_scope_set_task = PythonOperator(
+            task_id='validate_scope_set',
+            python_callable=_validate_scope_set,
+            trigger_rule='all_done',
+            on_failure_callback=_scope_set_failure_callback,
+        )
+
+        (
+            preflight_reader_route_task
+            >> plan_exact_scopes_task
+            >> run_exact_child_cycle_task
+            >> validate_scope_set_task
+        )
+else:
+    raise ValueError(f"Unknown Transfermarkt ingest engine: {_engine!r}")

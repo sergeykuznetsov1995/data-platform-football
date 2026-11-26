@@ -48,6 +48,8 @@ x-tm-airflow-common: &tm-airflow-common
     S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3 access key}
     S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3 secret key}
     # Те же имена, что у общего scheduler'а (compose.yaml, блок Transfermarkt).
+    TM_INGEST_ENGINE: core
+    TM_CORE_INVENTORY_SHA256: ${TM_CORE_INVENTORY_SHA256:-}
     TM_NATIVE_V2_ENABLED: ${TM_NATIVE_V2_ENABLED:-false}
     TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
     TRANSFERMARKT_DENOMINATOR_SOURCE: ${TRANSFERMARKT_DENOMINATOR_SOURCE:-tsv}
