@@ -1,11 +1,18 @@
-"""Run one Transfermarkt core scope from fixture captures or live transport."""
+"""Run a Transfermarkt scope. Offline mode reads a recorded manifest.
+
+An optional --section-plan JSON file supplies the section fields of CoreScopePlan.
+For example, {"club_value_targets": [{"competition_id": "VIE1", "slug": "v-league-1"}]}
+selects club values. The other non-match sections accept an explicit source URL
+in {"section_targets": [{"endpoint": "club_staff", "url":
+"https://www.transfermarkt.com/sc-paderborn-07/mitarbeiter/verein/127"}]}.
+"""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
-from datetime import date
 import gzip
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -22,11 +29,13 @@ def _parser():
     offline = modes.add_parser("offline", help="Replay a fixture manifest")
     offline.add_argument("--fixtures-root", type=Path, required=True)
     live = modes.add_parser("live", help="Fetch using the configured transport")
-    live.add_argument("--club", action="append", required=True, metavar="ID:SLUG[:NAME]")
+    live.add_argument("--club", action="append", default=[], metavar="ID:SLUG[:NAME]")
     live.add_argument("--player", action="append", default=[], metavar="ID")
     live.add_argument("--coach", action="append", default=[], metavar="ID:SLUG")
     live.add_argument("--i-have-transport-permission", action="store_true")
     for mode in (offline, live):
+        mode.add_argument("--section-plan", type=Path, metavar="JSON",
+                          help="CoreScopePlan section targets, including the competition context for rumours")
         for field in ("league", "season"):
             mode.add_argument(f"--{field}", required=True)
         for field in ("scope-id", "cycle-id"):
@@ -43,12 +52,18 @@ def _parser():
 def _load_records(root):
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     records = {}
+    hashes_by_capture = {}
     for fixture in manifest["fixtures"]:
         capture_id = fixture["capture_id"]
         path = root / "captures" / fixture["endpoint"] / f"{capture_id}.json"
         record = json.loads(path.read_text(encoding="utf-8"))
         if record["capture_id"] != capture_id:
             raise ValueError(f"Capture ID mismatch in {path}")
+        if record["endpoint"] != fixture["endpoint"]:
+            raise ValueError(f"Fixture endpoint mismatch in {path}")
+        body_hash = record["content_hash"]
+        if hashes_by_capture.setdefault(capture_id, body_hash) != body_hash:
+            raise ValueError("capture_evidence_conflict")
         blob = root / fixture["blob_file"]
         url = record["url"]
         if url in records:
@@ -59,47 +74,54 @@ def _load_records(root):
 
 def _fixture_fetch(records):
     from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+    from scrapers.transfermarkt.sections import parse_json_integer
+
+    requested = set()
+    reached = set()
 
     def fetch(url, *, as_json, label, context=None, validator=None):
+        requested.add(url)
         entry = records.get(url)
         if entry is None:
             return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error="fixture_missing")
         record, blob = entry
-        if record["status_code"] != 200:
-            return FetchOutcome(
-                status=FetchStatus.RETRY_EXHAUSTED, error=f"http_{record['status_code']}",
-                status_code=record["status_code"],
-            )
-        text = gzip.decompress(blob.read_bytes()).decode("utf-8")
+        if record["endpoint"] != label:
+            raise ValueError(f"{label} raw capture endpoint differs")
+        reached.add(url)
+        status = record["status_code"]
+        if status != 200 and not (label == "club_stadium" and status == 404):
+            return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error=f"http_{status}", status_code=status)
+        evidence = {
+            "raw_capture_id": record["capture_id"], "raw_body_hash": record["content_hash"],
+            "raw_fetched_at": record["fetched_at"], "status_code": status,
+        }
+        if status == 404:
+            return FetchOutcome(status=FetchStatus.RETRY_EXHAUSTED, error="http_404", **evidence)
+        body = gzip.decompress(blob.read_bytes())
+        if hashlib.sha256(body).hexdigest() != record["content_hash"]:
+            raise ValueError("body_hash_mismatch")
+        text = body.decode("utf-8")
         if as_json:
             try:
-                value = json.loads(text)
+                value = json.loads(text, parse_int=parse_json_integer)
             except ValueError:
                 return FetchOutcome(
-                    status=FetchStatus.SCHEMA_ERROR, error="invalid_json",
-                    status_code=record["status_code"],
+                    status=FetchStatus.SCHEMA_ERROR, error="invalid_json", **evidence,
                 )
         else:
             value = text
-        return FetchOutcome(
-            status=FetchStatus.OK,
-            value=value,
-            raw_capture_id=record["capture_id"],
-            raw_body_hash=record["content_hash"],
-            raw_fetched_at=record["fetched_at"],
-            cache_hit=False,
-            status_code=record["status_code"],
-        )
+        return FetchOutcome(status=FetchStatus.OK, value=value, **evidence)
 
+    fetch.requested = requested
+    fetch.reached = reached
     return fetch
 
 
 def _fixture_raw_loader(records):
-    by_capture = {record["capture_id"]: entry for entry in records.values()
-                  for record in (entry[0],)}
-
-    def load(capture_id):
-        record, blob = by_capture[capture_id]
+    def load(capture_id, url):
+        record, blob = records[url]
+        if record["capture_id"] != capture_id:
+            raise ValueError(f"Capture ID mismatch for {url}")
         return gzip.decompress(blob.read_bytes()), _RawRecord(record)
 
     return load
@@ -107,6 +129,11 @@ def _fixture_raw_loader(records):
 
 class _RawRecord:
     def __init__(self, record):
+        self.capture_id = record["capture_id"]
+        self.scope_id = record.get("scope_id")
+        self.cycle_id = record.get("cycle_id")
+        self.status_code = record["status_code"]
+        self.endpoint = record["endpoint"]
         self.content_hash = record["content_hash"]
         self.url = record["url"]
         self.fetched_at = record["fetched_at"]
@@ -128,13 +155,9 @@ def _report(report, plan, path):
 
 def _season_year(season):
     """The saison year of a slug, with the century window of season.py."""
-    if len(season) != 4 or not season.isdecimal():
-        raise ValueError(f"Cannot infer a saison year from {season!r}; supply --edition-id")
-    first, second = int(season[:2]), int(season[2:])
-    if second == (first + 1) % 100:
-        candidate = 2000 + first
-        return candidate if candidate <= date.today().year + 1 else 1900 + first
-    return int(season) - 1
+    from scrapers.transfermarkt import core
+
+    return core.saison_year(season)
 
 
 def _squad_season_matches(url, season):
@@ -143,6 +166,19 @@ def _squad_season_matches(url, season):
     if len(parts) < 6 or parts[1] != "kader" or parts[4] != "saison_id" or not parts[5].isdecimal():
         raise ValueError(f"Unrecognised squad fixture URL {url!r}")
     return int(parts[5]) == _season_year(season)
+
+
+def _fixture_in_scope(endpoint, url, league, season):
+    if endpoint == 'squad':
+        return _squad_season_matches(url, season)
+    if endpoint == 'current_injury':
+        # Raw archives contain injury lists of many competitions. The page
+        # itself must also prove the requested edition before it can write.
+        from scrapers.transfermarkt import section_catalog
+
+        scope = section_catalog.source_scope(endpoint, url, edition_id=str(_season_year(season)))
+        return scope['competition_id'] == league
+    return True
 
 
 def _club_parts(value):
@@ -159,12 +195,56 @@ def _coach_parts(value):
     return tuple(parts)
 
 
+_SECTION_FIELDS = {
+    'attendance': 'attendance_editions', 'club_values': 'club_value_targets',
+    'coach_achievement': 'achievement_holders', 'player_achievement': 'achievement_holders',
+    'club_achievement': 'achievement_holders', 'rumours': 'rumour_competitions',
+    'referee_directory': 'referee_directories', 'referee_profile': 'referee_profile_ids',
+    'representation': 'representation_player_ids',
+}
+
+
+def _section_options(path):
+    from scrapers.transfermarkt import orchestrator as runner
+
+    if path is None:
+        return {}
+    document = json.loads(path.read_text(encoding='utf-8'))
+    models = {
+        'attendance_editions': runner.AttendanceEditionTarget, 'club_value_targets': runner.ClubValueTarget,
+        'achievement_holders': runner.AchievementHolderTarget, 'rumour_competitions': runner.RumourCompetitionTarget,
+        'referee_directories': runner.RefereeDirectoryTarget, 'section_targets': runner.SectionTarget,
+    }
+    fields = set(_SECTION_FIELDS.values()) | {'section_targets'}
+    if not isinstance(document, dict) or not document or document.keys() - fields:
+        raise ValueError('section plan contains unknown fields or is empty')
+    options = {}
+    for field, items in document.items():
+        if not isinstance(items, list) or not items:
+            raise ValueError(f'{field} must contain at least one target')
+        if field in models:
+            if not all(isinstance(item, dict) for item in items):
+                raise ValueError(f'{field} must contain target objects')
+            try:
+                options[field] = tuple(models[field](**item) for item in items)
+            except TypeError as exc:
+                raise ValueError(f'invalid {field} target: {exc}') from exc
+        else:
+            if not all(isinstance(item, str) for item in items):
+                raise ValueError(f'{field} must contain string IDs')
+            options[field] = tuple(items)
+    return options
+
+
 def _live_plan(args):
     from scrapers.transfermarkt.orchestrator import (
         ClubTarget, CoreScopePlan, coach_history_url, squad_url,
     )
 
-    year = int(args.edition_id) if args.edition_id else _season_year(args.season)
+    year = _season_year(args.season)
+    options = _section_options(getattr(args, 'section_plan', None))
+    if not (args.club or args.player or args.coach or options):
+        raise ValueError('supply a club, player, coach or section plan')
     clubs = tuple(
         ClubTarget(club_id, slug, name, squad_url(slug, club_id, year),
                    coach_history_url(slug, club_id))
@@ -172,65 +252,133 @@ def _live_plan(args):
     )
     return CoreScopePlan(
         league=args.league, season=args.season, scope_id=args.scope_id, cycle_id=args.cycle_id,
-        edition_id=args.edition_id or str(year), clubs=clubs,
+        edition_id=args.edition_id or str(year), edition_inferred=args.edition_id is None, clubs=clubs,
         market_value_player_ids=tuple(args.player),
         transfer_player_ids=tuple(args.player),
         coach_profile_ids=tuple(map(_coach_parts, args.coach)),
+        **options,
     )
 
 
+# Endpoints of the stage-B core lanes. Their records of another season are on
+# file by design (the sample mixes seasons): a run owns exactly one of them.
+_CORE_ENDPOINTS = frozenset({"squad", "coach_history", "market_value_points", "transfer_events", "coach_profile"})
+
+
+def _offline_attendance_targets(urls):
+    from scrapers.transfermarkt import attendance, core, sections
+    from scrapers.transfermarkt.orchestrator import AttendanceEditionTarget
+
+    starts = {}
+    for url in urls:
+        parts = urlsplit(url)
+        match = attendance._ATTENDANCE_PATH_RE.fullmatch(parts.path)
+        if match is None or not sections._attendance_source_valid(url):
+            raise ValueError(f"Fixture endpoint 'attendance' does not match its URL {url!r}")
+        competition, edition = match.groups()
+        attendance._validate_attendance_url(
+            url, host=core.TRANSFERMARKT_HOST, path=parts.path,
+            competition=competition, edition=edition)
+        key = (competition, edition)
+        starts.setdefault(key, None)
+        if sections._attendance_page_number(url) == 1:
+            if starts[key] is not None:
+                raise ValueError("attendance_duplicate_first_page")
+            starts[key] = AttendanceEditionTarget(
+                competition, int(edition), parts.path.split("/")[1], start_url=url)
+    if None in starts.values():
+        raise ValueError("attendance_first_page_missing")
+    return tuple(starts.values())
+
+
 def _offline_plan(args, records):
-    from scrapers.transfermarkt.orchestrator import ClubTarget, CoreScopePlan
+    from scrapers.transfermarkt import core, section_catalog
+    from scrapers.transfermarkt.orchestrator import ClubTarget, CoreScopePlan, SectionTarget
 
     if not records:
         raise ValueError("The fixture manifest contains no captures")
     first = next(iter(records.values()))[0]
     season = args.season
+    options = _section_options(getattr(args, 'section_plan', None))
+    section_starts = {}
     clubs = {}
     mv_players = []
     transfer_players = []
     coaches = {}
+    attendance_urls = []
     squad_year = None
-    core_endpoints = {"squad", "coach_history", "market_value_points", "transfer_events", "coach_profile"}
     for url, (record, _blob) in records.items():
-        if record["endpoint"] not in core_endpoints:
+        endpoint = record["endpoint"]
+        if endpoint in section_catalog.ENTITIES:
+            if not _fixture_in_scope(endpoint, url, args.league, season):
+                continue
+            if 'section_targets' not in options:
+                edition = str(args.edition_id or record.get('edition_id') or _season_year(season))
+                values = section_catalog.source_scope(endpoint, url, edition_id=edition, competition_id=args.league)
+                key = (endpoint, tuple(sorted(values.items())))
+                section_starts.setdefault(key, None)
+                module = section_catalog.BY_ENDPOINT[endpoint]
+                if endpoint not in module.PAGINATED or module.page_number(endpoint, url) == 1:
+                    if section_starts[key] is not None:
+                        raise ValueError(f'{endpoint}:duplicate_first_page')
+                    section_starts[key] = SectionTarget(endpoint, url)
+            continue
+        if _SECTION_FIELDS.get(endpoint) in options:
+            continue
+        if endpoint == "attendance":
+            attendance_urls.append(url)
+            continue
+        if endpoint not in _CORE_ENDPOINTS:
+            if endpoint in core._ENDPOINTS:
+                raise ValueError(f"The offline replay plan cannot represent {endpoint!r} fixtures yet")
             continue
         parts = urlsplit(url).path.strip("/").split("/")
-        match parts:
-            case [slug, "kader", "verein", club_id, "saison_id", year, "plus", "1"]:
+        match endpoint, parts:
+            case "squad", [slug, "kader", "verein", club_id, "saison_id", year, "plus", "1"]:
                 # The sample mixes seasons; a run owns exactly one of them.
                 if _squad_season_matches(url, season):
                     squad_year = int(year)
-                    clubs.setdefault(club_id, {"club_slug": slug})["squad_url"] = url
-            case [slug, "mitarbeiterhistorie", "verein", club_id, "plus", "1"]:
+                    club = clubs.setdefault(club_id, {"club_slug": slug})
+                    if "squad_url" in club:
+                        raise ValueError(f"Conflicting squad fixture URLs for club {club_id}: "
+                                         f"{club['squad_url']}, {url}")
+                    club["squad_url"] = url
+            case "coach_history", [slug, "mitarbeiterhistorie", "verein", club_id, "plus", "1"]:
                 clubs.setdefault(club_id, {"club_slug": slug})["coach_history_url"] = url
-            case ["ceapi", "marketValueDevelopment", "graph", player_id]:
+            case "market_value_points", ["ceapi", "marketValueDevelopment", "graph", player_id]:
                 mv_players.append(player_id)
-            case ["ceapi", "transferHistory", "list", player_id]:
+            case "transfer_events", ["ceapi", "transferHistory", "list", player_id]:
                 transfer_players.append(player_id)
-            case [slug, "profil", "trainer", coach_id]:
+            case "coach_profile", [slug, "profil", "trainer", coach_id]:
                 coaches[coach_id] = slug
             case _:
-                raise ValueError(f"Unrecognised {record['endpoint']} fixture URL {url!r}")
+                raise ValueError(f"Fixture endpoint {endpoint!r} does not match its URL {url!r}")
 
-    edition = args.edition_id or first.get("edition_id") or squad_year
-    year = squad_year or (int(edition) if edition else _season_year(season))
+    edition = args.edition_id or squad_year or first.get("edition_id") or _season_year(season)
+    if any(target is None for target in section_starts.values()):
+        raise ValueError('section_first_page_missing')
+    if section_starts:
+        options['section_targets'] = tuple(section_starts.values())
+    if attendance_urls:
+        options['attendance_editions'] = _offline_attendance_targets(attendance_urls)
     return CoreScopePlan(
         league=args.league, season=season,
         scope_id=args.scope_id or first["scope_id"], cycle_id=args.cycle_id or first["cycle_id"],
-        edition_id=str(edition or year),
+        edition_id=str(edition), edition_inferred=args.edition_id is None,
         clubs=tuple(ClubTarget(club_id=key, **value) for key, value in clubs.items()),
         market_value_player_ids=tuple(sorted(set(mv_players))),
         transfer_player_ids=tuple(sorted(set(transfer_players))),
         coach_profile_ids=tuple(sorted(coaches.items())),
+        **options,
     )
 
 
 def _write_options(args):
+    from inspect import signature
     import os
 
     from trino.auth import BasicAuthentication
-    from trino.dbapi import connect
+    from trino.dbapi import Connection, connect
 
     from scrapers.transfermarkt.native_writer import CommittingConnection
     from scrapers.transfermarkt.writer import TransfermarktIcebergWriter
@@ -239,12 +387,16 @@ def _write_options(args):
     port = args.trino_port or int(os.getenv("TRINO_PORT", "8080"))
     user = args.trino_user or os.getenv("TRINO_USER", "airflow")
     password = os.getenv("TRINO_PASSWORD")
+    transport = {"max_attempts": 1}
+    if "legacy_prepared_statements" in signature(Connection).parameters:
+        transport["legacy_prepared_statements"] = False
 
     def connection_factory():
         connection = connect(
             host=host, port=port, user=user, catalog="iceberg", schema="bronze",
             http_scheme="https" if password else "http",
             auth=BasicAuthentication(user, password) if password else None,
+            **transport,
         )
         return CommittingConnection(connection)
 
@@ -262,28 +414,54 @@ def main(argv=None):
 
     from scrapers.transfermarkt.orchestrator import CoreRun, CoreRunError, planned_urls
 
+    client = None
     try:
-        if args.mode == "offline":
-            records = _load_records(args.fixtures_root)
-            plan = _offline_plan(args, records)
-            missing = [url for url in planned_urls(plan) if url not in records]
+        if args.edition_id == "":
+            raise ValueError("season_edition_mismatch")
+        records = _load_records(args.fixtures_root) if args.mode == "offline" else None
+        plan = _offline_plan(args, records) if records is not None else _live_plan(args)
+        urls = planned_urls(plan)
+        if records is not None:
+            missing = [url for url in urls if url not in records]
             if missing:
                 raise ValueError("Missing planned fixture: " + ", ".join(missing))
             fetch = _fixture_fetch(records)
-            raw_loader = _fixture_raw_loader(records)
+            run = CoreRun(fetch, request_raw_loader=_fixture_raw_loader(records))
         else:
             from scrapers.transfermarkt.client import TransfermarktHttpClient
 
-            plan = _live_plan(args)
             client = TransfermarktHttpClient()
-            fetch = client.fetch
             raw_loader = getattr(client, "_raw_store", None)
             raw_loader = raw_loader.load_capture if raw_loader is not None else None
+            run = CoreRun(client.fetch, raw_loader=raw_loader)
         write_args = _write_options(args) if args.write else {}
-        report = CoreRun(fetch, raw_loader=raw_loader).run(plan, **write_args)
+        report = run.run(plan, **write_args)
         _report(report, plan, args.report_out)
+        if args.mode == "offline":
+            # A record of a section the core replay plans for that the run
+            # never reached is a plan that skipped it in silence: nothing may
+            # report success over it. Records of other seasons and of donors
+            # the replay does not plan for are on file by design.
+            from scrapers.transfermarkt import core
+
+            eligible = {
+                url for url, (record, _) in records.items()
+                if record["endpoint"] in core._ENDPOINTS
+                and _fixture_in_scope(record["endpoint"], url, plan.league, plan.season)
+            }
+            missing = fetch.requested - fetch.reached
+            unreached = eligible - fetch.requested
+            if missing:
+                print("Missing fixture responses:", *sorted(missing), sep="\n", file=sys.stderr)
+            if unreached:
+                print("Unreached fixture records:", *sorted(unreached), sep="\n", file=sys.stderr)
+            if missing or unreached:
+                return 2
     except (ValueError, KeyError, OSError, CoreRunError) as exc:
         parser.exit(2, f"{parser.prog}: {exc}\n")
+    finally:
+        if client is not None:
+            client.close()
     verified = bool(report.receipts) and all(r.get("verified") is True for r in report.receipts)
     return 0 if report.dq["passed"] is True and (not args.write or verified) else 1
 

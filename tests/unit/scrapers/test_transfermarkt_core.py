@@ -1,4 +1,5 @@
 """Offline core-lane tests on the recorded stage-A capture sample (#2404)."""
+from dataclasses import replace
 import gzip
 import hashlib
 import json
@@ -64,11 +65,12 @@ def test_plan_scope_is_cross_checked_against_the_capture_url():
     capture = _load('squad')
     club_id = capture.url.split('/verein/')[1].split('/')[0]
     outcomes = core.extract_squad_observations(
-        capture, _scope(club_id=club_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        capture, _scope(club_id=club_id, season='2627', edition_id='2026'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
     with pytest.raises(CoreParseError, match='row_scope_mismatch'):
         core.plan_for_outcome(
             outcomes[0], captured_at=capture.captured_at,
-            scope_values={'league': 'GB1', 'season': '2526', 'club_id': '999'})
+            scope_values={'league': 'GB1', 'season': '2627', 'club_id': '999'})
 
 
 def test_source_capture_verifies_body_hash_and_lineage():
@@ -264,7 +266,8 @@ def _squad_outcomes():
     capture = _load('squad')
     club_id = capture.url.split('/verein/')[1].split('/')[0]
     return core.extract_squad_observations(
-        capture, _scope(club_id=club_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        capture, _scope(club_id=club_id, season='2627', edition_id='2026'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
 
 
 def test_captureless_outcomes_cover_transport_failures():
@@ -291,22 +294,98 @@ def test_core_dq_passes_the_recorded_sample_and_flags_duplicates():
     assert 'empty_universe' in core.build_core_dq(())['errors']
 
 
+def test_dq_compares_club_scopes_and_capture_bodies_independently():
+    # Round 9 finding 12
+    capture = _load('squad', 3)
+    club_id = capture.url.split('/verein/')[1].split('/')[0]
+    original, *_ = core.extract_squad_observations(
+        capture, _scope(club_id=club_id, season='2627', edition_id='2026'),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    alias = replace(capture, url=capture.url.replace(f'/verein/{club_id}/', '/verein/12/'),
+                    captured_at='2026-11-21T11:00:00.000000+00:00')
+    other_club = replace(original, scope=replace(original.scope, club_id='12'), capture=alias)
+    assert core.build_core_dq([original, other_club])['errors'] == []
+    assert core.build_core_dq([other_club, other_club])['errors'] == ['duplicate_outcome']
+    different = alias.body + b' '
+    conflict = replace(alias, body=different, body_hash=hashlib.sha256(different).hexdigest())
+    assert core.build_core_dq([original, replace(other_club, capture=conflict)])['errors'] == [
+        'capture_evidence_conflict']
+
+
+def test_squad_adapter_preserves_attribute_and_contract_club_identity():
+    # Round 10 finding 13
+    capture = _load('squad', 3)
+    lanes = []
+    for club_id in ('11', '12'):
+        alias = replace(capture, url=f'https://www.transfermarkt.com/club/kader/verein/{club_id}/saison_id/2026')
+        _, attributes, contracts = core.extract_squad_observations(
+            alias, _scope(club_id=club_id, season='2627', edition_id='2026'),
+            extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        for outcome in (attributes, contracts):
+            assert outcome.status == 'observed_empty'
+            assert core.build_core_dq([outcome, outcome])['errors'] == ['duplicate_outcome']
+        lanes.extend((attributes, contracts))
+    assert core.build_core_dq(lanes)['errors'] == []
+
+
+def test_dq_accepts_verified_referee_directory_aliases_at_distinct_clocks(tmp_path, monkeypatch):
+    # Round 11 finding 10
+    from tests.unit.scrapers.test_transfermarkt_native_writer import CoreDB
+    from tests.unit.scrapers.test_transfermarkt_sections import (
+        REFEREE_DIRECTORY_URL, _bundle, _referee_body, _referee_directory, _referee_page,
+    )
+
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'writer.lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+    first = _referee_page(REFEREE_DIRECTORY_URL, _referee_body([('101', 'Ada Example')]))
+    alias = replace(first, url=first.url.replace('/example-league/', '/league-alias/'),
+                    captured_at='2026-11-20T15:01:00.000000+00:00')
+    original, = _referee_directory((first,))
+    later, = _referee_directory((alias,))
+
+    db = CoreDB()
+    for outcome in (original, later):
+        plan = core.plan_for_outcome(outcome, captured_at=outcome.capture.captured_at,
+                                     scope_values={'competition_id': 'XY1', 'edition_id': '2025'})
+        receipt = _bundle(db, [plan], outcome.extracted_at)
+        assert receipt['verified'] is True and receipt['receipt_readback'] is True
+    assert db.sql.execute(
+        'SELECT COUNT(DISTINCT receipt_id) FROM transfermarkt_core_receipts_v1'
+    ).fetchone() == (2,)
+    assert db.sql.execute(
+        'SELECT COUNT(*), COUNT(DISTINCT metric) FROM transfermarkt_referee_aggregate_observations '
+        'GROUP BY observed_at'
+    ).fetchall() == [(5, 5), (5, 5)]
+    assert core.build_core_dq([original, later])['errors'] == []
+
+    same_clock, = _referee_directory((replace(alias, captured_at=first.captured_at),))
+    assert core.build_core_dq([original, same_clock])['errors'] == [
+        'duplicate_natural_key', 'duplicate_outcome']
+    other_competition, = _referee_directory((replace(first, url=first.url.replace('/XY1/', '/XY2/')),))
+    assert core.build_core_dq([original, other_competition])['errors'] == []
+    different_body = alias.body + b' '
+    conflict, = _referee_directory((replace(alias, body=different_body,
+                                            body_hash=hashlib.sha256(different_body).hexdigest()),))
+    assert core.build_core_dq([original, conflict])['errors'] == ['capture_evidence_conflict']
+
+
 def test_plan_for_outcome_builds_the_native_write_contract():
     outcomes = _squad_outcomes()
     club_id = outcomes[0].rows[0]['club_id']
     plan = core.plan_for_outcome(
         outcomes[0], captured_at=outcomes[0].capture.captured_at,
-        scope_values={'league': 'GB1', 'season': '2526', 'club_id': club_id})
+        scope_values={'league': 'GB1', 'season': '2627', 'club_id': club_id})
     assert plan.table == 'transfermarkt_squad_memberships'
     assert plan.write_mode == 'replace'
-    assert plan.scope_values == ('GB1', '2526', club_id)
+    assert plan.scope_values == ('GB1', '2627', club_id)
     assert plan.natural_keys == ('league', 'season', 'club_id', 'player_id')
     assert plan.ddl.startswith('CREATE TABLE IF NOT EXISTS iceberg.bronze.transfermarkt_squad_memberships')
     from scrapers.transfermarkt.native_writer import NativeWritePlan
     assert isinstance(plan, NativeWritePlan)
     merged = core.plan_for_outcome(
         outcomes[1], captured_at=outcomes[1].capture.captured_at,
-        scope_values={'league': 'GB1', 'season': '2526', 'club_id': club_id})
+        scope_values={'league': 'GB1', 'season': '2627', 'club_id': club_id})
     assert merged.write_mode == 'merge'
 
 
@@ -317,10 +396,10 @@ def test_plan_for_outcome_refuses_non_conclusive_and_scope_drift():
         extracted_at=EXTRACTED_AT, run_id='r', universe_version=UNIVERSE)
     with pytest.raises(ValueError, match='non-conclusive'):
         core.plan_for_outcome(unavailable, captured_at=EXTRACTED_AT, scope_values={})
-    with pytest.raises(Exception):
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
         core.plan_for_outcome(
             outcomes[0], captured_at=outcomes[0].capture.captured_at,
-            scope_values={'league': 'GB1', 'season': '2526', 'club_id': '999'})
+            scope_values={'league': 'GB1', 'season': '2627', 'club_id': '999'})
 
 
 def test_core_ddl_types_follow_the_column_contract():
@@ -360,3 +439,194 @@ def test_numeric_id_strings_render_as_their_bigint_column_type():
                     assert isinstance(row[column], int), column
         return
     pytest.skip('sample fixture has no transfer rows')
+
+
+# ---------------------------------------------------------------- stage-C review round 5
+
+
+def test_a_career_row_that_cannot_hold_its_value_is_an_error_of_its_capture():
+    # Round 5 finding 21 (stage-B lane): a source amount beyond bigint
+    # raised out of extraction instead of becoming the capture's error.
+    import re
+
+    for index in range(4):
+        capture = _load('market_value_points', index)
+        patched, count = re.subn(rb'"y":\s*\d+', b'"y":9223372036854775808', capture.body, count=1)
+        if count:
+            break
+    else:
+        pytest.skip('no recorded market-value fixture carries a chart value')
+    digest = hashlib.sha256(patched).hexdigest()
+    player_id = capture.url.rsplit('/', 1)[-1]
+    broken = SourceCapture(
+        url=capture.url, endpoint='market_value_points', body=patched, capture_id=digest,
+        body_hash=digest, captured_at=capture.captured_at, status_code=capture.status_code)
+    outcome = core.extract_career_observations(
+        broken, _scope(player_id=player_id, club_id=None),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == (
+        'error', 'row_value_exceeds_bigint', ())
+    assert outcome.capture.capture_id == digest
+
+
+@pytest.mark.parametrize('endpoint', [
+    'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history'])
+def test_a_core_row_that_cannot_be_rendered_is_its_captures_error(monkeypatch, endpoint):
+    # Round 5 finding 21 (stage-B lanes): rendering a row is part of reading
+    # the capture; a row the core cannot render is the capture's error.
+    capture = _load(endpoint)
+
+    def scope():
+        if endpoint in ('market_value_points', 'transfer_events'):
+            return _scope(player_id=capture.url.rsplit('/', 1)[-1], club_id=None)
+        if endpoint == 'coach_profile':
+            return _scope()
+        return _scope(club_id=capture.url.split('/verein/')[1].split('/')[0])
+
+    def extract():
+        if endpoint == 'squad':
+            return core.extract_squad_observations(
+                capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+        if endpoint in ('market_value_points', 'transfer_events'):
+            return (core.extract_career_observations(
+                capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),)
+        if endpoint == 'coach_profile':
+            return (core.extract_coach_profile(
+                capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),)
+        return (core.extract_coach_stints(
+            capture, scope(), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE),)
+
+    if not any(outcome.rows for outcome in extract()):
+        pytest.skip('the recorded capture of this lane renders no row')
+
+    def refusing(*args, **kwargs):
+        raise core.CoreParseError('row_value_exceeds_bigint')
+
+    monkeypatch.setattr(core, '_render', refusing)
+    for outcome in extract():
+        assert (outcome.status, outcome.status_reason, outcome.rows) == (
+            'error', 'row_value_exceeds_bigint', ())
+        assert outcome.capture.capture_id == capture.capture_id
+
+
+def test_finding_22a_stage_b_routes_bind_the_endpoint_and_scope():
+    # Round 6 finding 22: a recorded body only plans on its own endpoint, route and id.
+    squad = _load('squad')
+    club_id = squad.url.split('/verein/')[1].split('/')[0]
+    scope = _scope(club_id=club_id, season='2627', edition_id='2026')
+    outcomes = core.extract_squad_observations(
+        squad, scope, extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    values = {'club_id': club_id, 'league': scope.league, 'season': scope.season}
+    for outcome in outcomes:
+        assert core.plan_for_outcome(outcome, captured_at=squad.captured_at, scope_values=values)
+        for wrong in (
+            replace(squad, url='https://www.transfermarkt.com/unrelated'),
+            replace(squad, url=squad.url.replace(f'/verein/{club_id}/', f'/verein/{club_id}1/')),
+            replace(squad, endpoint='coach_history'),
+        ):
+            with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+                core.plan_for_outcome(replace(outcome, capture=wrong),
+                                      captured_at=squad.captured_at, scope_values=values)
+
+    career = _load('market_value_points')
+    player_id = career.url.rsplit('/', 1)[-1]
+    outcome = core.extract_career_observations(
+        career, _scope(player_id=player_id), extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    values = {'player_id': player_id}
+    assert core.plan_for_outcome(outcome, captured_at=career.captured_at, scope_values=values)
+    wrong = replace(career, url=f'https://www.transfermarkt.com/ceapi/transferHistory/list/{player_id}')
+    with pytest.raises(CoreParseError, match='row_scope_mismatch'):
+        core.plan_for_outcome(replace(outcome, capture=wrong), captured_at=career.captured_at,
+                              scope_values=values)
+
+
+def test_finding_24a_numeric_club_name_is_a_market_value_capture_error():
+    # Round 6 finding 24: a JSON number for a text column fails inside extraction.
+    for index in range(4):
+        capture = _load('market_value_points', index)
+        payload = json.loads(capture.body)
+        point = next((row for row in payload.get('list', []) if isinstance(row.get('verein'), str)), None)
+        if point is not None:
+            point['verein'] = 42
+            break
+    else:
+        pytest.fail('recorded market-value fixtures lack a club name')
+    body = json.dumps(payload).encode()
+    digest = hashlib.sha256(body).hexdigest()
+    broken = replace(capture, body=body, capture_id=digest, body_hash=digest)
+    outcome = core.extract_career_observations(
+        broken, _scope(player_id=capture.url.rsplit('/', 1)[-1]),
+        extracted_at=EXTRACTED_AT, universe_version=UNIVERSE)
+    assert (outcome.status, outcome.status_reason, outcome.rows) == ('error', 'row_value_not_text', ())
+    assert outcome.capture == broken
+
+
+def test_finding_3_empty_squad_from_another_season_cannot_replace_memberships(tmp_path, monkeypatch):
+    # Round 7 finding 3: even a proven empty squad must name the season it replaces.
+    from scrapers.transfermarkt.models import FetchOutcome, FetchStatus
+    from scrapers.transfermarkt.orchestrator import ClubTarget, CoreRun, CoreScopePlan
+    from tests.unit.scrapers.test_transfermarkt_native_writer import CoreDB, CoreWriter
+
+    monkeypatch.setenv('TM_WRITER_LOCK_PATH', str(tmp_path / 'writer.lock'))
+    monkeypatch.setenv('TM_CORE_WRITE_JOURNAL_DIR', str(tmp_path / 'journal'))
+    monkeypatch.delenv('TM_WRITER_LOCK_SHARED_FILE_ID', raising=False)
+    current = _load('squad')
+    club_id = current.url.split('/verein/')[1].split('/')[0]
+    empty = replace(_load('squad', 3), url=current.url.replace('/saison_id/2026/', '/saison_id/2025/'))
+    captures = {page.url: page for page in (current, empty)}
+
+    def fetch(url, **kwargs):
+        capture = captures[url]
+        return FetchOutcome(status=FetchStatus.OK, value=capture.text, raw_capture_id=capture.capture_id,
+                            raw_body_hash=capture.body_hash, raw_fetched_at=capture.captured_at)
+
+    db = CoreDB()
+    writer = CoreWriter(db)
+    target = ClubTarget(club_id, 'club', squad_url=current.url)
+    plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
+                         edition_id='2026', clubs=(target,))
+    run = CoreRun(fetch, extracted_at=EXTRACTED_AT)
+    report = run.run(plan, writer=writer, connection_factory=lambda: db)
+    receipt, = report.receipts
+    assert receipt['verified'] is True
+    count = 'SELECT COUNT(*) FROM transfermarkt_squad_memberships WHERE season = ? AND club_id = ?'
+    assert db.sql.execute(count, ('2627', club_id)).fetchone() == (38,)
+    receipts = 'SELECT receipt_id FROM transfermarkt_core_receipts_v1 ORDER BY receipt_id'
+    before = db.sql.execute(receipts).fetchall()
+    writes = list(writer.writes)
+
+    wrong = replace(plan, clubs=(replace(target, squad_url=empty.url),))
+    with pytest.raises(CoreParseError, match='^row_scope_mismatch$'):
+        run.run(wrong, writer=writer, connection_factory=lambda: db)
+    assert writer.writes == writes
+    assert db.sql.execute(receipts).fetchall() == before
+    assert db.sql.execute(count, ('2627', club_id)).fetchone() == (38,)
+    unreadable = {'league': 'GB1', 'season': 'bad', 'club_id': club_id}
+    for entity in ('squad_memberships', 'player_attribute_observations', 'player_contract_observations'):
+        with pytest.raises(CoreParseError, match='^row_scope_mismatch$'):
+            core._check_scope_against_capture(entity, unreadable, empty)
+
+
+@pytest.mark.parametrize('mode', ['offline', 'live_plan'])
+def test_r8_explicit_edition_must_match_the_squad_season(mode, tmp_path, monkeypatch, capsys):
+    # Round 8 finding 18
+    from dags.scripts import run_transfermarkt_core as cli
+    from scrapers.transfermarkt.orchestrator import ClubTarget, CoreRun, CoreRunError, CoreScopePlan
+    from tests.unit.scrapers.test_transfermarkt_orchestrator import _write_replay_manifest
+
+    capture = _load('squad')
+    assert '/saison_id/2026/' in capture.url
+    if mode == 'offline':
+        _write_replay_manifest(tmp_path, [capture])
+        monkeypatch.setattr(cli, '_write_options', lambda args: pytest.fail('unexpected writer setup'))
+        with pytest.raises(SystemExit) as caught:
+            cli.main(['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
+                      '--season', '2627', '--edition-id', '2025', '--write'])
+        assert caught.value.code == 2
+        assert capsys.readouterr().err.rstrip().endswith(': season_edition_mismatch')
+    else:
+        club_id = capture.url.split('/verein/')[1].split('/')[0]
+        plan = CoreScopePlan(league='GB1', season='2627', scope_id='s', cycle_id='c',
+                             edition_id='2025', clubs=(ClubTarget(club_id, 'club', squad_url=capture.url),))
+        with pytest.raises(CoreRunError, match='^season_edition_mismatch$'):
+            CoreRun(lambda *a, **kw: pytest.fail('unexpected fetch')).run(plan)

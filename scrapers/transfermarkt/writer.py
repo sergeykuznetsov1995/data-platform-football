@@ -10,21 +10,31 @@ shared Airflow logs volume).
 from __future__ import annotations
 
 import time  # noqa: F401 — donor tests patch the shared time module through here
+from contextlib import contextmanager, suppress
+from uuid import uuid4
 
 from scrapers.base import trino_manager as base_trino
 from scrapers.base.iceberg_writer import IcebergWriter
 from scrapers.base.trino_manager import TrinoTableManager
+from scrapers.transfermarkt import write_journal
 from scrapers.transfermarkt.native_writer import (  # noqa: F401 — donor facade
     CommittingConnection,
     CommittingCursor,
     StaleTransfermarktWrite,
+    TrinoConnection,
+    TrinoQueryError,
+    _CTAS_ANALYSIS_ERRORS,
     _LOCAL,
     _MUTATION,
+    _definite_rejection,
     _execute_committing,
+    _execute_once,
+    _target_dispatch,
     execute_statement,
     is_mutation,
     locked_write,
     shared_writer_lock_ready,
+    write_is_journalled,
     writer_deadline,
     writer_lock,
 )
@@ -35,8 +45,39 @@ CAREER_TABLES = frozenset({
 })
 
 
+@contextmanager
+def _stage_create(stage):
+    statement = write_journal.begin_statement(('stage-create', stage), {'single_submit': stage})
+    try:
+        yield statement
+    except Exception as exc:
+        coordinator = exc.__cause__
+        analysis_rejected = (isinstance(coordinator, TrinoQueryError)
+                             and coordinator.error_name in _CTAS_ANALYSIS_ERRORS
+                             and coordinator.query_id
+                             and coordinator.query_id == write_journal.statement_query(statement))
+        if _definite_rejection(exc) or analysis_rejected:
+            write_journal.finish_statement(statement)
+        raise
+    write_journal.finish_statement(statement)
+
+
 class TransfermarktTrinoManager(TrinoTableManager):
+    @property
+    def connection(self):
+        # The base manager caches a connection across calls. A donor read can
+        # warm it before a journalled write, and donor work can follow either.
+        with self._conn_lock:
+            if isinstance(self._conn, TrinoConnection):
+                strict = self._conn.max_attempts == 1 and self._conn.legacy_prepared_statements is False
+                if strict != write_is_journalled():
+                    self._reset_connection()
+            return super().connection
+
     def _create_connection(self):
+        transport = {}
+        if write_is_journalled():
+            transport.update(max_attempts=1, legacy_prepared_statements=False)
         if self._password:
             return base_trino.trino.dbapi.connect(
                 host=self.host,
@@ -47,6 +88,7 @@ class TransfermarktTrinoManager(TrinoTableManager):
                 auth=base_trino.trino.auth.BasicAuthentication(self.user, self._password),
                 verify=False,
                 session_properties={'enable_dynamic_filtering': 'false'},
+                **transport,
             )
         return base_trino.trino.dbapi.connect(
             host=self.host,
@@ -54,6 +96,7 @@ class TransfermarktTrinoManager(TrinoTableManager):
             user=self.user,
             catalog=self.catalog,
             session_properties={'enable_dynamic_filtering': 'false'},
+            **transport,
         )
 
     def arrow_schema_to_trino(self, arrow_schema):
@@ -72,22 +115,107 @@ class TransfermarktTrinoManager(TrinoTableManager):
                 types[column] = 'DATE'
         return types
 
-    def _execute(self, sql, fetch=False, params=None):
+    def _execute(self, sql, fetch=False, params=None, *, replay_safe=True):
         parent = super()._execute
-        if fetch or not _MUTATION.match(sql):
+        mutation = _MUTATION.match(sql)
+        if fetch or not mutation:
             return parent(sql, fetch=fetch, params=params)
+        if write_is_journalled():
+            verb = mutation[1].upper()
+            stage = getattr(_LOCAL, 'fresh_stage', None)
+            if stage and sql == 'DROP TABLE IF EXISTS ' + stage:
+                # The shared helper clears caller-supplied stable names. This
+                # name was allocated for a single attempt and has no predecessor.
+                return
+            if stage and sql.startswith('CREATE TABLE ' + stage + ' AS '):
+                _LOCAL.fresh_stage = None
+                return self._execute_target(sql, params, dispatch=_stage_create(stage))
+            if verb == 'INSERT':
+                # Includes every VALUES batch and the replacement tombstones.
+                return parent(sql, fetch=fetch, params=params, replay_safe=False)
+            if verb == 'MERGE':
+                stage = getattr(_LOCAL, 'merge_stage', None)
+                return self._execute_target(sql, params, dispatch=_target_dispatch(
+                    stage=stage if stage and stage in sql else None))
+        if not replay_safe:
+            return parent(sql, fetch=fetch, params=params, replay_safe=False)
         return _execute_committing(lambda: parent(sql, fetch=fetch, params=params))
-    def _execute_committing(self, sql):
+
+    def _execute_target(self, sql, params, *, dispatch=None):
+        with self._conn_lock:
+            cursor = self.connection.cursor()
+            try:
+                with (dispatch if dispatch is not None else _target_dispatch()) as statement:
+                    try:
+                        _execute_once(cursor, sql, params, statement)
+                    except Exception as exc:
+                        if any(message in str(exc) for message in self._CONNECTION_ERRORS):
+                            with suppress(Exception):
+                                self._reset_connection()
+                            raise base_trino.TrinoAmbiguousWriteError(
+                                f'Connection lost while executing SQL: {exc}') from exc
+                        raise base_trino.TrinoError(f'SQL execution failed: {exc}') from exc
+            finally:
+                with suppress(Exception):
+                    cursor.close()
+
+    def _execute_committing(self, sql, *, replay_safe=True):
         # Avoid the common manager's independent retry loop and nested jitter.
+        if write_is_journalled() or not replay_safe:
+            # The strict ladder retries a definite rejected commit only.
+            return super()._execute_committing(sql, replay_safe=False)
         return self._execute(sql)
+
+    def _fast_merge_column_types(self, schema, table, columns, provided):
+        # The base single-row fast path falls back to another MERGE on a
+        # TrinoError, including an ambiguous response to its first MERGE.
+        if write_is_journalled():
+            return None
+        return super()._fast_merge_column_types(schema, table, columns, provided)
+
     def insert_dataframe_atomic(self, schema, table, df, **kwargs):
         with writer_lock():
+            stage_record = None
+            previous_stage = getattr(_LOCAL, 'fresh_stage', None)
+            previous_merge_stage = getattr(_LOCAL, 'merge_stage', None)
+            if write_is_journalled():
+                kwargs.pop('staging_id', None)  # a delayed insert belongs only to its original stage
+                target = getattr(_LOCAL, 'target', None)
+                if target is not None:
+                    scope, receipt_id, _, _ = target
+                    if scope[0] != f'{self.catalog}.{schema}.{table}':
+                        raise RuntimeError('core staging target differs')
+                    suffix = 'tm_' + uuid4().hex
+                    stage = table + '__stg_' + suffix
+                    stage_record = write_journal.stage_record(receipt_id, stage)
+                    write_journal.mark_stage_idle(receipt_id, stage)
+                    write_journal._immutable_record(stage_record, {
+                        'receipt_id': receipt_id, 'table': scope[0], 'stage': stage, 'fenced_create': True})
+                    kwargs['staging_id'] = suffix
             if kwargs.get('delete_filter'):
                 kwargs['single_statement_replace'] = True
-            return super().insert_dataframe_atomic(schema, table, df, **kwargs)
+            try:
+                _LOCAL.merge_stage = stage if stage_record else None
+                _LOCAL.fresh_stage = f'{self.catalog}.{schema}.{stage}' if stage_record else None
+                count = super().insert_dataframe_atomic(schema, table, df, **kwargs)
+            finally:
+                _LOCAL.fresh_stage = previous_stage
+                _LOCAL.merge_stage = previous_merge_stage
+            if stage_record is not None:
+                write_journal.forget_stage(stage_record)
+            return count
 
 
 class TransfermarktIcebergWriter(IcebergWriter):
+    dispatches_journalled_target = True
+
+    def drop_journalled_stage(self, stage):
+        manager = self._get_trino_manager()
+        if manager.catalog != 'iceberg':
+            raise RuntimeError('core retained stage catalog differs')
+        with base_trino._COMMIT_LOCK:
+            manager.drop_table('bronze', stage, if_exists=True)
+
     def _get_trino_manager(self):
         if self._trino_manager is None:
             self._trino_manager = TransfermarktTrinoManager(host=self.trino_host, port=self.trino_port, catalog=self.catalog)

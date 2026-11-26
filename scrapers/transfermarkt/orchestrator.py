@@ -1,4 +1,4 @@
-"""Thin stage-B orchestration: plan -> fetch -> parse -> observations -> receipt.
+"""Run core and section targets from a scope plan through verified receipts.
 
 No BaseScraper, no legacy materialisers. One scope unit in, one report with
 outcomes, DQ and (when a writer is configured) a physically verified
@@ -9,14 +9,21 @@ signature, so live transport and offline capture replay run the same code.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import partial
 import hashlib
+from itertools import batched
+import json
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
-from . import core, native_writer, parsing
+from . import attendance, club_sections, core, native_writer, parsing, rumours, section_catalog, sections
 from .models import FetchOutcome, FetchStatus
+from .raw_store import RawStoreError
+from .referee_capture import _next_directory_page, referee_directory_url, referee_profile_url
 
 
 class CoreRunError(RuntimeError):
@@ -25,6 +32,9 @@ class CoreRunError(RuntimeError):
 
 Fetch = Callable[..., FetchOutcome]
 TM_BASE = "https://www.transfermarkt.com"
+TM_API_BASE = "https://tmapi.transfermarkt.technology"
+_REPRESENTATION_PACKET_LIMIT = 100
+_SECTION_PAGE_LIMIT = 100
 
 
 def squad_url(club_slug: str, club_id: str, saison_year: int) -> str:
@@ -47,6 +57,37 @@ def transfers_url(player_id: str) -> str:
     return f"{TM_BASE}/ceapi/transferHistory/list/{player_id}"
 
 
+def representation_url(player_ids: Sequence[str]) -> str:
+    if not 1 <= len(player_ids) <= _REPRESENTATION_PACKET_LIMIT:
+        raise CoreRunError('representation:batch_invalid')
+    query = '&'.join(f'ids[]={player_id}' for player_id in player_ids)
+    return f"{TM_API_BASE}/players?{query}"
+
+
+def attendance_url(slug: str, competition_id: str, saison_year: int) -> str:
+    return f"{TM_BASE}/{slug}/besucherzahlen/wettbewerb/{competition_id}/saison_id/{saison_year}"
+
+
+def club_values_url(slug: str, competition_id: str, stichtag: str = '') -> str:
+    url = f"{TM_BASE}/{slug}/marktwerteverein/wettbewerb/{competition_id}"
+    return f"{url}/stichtag/{stichtag}" if stichtag else url
+
+
+def achievements_url(recipient_type: str, recipient_id: str, slug: str = '') -> str:
+    if recipient_type == 'coach':
+        return f"{TM_BASE}/{slug}/erfolge/trainer/{recipient_id}"
+    return f"{TM_API_BASE}/{recipient_type}/{recipient_id}/achievement"
+
+
+def rumours_url(slug: str, competition_id: str) -> str:
+    return f"{TM_BASE}/{slug}/geruechte/wettbewerb/{competition_id}"
+
+
+def rumours_competition(slug: str, competition_id: str, name: str) -> rumours.CompetitionContext:
+    url = f"{TM_BASE}/{slug}/startseite/wettbewerb/{competition_id}"
+    return rumours.CompetitionContext(competition_id, name, url)
+
+
 @dataclass(frozen=True)
 class ClubTarget:
     club_id: str
@@ -54,6 +95,59 @@ class ClubTarget:
     club_name: str = ""
     squad_url: str = ""
     coach_history_url: str = ""
+
+
+@dataclass(frozen=True)
+class AttendanceEditionTarget:
+    competition_id: str
+    saison_year: int
+    slug: str = ''
+    start_url: str = ''
+
+    def __post_init__(self):
+        if self.start_url:
+            if not sections._attendance_source_valid(self.start_url):
+                raise CoreRunError('attendance:pagination_identity_invalid')
+            attendance._validate_attendance_url(
+                self.start_url, host=core.TRANSFERMARKT_HOST, path=urlsplit(self.start_url).path,
+                competition=self.competition_id, edition=str(self.saison_year))
+            if sections._attendance_page_number(self.start_url) != 1:
+                raise CoreRunError('attendance:pagination_start_not_first_page')
+
+
+@dataclass(frozen=True)
+class ClubValueTarget:
+    competition_id: str
+    slug: str = ''
+    stichtag: str = ''
+
+
+@dataclass(frozen=True)
+class AchievementHolderTarget:
+    recipient_type: str
+    recipient_id: str
+    slug: str = ''
+
+
+@dataclass(frozen=True)
+class RumourCompetitionTarget:
+    competition_id: str
+    name: str
+    slug: str = ''
+
+
+@dataclass(frozen=True)
+class RefereeDirectoryTarget:
+    competition_id: str
+    edition_id: str
+    slug: str = ''
+    route: str = 'wettbewerb'
+
+
+@dataclass(frozen=True)
+class SectionTarget:
+    endpoint: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -67,6 +161,17 @@ class CoreScopePlan:
     market_value_player_ids: tuple[str, ...] = ()
     transfer_player_ids: tuple[str, ...] = ()
     coach_profile_ids: tuple[tuple[str, str], ...] = ()
+    attendance_editions: tuple[AttendanceEditionTarget, ...] = ()
+    club_value_targets: tuple[ClubValueTarget, ...] = ()
+    achievement_holders: tuple[AchievementHolderTarget, ...] = ()
+    rumour_competitions: tuple[RumourCompetitionTarget, ...] = ()
+    referee_directories: tuple[RefereeDirectoryTarget, ...] = ()
+    referee_profile_ids: tuple[str, ...] = ()
+    representation_player_ids: tuple[str, ...] = ()
+    # An inferred edition describes the season. Only an explicit edition
+    # constrains independently dated section targets in a mixed fixture.
+    edition_inferred: bool = False
+    section_targets: tuple[SectionTarget, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,11 +201,30 @@ class _Request:
     club: ClubTarget | None = None
     player_id: str = ""
     coach_id: str = ""
+    competition_id: str = ""
+    edition_id: str | None = None
+    recipient_id: str = ""
+    recipient_type: str = ""
+    directory_scope: Mapping[str, str] | None = None
+    referee_id: str = ""
+    stichtag: str = ""
+    player_ids: tuple[str, ...] = ()
+    section_scope: Mapping[str, str] | None = None
+
+    @property
+    def as_json(self) -> bool:
+        if self.section_scope is not None:
+            return self.label in section_catalog.JSON_ENDPOINTS
+        return bool(self.player_id) or self.label in (
+            "player_achievement", "club_achievement", "representation",
+        )
 
     def scope_values(self, plan):
         # The replacement scope follows the entity's own scope columns:
         # squad lanes replace (league, season, club_id), stints replace the
         # club's whole history, career and coach profiles the single id.
+        if self.section_scope is not None:
+            return dict(self.section_scope)
         if self.label == "squad":
             return {"league": plan.league, "season": plan.season, "club_id": self.club.club_id}
         if self.label == "coach_history":
@@ -109,10 +233,30 @@ class _Request:
             return {"player_id": self.player_id}
         if self.coach_id:
             return {"coach_id": self.coach_id}
+        if self.label == "referee_profile":
+            return {"referee_id": self.referee_id}
+        if self.label in ("attendance", "referee_directory"):
+            return {"competition_id": self.competition_id, "edition_id": self.edition_id}
+        if self.label in ("club_values", "rumours"):
+            return {"competition_id": self.competition_id}
+        if self.label.endswith("_achievement"):
+            return {"recipient_type": self.recipient_type, "recipient_id": self.recipient_id}
         raise CoreRunError(f"{self.label} request has no replacement scope")
 
 
-def _requests(plan: CoreScopePlan):
+def _canonical_target_id(value: str, error: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]+', value):
+        raise CoreRunError(error)
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise CoreRunError(error) from exc
+    if number == 0:
+        raise CoreRunError(error)
+    return str(number)
+
+
+def _base_requests(plan: CoreScopePlan):
     for club in plan.clubs:
         if club.squad_url:
             yield _Request("squad", club.squad_url, club=club)
@@ -124,19 +268,130 @@ def _requests(plan: CoreScopePlan):
         yield _Request("transfer_events", transfers_url(player_id), player_id=player_id)
     for coach_id, slug in plan.coach_profile_ids:
         yield _Request("coach_profile", coach_profile_url(slug, coach_id), coach_id=coach_id)
+    for target in plan.attendance_editions:
+        url = target.start_url or attendance_url(
+            target.slug or target.competition_id, target.competition_id, target.saison_year)
+        yield _Request("attendance", url, competition_id=target.competition_id, edition_id=str(target.saison_year))
+    for target in plan.club_value_targets:
+        url = club_values_url(target.slug or target.competition_id, target.competition_id, target.stichtag)
+        yield _Request("club_values", url, competition_id=target.competition_id, stichtag=target.stichtag)
+    for holder in plan.achievement_holders:
+        if holder.recipient_type not in ("player", "club", "coach"):
+            raise CoreRunError("achievements:invalid_recipient_type")
+        if holder.recipient_type == "coach" and not holder.slug:
+            raise CoreRunError("achievements:coach_slug_missing")
+        recipient_id = _canonical_target_id(holder.recipient_id, 'achievements:recipient_id_invalid')
+        url = achievements_url(holder.recipient_type, recipient_id, holder.slug)
+        yield _Request(f"{holder.recipient_type}_achievement", url,
+                       recipient_type=holder.recipient_type, recipient_id=recipient_id)
+
+
+def _target_requests(plan: CoreScopePlan):
+    for request in _base_requests(plan):
+        yield request, None
+    for target in plan.rumour_competitions:
+        # The donor's canonical route: Transfermarkt serves the rumour grid
+        # under the generic "-" slug and every pager link carries it. A
+        # competition slug fails the donor's page navigation check instead.
+        slug = target.slug or '-'
+        request = _Request("rumours", rumours_url('-', target.competition_id),
+                           competition_id=target.competition_id)
+        yield request, rumours_competition(slug, target.competition_id, target.name)
+    for target in plan.referee_directories:
+        directory = {
+            "competition_id": target.competition_id, "edition_id": target.edition_id,
+            "slug": target.slug or target.competition_id, "route": target.route,
+        }
+        yield _Request("referee_directory", referee_directory_url(directory),
+                       competition_id=target.competition_id, edition_id=target.edition_id,
+                       directory_scope=directory), None
+    for target in plan.referee_profile_ids:
+        # One canonical id serves the URL and the requested scope alike; the
+        # donor's URL builder is what validates and normalises it.
+        url = referee_profile_url(target)
+        yield _Request("referee_profile", url, referee_id=url.rsplit('/', 1)[-1]), None
+    player_ids = (_canonical_target_id(value, 'representation:player_id_invalid')
+                  for value in plan.representation_player_ids)
+    for batch in batched(player_ids, _REPRESENTATION_PACKET_LIMIT):
+        yield _Request("representation", representation_url(batch), player_ids=batch), None
+    seen = set()
+    for target in plan.section_targets:
+        endpoint = target.endpoint
+        values = section_catalog.source_scope(
+            endpoint, target.url, edition_id=plan.edition_id or str(core.saison_year(plan.season)),
+            competition_id=plan.league,
+        )
+        module = section_catalog.BY_ENDPOINT[endpoint]
+        if endpoint in module.PAGINATED and module.page_number(endpoint, target.url) != 1:
+            raise ValueError(f'{endpoint}:first_page_missing')
+        for entity in module.ENDPOINT_ENTITIES[endpoint]:
+            for physical_scope in section_catalog.entity_scopes(entity, endpoint, values):
+                identity = entity, tuple(sorted(physical_scope.items()))
+                if identity in seen:
+                    raise ValueError(f'{endpoint}:duplicate_section_target')
+                seen.add(identity)
+        club = ClubTarget(values['club_id'], '') if 'club_id' in values else None
+        yield _Request(endpoint, target.url, section_scope=values, club=club,
+                       player_id=values.get('player_id', ''), competition_id=values.get('competition_id', ''),
+                       edition_id=values.get('edition_id')), None
 
 
 def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
-    return tuple(request.url for request in _requests(plan))
+    return tuple(request.url for request, _ in _requests(plan))
 
 
-def _capture(request, result, raw_loader):
+def _requests(plan: CoreScopePlan):
+    """The run's requests: one scope is never replaced twice in a run.
+
+    Two replacements of one scope are two verified deletions of each other,
+    whichever of them is fetched first.
+    """
+    if plan.edition_id and plan.edition_id != str(core.saison_year(plan.season)):
+        raise CoreRunError('season_edition_mismatch')
+    requests = list(_target_requests(plan))
+    seen = set()
+    for request, _competition in requests:
+        if any(core.CORE_WRITE_MODES[entity] == 'replace' for entity in _ENTITIES[request.label]):
+            target = (request.label, tuple(sorted(request.scope_values(plan).items())))
+            if target in seen:
+                raise CoreRunError(f"{request.label}:duplicate_target")
+            seen.add(target)
+    for request, _ in requests:
+        if request.label == 'squad':
+            core._check_scope_against_url('squad_memberships', request.scope_values(plan),
+                                          request.url, request.label)
+        if (plan.edition_id and not plan.edition_inferred and request.edition_id is not None
+                and request.edition_id != plan.edition_id):
+            raise CoreRunError(f'{request.label}_edition_mismatch')
+    return requests
+
+
+def _capture(request, result, raw_loader, *, paired_scope=None):
     if raw_loader is not None:
-        body, record = raw_loader(result.raw_capture_id)
+        body, record = raw_loader(result.raw_capture_id, request.url)
+        if paired_scope is not None:
+            expected = {'capture_id': result.raw_capture_id, 'endpoint': request.label,
+                        'url': request.url, 'content_hash': result.raw_body_hash,
+                        'scope_id': paired_scope.scope_id, 'cycle_id': paired_scope.cycle_id,
+                        'status_code': result.status_code}
+            if (not isinstance(body, bytes) or type(getattr(record, 'status_code', None)) is not int
+                    or any(getattr(record, key, None) != value for key, value in expected.items())
+                    or not result.raw_fetched_at or not getattr(record, 'fetched_at', None)
+                    or _normalise_ts(record.fetched_at) != _normalise_ts(result.raw_fetched_at)):
+                raise CoreRunError('paired club raw manifest differs')
+            if result.status_code == 200:
+                payload = json.loads(body.decode('utf-8'), parse_int=sections.parse_json_integer)
+                value = result.value
+                if isinstance(value, (str, bytes)):
+                    value = json.loads(value, parse_int=sections.parse_json_integer)
+                if core.canonical_json(payload) != core.canonical_json(value):
+                    raise CoreRunError('paired club JSON body differs')
+        if getattr(record, "endpoint", request.label) != request.label:
+            raise CoreRunError(f"{request.label} raw capture endpoint differs")
         if record.content_hash != result.raw_body_hash or record.url != request.url:
             raise CoreRunError(f"{request.label} raw capture does not match its outcome")
         captured_at = _normalise_ts(record.fetched_at)
-    elif request.player_id:
+    elif request.as_json:
         # A JSON payload cannot be re-serialised to its exact source bytes.
         raise CoreRunError(f"{request.label} capture requires its raw body loader")
     else:
@@ -149,6 +404,11 @@ def _capture(request, result, raw_loader):
         capture_id=result.raw_capture_id, body_hash=result.raw_body_hash,
         captured_at=captured_at, status_code=result.status_code or 200,
     )
+
+
+def _freshness_clock(outcome):
+    """The newest walked page of the outcome, or its own capture."""
+    return max((page[2] for page in outcome.pages), default=outcome.capture.captured_at)
 
 
 def _summary(outcome):
@@ -165,39 +425,103 @@ def _summary(outcome):
         )),
         "run_id": outcome.run_id,
         "extracted_at": outcome.extracted_at,
+        "subject": outcome.subject,
     }
 
 
 
 _ENTITIES = {
+    **section_catalog.ENTITIES,
     "squad": ("squad_memberships", "player_attribute_observations", "player_contract_observations"),
     "coach_history": ("coach_stints",),
     "market_value_points": ("market_value_points",),
     "transfer_events": ("transfer_events",),
     "coach_profile": ("coach_profiles",),
+    "attendance": ("attendance_observations",),
+    "club_values": ("club_value_observations",),
+    "player_achievement": ("achievement_observations",),
+    "club_achievement": ("achievement_observations",),
+    "coach_achievement": ("achievement_observations",),
+    "rumours": ("rumour_observations",),
+    "referee_directory": ("referee_aggregate_observations",),
+    "referee_profile": ("referee_profiles",),
+    "representation": ("player_representation_observations",),
 }
+_PAGINATED_ENDPOINTS = frozenset({"attendance", "rumours", "referee_directory"}) | section_catalog.PAGINATED
 _SUCCESS = {FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY, FetchStatus.NOT_APPLICABLE}
 
 
-def _observations(request, result, plan, extracted_at, universe_version, raw_loader):
+def _request_subject(request, plan) -> str:
+    """Name the requested target inside a scope that may hold several.
+
+    A failed request keeps no capture to tell its targets apart in DQ.
+    """
+    try:
+        values = request.scope_values(plan)
+    except CoreRunError:
+        values = {"player_ids": request.player_ids}
+    if request.label == "club_values":
+        # Stichtag targets of one competition share their scope values.
+        values = {**values, "stichtag": request.stichtag}
+    return core.canonical_json(values).decode()
+
+
+def _observations(request, result, plan, extracted_at, universe_version, capture_response, captures=(),
+                  competition=None, walk_failure=None, walk_failed=None, paired_club=False):
     scope = core.ScopeContext(
         league=plan.league, season=plan.season, scope_id=plan.scope_id, cycle_id=plan.cycle_id,
-        edition_id=plan.edition_id or None, player_id=request.player_id or None,
+        edition_id=request.edition_id or plan.edition_id or None, player_id=request.player_id or None,
+        competition_id=request.competition_id or None,
         club_id=request.club.club_id if request.club else None,
         club_name=request.club.club_name if request.club else None,
     )
     metadata = {"extracted_at": extracted_at, "universe_version": universe_version}
     run_id = core._run_id(scope, extracted_at)
-    if result.status is FetchStatus.NOT_APPLICABLE:
+    subject = _request_subject(request, plan)
+    paginated = request.label in _PAGINATED_ENDPOINTS
+    if request.section_scope is not None:
+        module = section_catalog.BY_ENDPOINT[request.label]
+        failure = walk_failure
+        if paired_club and result.raw_capture_id and (
+                result.status is FetchStatus.OK and result.status_code == 200
+                or request.label == 'club_stadium' and result.status_code == 404):
+            try:
+                capture = capture_response(request, result, paired_scope=scope)
+            except (CoreRunError, RawStoreError, OSError, EOFError, KeyError, TypeError, ValueError):
+                failure = 'paired_raw_mismatch'
+            else:
+                return module.extract((capture,), scope, **metadata), capture.captured_at
+        elif paired_club and result.status is FetchStatus.OK:
+            failure = 'paired_raw_mismatch'
+        if failure or result.status is not FetchStatus.OK or not result.raw_capture_id:
+            reason = failure or result.status.value
+            status = 'error' if failure or result.status in _SUCCESS | {FetchStatus.SCHEMA_ERROR} else 'unavailable'
+            return tuple(core.captureless_outcome(
+                entity, scope, status=status, reason=f'{request.label}:{reason}',
+                run_id=run_id, subject=subject, **metadata,
+            ) for entity in module.ENDPOINT_ENTITIES[request.label]), None
+        pages = captures if paginated else (capture_response(request, result),)
+        return module.extract(pages, scope, **metadata), max(page.captured_at for page in pages)
+    if request.label == "representation" and (
+        result.status in (FetchStatus.NOT_APPLICABLE, FetchStatus.SCHEMA_ERROR)
+        or (result.status in _SUCCESS and not result.raw_capture_id)
+    ):
+        reason = result.status.value if result.status is not FetchStatus.OK else "no_capture"
+        return (core.captureless_outcome(
+            _ENTITIES[request.label][0], scope, status="error", reason=f"representation:{reason}",
+            run_id=run_id, subject=subject, **metadata,
+        ),), None
+    if result.status is FetchStatus.NOT_APPLICABLE and not paginated:
         return tuple(
             core.captureless_outcome(
                 entity, scope, status="not_applicable",
                 reason=f"{request.label}:transport_not_applicable",
                 proof=f"transport:not_applicable:{request.label}",
-                run_id=run_id, **metadata)
+                run_id=run_id, subject=subject, **metadata)
             for entity in _ENTITIES[request.label]
         ), None
-    if result.status not in _SUCCESS or not result.raw_capture_id:
+    if (result.status not in _SUCCESS or not result.raw_capture_id
+            or (paginated and result.status is not FetchStatus.OK)):
         status = "unavailable"
         reason = f"{request.label}:{result.status.value}"
         if request.player_id:
@@ -207,73 +531,332 @@ def _observations(request, result, plan, extracted_at, universe_version, raw_loa
                 reason = f"career:{request.label}:no_capture"
         return tuple(
             core.captureless_outcome(entity, scope, status=status, reason=reason,
-                                     run_id=run_id, **metadata)
+                                     run_id=run_id, subject=subject, **metadata)
             for entity in _ENTITIES[request.label]
         ), None
 
-    capture = _capture(request, result, raw_loader)
+    if request.label == "referee_directory":
+        unit = sections.extract_referee_directory_observations(captures, scope, **metadata)
+        return unit, max(page.captured_at for page in captures)
+    if request.label == "rumours":
+        if walk_failure is not None and not captures:
+            return (core.captureless_outcome(
+                "rumour_observations", scope, status="error",
+                reason=f"rumours:{walk_failure}", run_id=run_id, subject=subject, **metadata),), None
+        unit = sections.extract_rumour_observations(
+            captures, scope, competition=competition, failure=walk_failure, broken=walk_failed,
+            **metadata)
+        return tuple(unit), max(capture.captured_at for capture in captures)
+    if request.label == "attendance":
+        if walk_failure is not None:
+            return (sections._outcome(
+                "attendance_observations", "error", f"attendance:{walk_failure}",
+                **core._context(walk_failed, scope, extracted_at, universe_version),
+            ),), walk_failed.captured_at
+        unit = sections.extract_attendance_observations(
+            captures, scope, start_url=request.url, competition_id=request.competition_id,
+            edition_id=request.edition_id, **metadata,
+        )
+        return unit, max(page.captured_at for page in captures)
+
+    capture = capture_response(request, result)
     if request.label == "squad":
         unit = core.extract_squad_observations(capture, scope, **metadata)
     elif request.label == "coach_history":
         unit = core.extract_coach_stints(capture, scope, **metadata)
     elif request.player_id:
         unit = core.extract_career_observations(capture, scope, **metadata)
+    elif request.label == "club_values":
+        unit = sections.extract_club_value_observations(
+            capture, scope, competition_id=request.competition_id, **metadata)
+    elif request.label == "representation":
+        unit = sections.extract_representation_observations(
+            capture, scope, expected_ids=request.player_ids, **metadata,
+        )
+    elif request.label == "referee_profile":
+        unit = sections.extract_referee_profile_observations(
+            capture, scope, referee_id=request.referee_id, **metadata,
+        )
+    elif request.label.endswith("_achievement"):
+        unit = sections.extract_achievement_observations(
+            capture, scope, recipient_type=request.recipient_type,
+            recipient_id=request.recipient_id, **metadata,
+        )
     else:
         unit = core.extract_coach_profile(capture, scope, **metadata)
     return (unit if isinstance(unit, (tuple, list)) else (unit,)), capture.captured_at
 
 
+def _outcome_scope_values(outcome, request, plan):
+    # Single-target lanes keep their REQUESTED scope: rows are cross-checked
+    # against it, so a wrong-holder page can never be written under another
+    # identity. Only explicit fan-out sections (one capture, many row scopes)
+    # derive the scope from their rows.
+    if request.section_scope is not None:
+        allowed = section_catalog.entity_scopes(outcome.entity, request.label, request.section_scope)
+        if len(allowed) == 1:
+            return allowed[0]
+        if outcome.rows:
+            values = {key: outcome.rows[0][key] for key in core.CORE_SCOPE_COLUMNS[outcome.entity]}
+            if values in allowed:
+                return values
+        raise CoreRunError(f'{outcome.entity} does not identify a requested owner')
+    requested = None
+    try:
+        requested = request.scope_values(plan)
+    except CoreRunError:
+        requested = None
+    columns = core.CORE_SCOPE_COLUMNS[outcome.entity]
+    if requested is not None and set(requested) == set(columns):
+        if any(row[column] != requested[column] for row in outcome.rows for column in columns):
+            raise CoreRunError(f"{outcome.entity} rows escape the requested scope")
+        return dict(requested)
+    if not outcome.rows:
+        return request.scope_values(plan)
+    values = {column: outcome.rows[0][column] for column in columns}
+    if any(row[column] != values[column] for row in outcome.rows for column in columns):
+        raise CoreRunError(f"{outcome.entity} rows span multiple scopes")
+    return values
+
+
+class _RumourWalk:
+    """Union planning of one rumour feed.
+
+    Every fetched page contributes the page links it evidences: a first pager
+    may omit middle pages that a later page supplies. The combined plan is
+    validated by extraction before any page of the feed is written.
+    """
+
+    def __init__(self, competition):
+        self.competition = competition
+        self.links = {}       # page number -> evidenced canonical URL
+        self.last_page = None
+        self.pages = {}       # validated page number -> its capture
+        self.captures = []    # every page handed to extraction, failures included
+        self.failed = None    # the page whose evidence broke the walk
+        self.aliases = set()  # visited URLs that are no plan page
+
+    def ordered(self):
+        """The plan pages in page order.
+
+        A later page may reveal an earlier page number, so fetch order and
+        page order differ; extraction numbers the pages by position.
+        """
+        return [self.pages[number] for number in sorted(self.pages)] or list(self.captures)
+
+    def add(self, capture):
+        """Register one fetched page and return the next page URL, if any."""
+        # The page stays in the walk even when its pager is unreadable, so
+        # extraction reports the donor error from the page that caused it.
+        self.captures.append(capture)
+        pagination = rumours.parse_rumour_pagination(
+            capture.text, competition=self.competition, page_url=capture.url)
+        if pagination.last_page > 100:
+            raise CoreRunError('rumours:pagination_limit')
+        if self.last_page is None:
+            self.last_page = pagination.last_page
+        elif pagination.last_page != self.last_page:
+            raise rumours.RumourParseError('conflicting_page_ref')
+        links = dict(pagination.links)
+        if not self.links and links.get(1) != capture.url:
+            # Every row binds to its CANONICAL plan URL; a listing that names
+            # another page 1 was only the discovery response.
+            self.captures.pop()
+            self.aliases.add(capture.url)
+        else:
+            self.pages[pagination.current_page] = capture
+        for number, url in links.items():
+            if self.links.setdefault(number, url) != url:
+                if url in self.aliases:
+                    # Two pages naming each other canonical would re-enter
+                    # discovery forever; the discovery URL never comes back.
+                    raise CoreRunError('rumours:discovery_cycle')
+                raise rumours.RumourParseError('conflicting_page_ref')
+        fetched = {page.url for page in self.captures}
+        for number in sorted(self.links):
+            url = self.links[number]
+            if url in self.aliases:
+                raise CoreRunError('rumours:discovery_cycle')
+            if url not in fetched:
+                return url
+        return None
+
+
 class CoreRun:
+    """Use an ID-only raw loader or resolve a replay record by (capture ID, request URL)."""
+
     def __init__(
         self,
         fetch: Fetch,
         *,
         raw_loader: Callable[[str], tuple[bytes, Any]] | None = None,
+        request_raw_loader: Callable[[str, str], tuple[bytes, Any]] | None = None,
         universe_version: str = "core-universe-v1",
         extracted_at: str | None = None,
     ):
         self._fetch = fetch
-        self._raw_loader = raw_loader
+        if raw_loader is not None and request_raw_loader is not None:
+            raise ValueError('supply only one raw loader')
+        self._raw_loader = request_raw_loader
+        if raw_loader is not None:
+            self._raw_loader = lambda capture_id, url: raw_loader(capture_id)
         self._universe_version = universe_version
         self._extracted_at = extracted_at
 
     def run(self, plan: CoreScopePlan, *, writer=None, connection_factory=None) -> CoreRunReport:
-        extracted_at = (
-            datetime.now(timezone.utc).isoformat(timespec="microseconds")
-            if self._extracted_at is None else _normalise_ts(self._extracted_at)
-        )
+        # An auto-sampled extraction clock must postdate every capture of its
+        # own target (donor contracts reject extracted_at < captured_at), so
+        # it is sampled after each target's walk: one clock and run identity
+        # per target. An explicit stamp is used verbatim for the whole run —
+        # offline replays pin their own clocks.
+        pinned = None if self._extracted_at is None else _normalise_ts(self._extracted_at)
         context = {"scope_id": plan.scope_id, "cycle_id": plan.cycle_id}
+        evaluated = []
+        profiles = {}
+        capture_response = partial(_capture, raw_loader=self._raw_loader)
+        hashes_by_capture = {}
+        fetched = cache_hits = 0
+        requests = _requests(plan)
+        profiles_requested = {req.url for req, _ in requests if req.label == 'club_profile'}
+        stadiums_requested = {req.url for req, _ in requests if req.label == 'club_stadium'}
+        paired_profiles = {url for url in profiles_requested if url + '/stadium' in stadiums_requested}
+        for request, competition in requests:
+            as_json = request.as_json
+            page = request
+            captures = []
+            walk = _RumourWalk(competition) if request.label == "rumours" else None
+            walk_failure, walk_failed = None, None
+            while True:
+                result = self._fetch(
+                    page.url, label=request.label, as_json=as_json, context=context,
+                    validator=parsing.endpoint_validator(request.label, as_json=as_json),
+                )
+                # Even a transport/schema failure may identify the raw response.
+                # Its captureless lane outcome will no longer carry this evidence.
+                capture_id, body_hash = result.raw_capture_id, result.raw_body_hash
+                if capture_id and body_hash and hashes_by_capture.setdefault(capture_id, body_hash) != body_hash:
+                    raise CoreRunError('capture_evidence_conflict')
+                fetched += 1
+                cache_hits += int(result.cache_hit)
+                if (request.label not in _PAGINATED_ENDPOINTS or result.status is not FetchStatus.OK
+                        or not result.raw_capture_id):
+                    break
+                capture = capture_response(page, result)
+                if walk is not None:
+                    try:
+                        next_url = walk.add(capture)
+                    except ValueError as exc:
+                        # The walk's own evidence conflicts or is unreadable:
+                        # the feed is reported from it, never certified in part.
+                        walk_failure = getattr(exc, "reason", None) or "invalid_source_data"
+                        walk_failed = walk.captures[-1]
+                        break
+                    if next_url is None:
+                        break
+                    page = replace(request, url=next_url)
+                    continue
+                captures.append(capture)
+                if request.section_scope is not None:
+                    module = section_catalog.BY_ENDPOINT[request.label]
+                    number = len(captures)
+                    try:
+                        next_url = module.next_page(capture, number)
+                        if next_url is None:
+                            break
+                        if number >= _SECTION_PAGE_LIMIT:
+                            raise ValueError('pagination_limit')
+                        values = section_catalog.source_scope(
+                            request.label, next_url, edition_id=request.edition_id or '',
+                            competition_id=request.competition_id,
+                        )
+                        if (values != request.section_scope or module.page_number(request.label, next_url) != number + 1
+                                or any(previous.url == next_url for previous in captures)):
+                            raise ValueError('pagination_identity_mismatch')
+                    except (ValueError, UnicodeError) as exc:
+                        walk_failure = getattr(exc, 'reason', None) or 'invalid_pagination'
+                        break
+                    page = replace(request, url=next_url)
+                    continue
+                if request.label == "referee_directory":
+                    number = len(captures)
+                    try:
+                        has_next = _next_directory_page(capture.text, request.directory_scope, number)
+                    except ValueError:
+                        # Any probe failure (a malformed link URL included) is
+                        # contained: the adapter checks the same links against
+                        # the whole walk and reports the failing page.
+                        break
+                    if not has_next:
+                        break
+                    if number >= 100:
+                        raise CoreRunError('referee_directory:pagination_limit')
+                    page = replace(request, url=referee_directory_url(request.directory_scope, page=number + 1))
+                    continue
+                try:
+                    next_url = attendance.next_attendance_url(capture.body, page.url)
+                    if next_url is None:
+                        break
+                    if not sections._attendance_source_valid(next_url):
+                        break
+                    start = urlsplit(request.url)
+                    next_url = attendance._validate_attendance_url(
+                        next_url, host=start.netloc, path=start.path,
+                        competition=request.competition_id, edition=request.edition_id,
+                    )
+                    if sections._attendance_page_number(next_url) != len(captures) + 1:
+                        walk_failure, walk_failed = 'pagination_not_sequential', capture
+                        break
+                except ValueError:
+                    # The donor parser reports the precise error from these same pages.
+                    break
+                if any(previous.url == next_url for previous in captures):
+                    break
+                if len(captures) >= 100:
+                    raise CoreRunError('attendance:pagination_limit')
+                page = replace(request, url=next_url)
+            if walk is not None:
+                captures = walk.ordered()
+            extracted_at = pinned or datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            paired_club = request.url.removesuffix('/stadium') in paired_profiles
+            unit, captured_at = _observations(
+                request, result, plan, extracted_at, self._universe_version, capture_response,
+                captures, competition=competition, walk_failure=walk_failure,
+                walk_failed=walk_failed, paired_club=paired_club)
+            if paired_club and request.label == 'club_profile':
+                profiles[request.url] = unit[0]
+            evaluated.append((request, unit, captured_at))
+
         outcomes = []
         captured_units = []
-        fetched = cache_hits = 0
-        for request in _requests(plan):
-            as_json = bool(request.player_id)
-            result = self._fetch(
-                request.url, label=request.label, as_json=as_json, context=context,
-                validator=parsing.endpoint_validator(request.label, as_json=as_json),
-            )
-            fetched += 1
-            cache_hits += int(result.cache_hit)
-            unit, captured_at = _observations(
-                request, result, plan, extracted_at, self._universe_version, self._raw_loader)
+        for request, unit, captured_at in evaluated:
+            if request.label == 'club_stadium':
+                unit = club_sections.confirm_stadium_absence(unit, profiles.get(request.url.removesuffix('/stadium')))
             outcomes.extend(unit)
             if captured_at is not None and writer is not None and connection_factory is not None:
-                captured_units.append((unit, captured_at, request.scope_values(plan)))
+                # A multi-page merge writes one plan per contributing page capture.
+                entries = [
+                    (item, _freshness_clock(item), _outcome_scope_values(item, request, plan))
+                    for item in unit
+                    if item.status in core.CONCLUSIVE_CORE_STATUSES and item.capture is not None
+                ]
+                if entries:
+                    captured_units.append((unit[0].run_id, unit[0].extracted_at, entries))
 
         bundles = []
-        for unit, captured_at, values in captured_units:
-            conclusive = [item for item in unit if item.status in core.CONCLUSIVE_CORE_STATUSES]
-            if conclusive:
-                plans = [
-                    core.plan_for_outcome(item, captured_at=captured_at, scope_values=values)
-                    for item in conclusive
-                ]
-                bundles.append((conclusive[0].run_id, plans))
+        for run_id, committed_at, entries in captured_units:
+            plans = [core.plan_for_outcome(item, captured_at=captured_at, scope_values=values)
+                     for item, captured_at, values in entries]
+            bundles.append((run_id, committed_at, plans))
+        # Every plan of the run is checked against every other before the
+        # first mutation: a collision between two targets must not surface
+        # after the first one has committed.
+        native_writer.validate_run_plans(
+            [plan for _run_id, _committed_at, plans in bundles for plan in plans])
         receipts = []
-        for run_id, plans in bundles:
+        for run_id, committed_at, plans in bundles:
             receipt = native_writer.write_core_bundle(
                 connection_factory, writer, plans, run_id=run_id,
-                universe_version=self._universe_version, committed_at=extracted_at,
+                universe_version=self._universe_version, committed_at=committed_at,
             )
             if not isinstance(receipt, dict):
                 raise CoreRunError(f"Missing receipt for capture run {run_id}")
@@ -288,7 +871,8 @@ class CoreRun:
             }
         dq = core.build_core_dq(outcomes, verified_receipt=verified)
         return CoreRunReport(
-            run_id=outcomes[0].run_id if outcomes else "",
+            # The compatibility run id names the target of the first receipt.
+            run_id=receipts[0]["run_id"] if receipts else (outcomes[0].run_id if outcomes else ""),
             scope_id=plan.scope_id,
             cycle_id=plan.cycle_id,
             outcomes=tuple(_summary(item) for item in outcomes),
