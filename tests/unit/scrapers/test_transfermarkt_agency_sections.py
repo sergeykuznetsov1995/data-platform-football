@@ -199,6 +199,18 @@ def test_separate_staff_name_requires_unique_row_evidence(link_text, labels, sta
     assert relations.status == status and not relations.rows
 
 
+@pytest.mark.parametrize('link', [
+    '<a href="/alex/profil/berater/42" aria-label="Alex"><img alt=""></a>',
+    '<a href="/alex/profil/berater/42"><img alt="Alex"></a>',
+    '<a href="/alex/profil/berater/42" title="Pat">Alex</a>',
+])
+def test_conflicting_names_on_a_staff_link_cannot_certify_the_row(link):
+    html = ('<div class="box"><h2 class="content-box-headline">Staff</h2><table class="items"><tr>'
+            f'<td>{link}</td><td><strong class="employee-label">Pat</strong></td></tr></table></div>')
+    _, relations = observe(capture('agency_profile', AGENCY, client_page('', total=0) + html))
+    assert relations.status == 'error' and not relations.rows
+
+
 def test_agency_navigation_confirms_the_same_id_as_the_agency_header():
     html = ('<tm-subnavigation controller="berater" section="berater" id="47"></tm-subnavigation>'
             '<h2 class="advisor-header__headline">Alpha</h2>')

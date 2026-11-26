@@ -346,6 +346,19 @@ def _client_walk(captures):
     return remaining
 
 
+def _staff_identity(row, listed_name):
+    agent_id, link_name = _links(row, _AGENT, '/profil/berater/')
+    name = listed_name if listed_name not in _MISSING else link_name
+    if not agent_id or not name or name in _MISSING:
+        return agent_id, None
+    for link in row.select('a[href*="/profil/berater/"]'):
+        captions = [link.get_text(' ', strip=True), link.get('title', ''), link.get('aria-label', '')]
+        captions.extend(img['alt'] for img in link.select('img[alt]'))
+        if any(caption.strip() and caption.strip() != name for caption in captions):
+            raise AgencyError('conflicting_agency_staff')
+    return agent_id, name
+
+
 def _staff(soup, agency_id):
     tables = []
     for box in soup.select('div.box'):
@@ -359,13 +372,10 @@ def _staff(soup, agency_id):
     listings = []
     unresolved = False
     for tr in body.find_all('tr', recursive=False):
-        agent_id, name = _links(tr, _AGENT, '/profil/berater/')
         labels = tr.select('strong.employee-label')
         listed_name = labels[0].get_text(' ', strip=True) if len(labels) == 1 else ''
+        agent_id, name = _staff_identity(tr, listed_name)
         if listed_name not in _MISSING:
-            if agent_id and name and listed_name != name:
-                raise AgencyError('conflicting_agency_staff')
-            name = listed_name
             cell = labels[0].find_parent('td') or labels[0].parent
             roles = [match[1] for span in cell.find_all('span', recursive=False)
                      if (match := re.fullmatch(r'\(([^()]+)\)', span.get_text(' ', strip=True)))]
@@ -439,7 +449,7 @@ def extract(captures, scope, *, extracted_at, universe_version):
 
     def outcome(entity, capture, status, reason, records=(), proof=None):
         return make_outcome(entity, capture, scope, status=status, reason=f'{endpoint}:{reason}',
-                            records=records, proof=proof, parser_revision='agency-sections-v4',
+                            records=records, proof=proof, parser_revision='agency-sections-v5',
                             extracted_at=extracted_at, universe_version=universe_version)
 
     for capture in captures:
