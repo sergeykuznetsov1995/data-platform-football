@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from itertools import islice
 from typing import (
     Any,
     Callable,
@@ -48,7 +49,7 @@ from scrapers.fotmob.domain import (
     ProbeStatus,
     ScopeDecision,
 )
-from scrapers.fotmob.match_refresh import source_observed_at
+from scrapers.fotmob.match_refresh import match_time, source_observed_at
 from scrapers.fotmob.planner import ScopeAttemptState
 from scrapers.fotmob.player_collector import PLAYER_COLLECTOR_NOT_AVAILABLE_COOLDOWN
 from scrapers.fotmob.row_identity import OBSERVATION_COLUMNS, row_multiset
@@ -534,6 +535,13 @@ DEDUP_KEYS: dict[str, tuple[str, ...]] = {
 # Player inventory keys carry no scope columns, so one preload would pull the
 # whole ~3.8M-key population for rows the run-level dedup already collapses.
 INVENTORY_PRELOAD_SKIP: frozenset[str] = frozenset({"player"})
+DISCOVERY_INVENTORY_SCOPES = 16
+
+
+def _inventory_sql_values(value: str) -> tuple[str, ...]:
+    escaped = value.replace("'", "''")
+    # Older pandas frames stored numeric scopes as VARCHARs ending in ".0".
+    return (f"'{escaped}'", f"'{escaped}.0'") if value.isdigit() else (f"'{escaped}'",)
 
 
 def _dedup_key_value(value: Any) -> Optional[str]:
@@ -579,6 +587,16 @@ def _completed_at_key(view: Mapping[str, Any]) -> str:
     """Order manifest views by completion time without assuming a dtype."""
 
     return str(view.get("completed_at") or "")
+
+
+def _latest_discovery_times(rows: Iterable[tuple[str, Any]]) -> dict[int, datetime]:
+    times: dict[int, datetime] = {}
+    for entity_id, completed_at in rows:
+        timestamp = match_time(completed_at)
+        if timestamp is not None:
+            competition_id = int(entity_id)
+            times[competition_id] = max(timestamp, times.get(competition_id, datetime.min))
+    return times
 
 
 def _raw_entity_rank(view: Mapping[str, Any]) -> tuple[int, str, str, str, str]:
@@ -1038,6 +1056,7 @@ class FotMobRepository:
         # them each flush wrote ~2.4M rows per iteration where ~200k were new.
         self._seen_keys: dict[str, set[tuple[Any, ...]]] = {}
         self._seeded_scopes: set[tuple[Any, ...]] = set()
+        self._discovery_inventory: set[tuple[Any, ...]] = set()
         self._pending_targets: dict[str, dict[str, Any]] = {}
         self._pending_entities: dict[tuple[str, str], dict[str, Any]] = {}
         # Offline replay needs the exact historical raw target for entities whose
@@ -1323,12 +1342,59 @@ class FotMobRepository:
         output: list[dict[str, Any]] = []
         for row in rows:
             key = tuple(_dedup_key_value(row.get(column)) for column in key_columns)
+            if key in staged or key in seen:
+                continue
+            if table == "fotmob_field_inventory" and key in self._discovery_inventory:
+                staged.add(key)
+                continue
             self._seed_scope_keys(table, key_columns, key)
-            if key in seen or key in staged:
+            if key in seen:
                 continue
             staged.add(key)
             output.append(row)
         return output
+
+    @contextmanager
+    def discovery_inventory(self, scopes: Iterable[tuple[int, str]]) -> Iterator[None]:
+        """Share only committed inventory keys across a short group of league roots."""
+        group = tuple(islice(scopes, DISCOVERY_INVENTORY_SCOPES))
+        getter = getattr(self.writer, "_get_trino_manager", None)
+        if len(group) < 2 or getter is None:
+            yield
+            return
+        pairs = {
+            f"({cid}, {season})"
+            for competition_id, season_key in group
+            for cid in _inventory_sql_values(str(competition_id))
+            for season in _inventory_sql_values(_dedup_key_value(season_key) or "")
+        }
+        previous = self._discovery_inventory
+        self._discovery_inventory = set()
+        try:
+            trino = getter()
+            if trino.table_exists(self.schema, "fotmob_field_inventory"):
+                # The cap bounds memory on older seasons with many historical paths.
+                # A partial result is safe: misses use the ordinary per-scope read.
+                records = trino.execute_query(f"""
+                    SELECT DISTINCT i.competition_id, i.source_season_key, i.json_path, i.disposition
+                    FROM {self.catalog}.{self.schema}.fotmob_field_inventory i
+                    JOIN {self.catalog}.{self.schema}.{MANIFEST_TABLE} m ON m.batch_id = i._target_batch_id
+                    WHERE i.target_type = 'league_season' AND m.parser_version = '{PARSER_VERSION}'
+                      AND m.status IN ('success', 'not_modified')
+                      AND (i.competition_id, i.source_season_key) IN ({", ".join(sorted(pairs))})
+                    LIMIT 16384
+                """)
+                self._discovery_inventory = {
+                    ("league_season", *(_dedup_key_value(v) for v in record))
+                    for record in records
+                }
+        except Exception:
+            # The usual single-scope read still checks storage before any write.
+            logger.warning("FotMob discovery inventory preload failed; using scoped reads", exc_info=True)
+        try:
+            yield
+        finally:
+            self._discovery_inventory = previous
 
     def _seed_scope_keys(
         self,
@@ -1363,11 +1429,7 @@ class FotMobRepository:
             if value is None:
                 conditions.append(f"{qualified_column} IS NULL")
                 continue
-            safe = value.replace("'", "''")
-            variants = {safe}
-            if safe.isdigit():
-                variants.add(f"{safe}.0")  # historical pandas spelling
-            in_list = ", ".join(f"'{v}'" for v in sorted(variants))
+            in_list = ", ".join(_inventory_sql_values(value))
             conditions.append(f"{qualified_column} IN ({in_list})")
         tail_columns = ", ".join(f'i."{column}"' for column in key_columns[3:])
         safe_version = PARSER_VERSION.replace("'", "''")
@@ -2896,6 +2958,33 @@ class FotMobRepository:
             ),
         )
 
+    def competition_discovery_times(self, competition_ids: Iterable[int]) -> dict[int, datetime]:
+        """Read the latest discovery attempt for every candidate in one manifest scan."""
+        ids = {str(int(value)) for value in competition_ids}
+        if not ids:
+            return {}
+        rows = [
+            (row["entity_id"], row.get("completed_at"))
+            for row in self._pending_manifest
+            if row.get("target_type") == "competition_seasons"
+            and row.get("parser_version") == PARSER_VERSION
+            and str(row.get("entity_id")) in ids
+        ]
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is not None:
+            values = ", ".join(f"'{value}'" for value in sorted(ids))
+            statuses = ", ".join(f"'{status.value}'" for status in ManifestStatus)
+            rows.extend(manager_getter().execute_query(
+                f"""
+                SELECT entity_id, MAX(completed_at)
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE target_type = 'competition_seasons' AND entity_id IN ({values})
+                  AND parser_version = '{PARSER_VERSION}' AND status IN ({statuses})
+                GROUP BY entity_id
+                """
+            ))
+        return _latest_discovery_times(rows)
+
     def entity_attempt_rows(
         self, target_type: str, entity_ids: Iterable[str | int]
     ) -> list[dict[str, Any]]:
@@ -3739,6 +3828,16 @@ class MemoryFotMobRepository:
                 microseconds=latest_index + 1
             )
         return view
+
+    def competition_discovery_times(self, competition_ids: Iterable[int]) -> dict[int, datetime]:
+        ids = {str(int(value)) for value in competition_ids}
+        return _latest_discovery_times(
+            (commit.entity_id, commit.completed_at or datetime.min + timedelta(microseconds=index + 1))
+            for index, commit in enumerate(self.commits)
+            if commit.target_type == "competition_seasons"
+            and commit.parser_version == PARSER_VERSION
+            and commit.entity_id in ids
+        )
 
     def entity_attempt_rows(
         self, target_type: str, entity_ids: Iterable[str | int]

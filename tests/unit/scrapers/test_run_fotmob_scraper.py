@@ -2681,6 +2681,10 @@ class TestFotmobNativeRunner:
             },
         }
         repository = MemoryFotMobRepository()
+        single_attempt = MagicMock(wraps=repository.latest_entity_attempt)
+        repository.latest_entity_attempt = single_attempt
+        batch = MagicMock(wraps=repository.competition_discovery_times)
+        repository.competition_discovery_times = batch
         attempted_prefixes = []
 
         def run_once(index, max_requests):
@@ -2721,6 +2725,8 @@ class TestFotmobNativeRunner:
         results = [run_once(1, 5), *(run_once(index, 2) for index in range(2, 6))]
 
         assert attempted_prefixes == [[47], [48], [49], [47], [48]]
+        assert single_attempt.call_count == 0
+        assert batch.call_count == len(results)
         assert results[0][0] == 1  # malformed low-ID root is still a hard failure
         assert repository.latest_entity_attempt("competition_seasons", 47)[
             "status"

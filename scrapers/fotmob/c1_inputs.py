@@ -10,6 +10,7 @@ import hashlib
 import json
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
@@ -337,6 +338,9 @@ def _decoded_pairs(values):
 
 
 MANIFEST_BUCKETS = 64
+MANIFEST_TARGET_TYPES = ("match", "league_season", "competition_profile", "competition_seasons")
+MAX_APPEND_FILES = 256
+MAX_APPEND_ROWS = 50_000
 # Trino crc32(varbinary) returns an unsigned, nonnegative BIGINT. One VARCHAR
 # key avoids tuple/JSON encodings and delimiter ambiguity. NULL and empty keys
 # deliberately share a bucket; routing collisions never establish equality.
@@ -358,7 +362,7 @@ def manifest_changes_sql(old, new, target_type, bucket):
         SELECT * FROM {after} EXCEPT ALL SELECT * FROM {before})"""
 
 
-def manifest_changes(manager, old, new):
+def _compare_manifest_buckets(manager, old, new):
     """Consume at most 512 comparisons plus four bounded-key discoveries.
 
     64 buckets per type bound sequential fan-out independently of competition/
@@ -375,7 +379,7 @@ def manifest_changes(manager, old, new):
     snapshots, without retry or publication; refresh exhausts this iterator
     before any staging or checkpoint writes.
     """
-    for target_type in ("match", "league_season", "competition_profile", "competition_seasons"):
+    for target_type in MANIFEST_TARGET_TYPES:
         predicate = f"target_type={literal(target_type)}"
         before = source_sql(MANIFEST, {MANIFEST: old}, predicate)
         after = source_sql(MANIFEST, {MANIFEST: new}, predicate)
@@ -389,6 +393,74 @@ def manifest_changes(manager, old, new):
                 yield from manager.execute_query(
                     manifest_changes_sql(left, right, target_type, bucket)
                 )
+
+
+def _appended_manifest_rows(manager, old, new):
+    """Return exact additions on a short append-only ancestry, or None to compare.
+
+    Snapshot IDs are opaque. Walk parent links, then corroborate the per-snapshot
+    file inventory and each file's row count before returning any changes.
+    Maintenance can replace files while we read live metadata; a missing file
+    always sends us back to the full comparison of the two pinned snapshots.
+    """
+    history = manager.execute_query(
+        f"SELECT snapshot_id, parent_id, operation, "
+        f"try_cast(element_at(summary, 'added-data-files') AS bigint) "
+        f'FROM {PREFIX}"{MANIFEST}$snapshots" ORDER BY committed_at DESC LIMIT 1024'
+    )
+    ancestry = {sid: (parent, operation, added) for sid, parent, operation, added in history}
+    if old not in ancestry:
+        return None
+    files_per_snapshot = {}
+    snapshot = new
+    while snapshot != old:
+        if snapshot not in ancestry or snapshot in files_per_snapshot:
+            return None
+        parent, operation, added = ancestry[snapshot]
+        if operation != "append" or added is None or added < 1:
+            return None
+        files_per_snapshot[snapshot] = added
+        snapshot = parent
+    file_count = sum(files_per_snapshot.values())
+    if not file_count or file_count > MAX_APPEND_FILES:
+        return None
+
+    versions = ", ".join(str(int(sid)) for sid in sorted(files_per_snapshot))
+    files = list(manager.execute_query(
+        f'SELECT added_snapshot_id, file_path, record_count FROM {PREFIX}"{MANIFEST}$files" '
+        f"WHERE content = 0 AND added_snapshot_id IN ({versions}) LIMIT {file_count + 1}"
+    ))
+    if Counter(sid for sid, _, _ in files) != files_per_snapshot:
+        return None
+    counts = {path: count for _, path, count in files}
+    if len(counts) != file_count or None in counts or any(
+        count is None or count < 0 for count in counts.values()
+    ):
+        return None
+    row_count = sum(counts.values())
+    if row_count > MAX_APPEND_ROWS:
+        return None
+    paths = ", ".join(literal(path) for path in sorted(counts))
+    rows = manager.execute_query(
+        f'SELECT "$path", competition_id, source_season_key, target_type, entity_id '
+        f'FROM {PREFIX}{MANIFEST} FOR VERSION AS OF {int(new)} '
+        f'WHERE "$path" IN ({paths}) LIMIT {row_count + 1}'
+    )
+    observed = Counter()
+    changes = []
+    for path, competition, season, target_type, entity in rows:
+        observed[path] += 1
+        if target_type in MANIFEST_TARGET_TYPES:
+            changes.append((competition, season, target_type, entity))
+    return changes if observed == Counter(counts) else None
+
+
+def manifest_changes(manager, old, new):
+    appended = _appended_manifest_rows(manager, old, new)
+    if appended is None:
+        yield from _compare_manifest_buckets(manager, old, new)
+    else:
+        yield from appended
 
 
 def merge_sql(stage):

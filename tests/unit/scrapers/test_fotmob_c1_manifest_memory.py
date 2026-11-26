@@ -123,6 +123,8 @@ class ManifestManager:
     def execute_query(self, sql):
         assert not self.pending, "next statement submitted before consuming the batch"
         self.queries.append(sql)
+        if '$snapshots"' in sql:
+            return []  # Exercise the exact multiset comparison fallback.
         normalized = re.sub(r"\s+", " ", sql).strip()
         selections = SOURCE.findall(normalized)
         structure = SOURCE.sub("<source>", normalized)
@@ -243,14 +245,14 @@ def test_equal_rewrite_uses_only_occupied_buckets():
     assert len(manager.discoveries) == 4
     # Every synthetic row shares target_key, despite different pair identities.
     assert len(manager.batches) == 8
-    assert len(manager.queries) == 12
+    assert len(manager.queries) == 13
     assert manager.completed == manager.batches
 
 
 def test_empty_snapshots_only_discover_buckets():
     manager = ManifestManager([], [])
     assert list(c1.manifest_changes(manager, OLD, NEW)) == []
-    assert len(manager.queries) == 4
+    assert len(manager.queries) == 5
     assert manager.batches == []
 
 
@@ -273,7 +275,7 @@ def test_comparison_iterator_does_not_prefetch_batches():
     assert manager.queries == []
 
     first = next(changes)
-    assert len(manager.queries) == 2  # one discovery and one heavy query
+    assert len(manager.queries) == 3  # ancestry, one discovery and one comparison
     assert len(manager.batches) == 1
     assert manager.completed == []
     assert manager.pending
@@ -472,7 +474,7 @@ def test_refresh_missing_snapshot_fails_closed(monkeypatch, expired):
 
     assert manager.writes == []
     assert manager.batches == []
-    assert len(manager.queries) == 2  # checkpoint read, then failed discovery
+    assert len(manager.queries) == 3  # checkpoint read, ancestry and failed discovery
 
 
 def test_refresh_equal_snapshot_ids_skip_manifest_work(monkeypatch):

@@ -71,6 +71,10 @@ class ScopeAttemptState:
     def identity(self) -> tuple[int, str]:
         return self.competition_id, self.source_season_key
 
+    @property
+    def awaiting_source_calendar(self) -> bool:
+        return self.reason == "source_calendar_unavailable" and self.outcome in {"retryable", "deferred"}
+
 
 SCOPE_PLAN_SIGNATURE_VERSION = "fotmob-scope-plan-v1"
 
@@ -414,15 +418,22 @@ def _plan_seasons(
         and explicit_scopes is None
         and candidates
     ):
+        # A due metadata-only calendar must be retried, but it cannot advance
+        # the history wave on its own while an older cycle still has work.
+        cycle_candidates = [
+            (season, attempt)
+            for season, attempt in candidates
+            if attempt is None or not attempt.awaiting_source_calendar
+        ]
         newest_cycle = max(
             _history_season_cycle_key(season.source_season_key)
-            for season, _ in candidates
+            for season, _ in (cycle_candidates or candidates)
         )
         candidates = [
             (season, attempt)
             for season, attempt in candidates
             if season.identity in refresh
-            or _history_season_cycle_key(season.source_season_key) == newest_cycle
+            or _history_season_cycle_key(season.source_season_key) >= newest_cycle
         ]
 
     output: list[SeasonWorkItem] = []
@@ -483,9 +494,9 @@ def plan_seasons(
     plan. Current and history lanes are disjoint. Within a selected cycle, a
     durable retry that is not due is skipped without blocking later ready work.
     Automatic BACKFILL + HISTORY planning selects its newest unfinished cycle
-    among runnable scopes: a scope waiting for its retry or terminal cooldown
-    keeps its own schedule but does not block older cycles. Exact season strings pass through
-    unchanged and no hardcoded competition cohort affects order.
+    among runnable scopes. Due retries of previously unavailable calendars
+    in newer cycles join that work. When only calendar retries remain, the
+    newest runnable cycle is retried. Exact season strings pass through unchanged.
 
     ``scope_debt`` (played matches without details per scope) is the first
     order key after the lane rank. Without it the order is the previous one.

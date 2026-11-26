@@ -61,6 +61,7 @@ from .planner import (
     utc_run_id,
 )
 from .repository import (
+    DISCOVERY_INVENTORY_SCOPES,
     PARSER_VERSION,
     stable_json,
     SCOPE_OBSERVATIONS_TABLE,
@@ -106,11 +107,54 @@ def _failure_status(exc: BaseException) -> ManifestStatus:
     return ManifestStatus.SCHEMA_DRIFT
 
 
+def _is_stats_links_only(payload: Mapping[str, Any], overview: Mapping[str, Any]) -> bool:
+    """The retained stats tab for 221=2020 holds links, not statistic rows."""
+    stats = payload.get("stats")
+    if not isinstance(stats, Mapping) or set(stats) != {
+        "players", "teams", "seasonStatLinks", "seasonsWithLinks",
+    }:
+        return False
+    links = stats["seasonStatLinks"]
+    if not isinstance(links, list) or not links:
+        return False
+    link_types = {
+        "Name": str, "CountryCode": str, "RelativePath": str, "League": str,
+        "StageId": int, "TemplateId": int, "TournamentId": int,
+    }
+    for link in links:
+        if not isinstance(link, Mapping) or link.keys() != link_types.keys():
+            return False
+        if any(type(link[key]) is not kind for key, kind in link_types.items()):
+            return False
+        if not link["Name"] or not link["RelativePath"]:
+            return False
+    previews = overview.get("topPlayers")
+    if not isinstance(previews, Mapping) or set(previews) != {"byRating", "byGoals", "byAssists", "seeAllUrl"}:
+        return False
+    for section in ("byRating", "byGoals", "byAssists"):
+        preview = previews[section]
+        if not isinstance(preview, Mapping) or set(preview) != {"seeAllLink"}:
+            return False
+        if not isinstance(preview["seeAllLink"], str) or not preview["seeAllLink"]:
+            return False
+    return (
+        stats["players"] is None and stats["teams"] is None
+        and stats["seasonsWithLinks"] == [link["Name"] for link in links]
+        and set(overview) == {
+            "season", "selectedSeason", "table", "topPlayers", "hasTotw", "hasOngoingMatch", "shotMap", "matches",
+        }
+        and overview["table"] is None and overview["shotMap"] is None
+        and overview["hasTotw"] is False and overview["hasOngoingMatch"] is False
+        and previews["seeAllUrl"] == "stats"
+        and payload.get("transfers") is None and payload.get("seasons") == []
+    )
+
+
 def _is_calendar_unavailable_stub(payload: Mapping[str, Any]) -> bool:
     """Recognize the retained metadata-only source page, never an empty list.
 
     This shape was observed for six included competitions before #1288 and
-    with only the seasons tab for the historical Super Cup page in #1812.
+    with only a seasons tab (#1812) or an index of stats links (221=2020).
     Extra calendar fields and malformed explicit lists remain schema drift.
     Caller must still validate all JSON paths and protect committed matches.
     """
@@ -127,10 +171,12 @@ def _is_calendar_unavailable_stub(payload: Mapping[str, Any]) -> bool:
         and isinstance(overview_matches, Mapping)
         and set(overview_matches) == {"hasOngoingMatch"}
         and overview_matches["hasOngoingMatch"] is False
-        and payload.get("tabs") in ([], ["seasons"])
         and payload.get("table") is None
-        and payload.get("stats") == {}
         and payload.get("playoff") is None
+        and (
+            (payload.get("tabs") in ([], ["seasons"]) and payload.get("stats") == {})
+            or (payload.get("tabs") == ["stats"] and _is_stats_links_only(payload, overview))
+        )
     )
 
 
@@ -1905,6 +1951,30 @@ class FotMobIngestService:
                 if item.decision == ScopeDecision.INCLUDED
             }
         fetched.update(reusable)
+        preload = getattr(self.repository, "discovery_inventory", None)
+        if preload is None:
+            return self._discover_fetched_group(classifications, fetched)
+        output: list[CompetitionDiscoveryResult] = []
+        for offset in range(0, len(classifications), DISCOVERY_INVENTORY_SCOPES):
+            group = classifications[offset : offset + DISCOVERY_INVENTORY_SCOPES]
+            scopes = []
+            # Hints cover only the declared season. Discovery still validates each payload.
+            for item in group:
+                cid = item.competition.competition_id
+                value = fetched.get(str(cid))
+                if not isinstance(value, FetchResult) or not value.ok or not isinstance(value.data, Mapping):
+                    continue
+                details = value.data.get("details")
+                season = details.get("selectedSeason") if isinstance(details, Mapping) else None
+                if type(season) is int or (isinstance(season, str) and season):
+                    scopes.append((cid, str(season)))
+            with preload(scopes):
+                output.extend(self._discover_fetched_group(group, fetched))
+        return output
+
+    def _discover_fetched_group(
+        self, classifications: Sequence[ScopeClassification], fetched: Mapping[str, FetchResult | Exception],
+    ) -> list[CompetitionDiscoveryResult]:
         output: list[CompetitionDiscoveryResult] = []
         for item in classifications:
             if item.decision != ScopeDecision.INCLUDED:
@@ -1950,6 +2020,7 @@ class FotMobIngestService:
         source_season_key: str,
         *,
         prefetched: Optional[FetchResult] = None,
+        revalidate_unavailable: bool = False,
     ) -> tuple[OperationResult, Optional[SeasonBundle]]:
         """Fetch, parse and persist one season family."""
 
@@ -1958,6 +2029,7 @@ class FotMobIngestService:
             source_season_key,
             prefetched=prefetched,
             persist=True,
+            revalidate_unavailable=revalidate_unavailable,
         )
 
     def read_season_dependency(
@@ -1966,6 +2038,7 @@ class FotMobIngestService:
         source_season_key: str,
         *,
         prefetched: Optional[FetchResult] = None,
+        revalidate_unavailable: bool = False,
     ) -> tuple[OperationResult, Optional[SeasonBundle]]:
         """Parse a bundle for child families without reopening season debt."""
 
@@ -1974,6 +2047,7 @@ class FotMobIngestService:
             source_season_key,
             prefetched=prefetched,
             persist=False,
+            revalidate_unavailable=revalidate_unavailable,
         )
 
     def _season_bundle(
@@ -1983,6 +2057,8 @@ class FotMobIngestService:
         *,
         prefetched: Optional[FetchResult],
         persist: bool,
+        revalidate_unavailable: bool = False,
+        revalidate_from: Optional[str] = None,
     ) -> tuple[OperationResult, Optional[SeasonBundle]]:
         result = OperationResult(
             "season_bundle" if persist else "season_bundle_dependency",
@@ -2000,9 +2076,9 @@ class FotMobIngestService:
         prefetched_source_url: Optional[str] = None
         replay_existing = False
         try:
+            previous = self.repository.latest_success(exact.target_key)
             if prefetched is None:
-                previous = self.repository.latest_success(exact.target_key)
-                replay_existing = previous is not None and self.mode == RunMode.BACKFILL
+                replay_existing = previous is not None and self.mode == RunMode.BACKFILL and not revalidate_from
                 if previous is not None and (replay_existing or self.mode == RunMode.REPLAY):
                     fetch = self.transport.replay_target_key(exact.target_key, observation=previous)
                     self._account(fetch)
@@ -2036,8 +2112,16 @@ class FotMobIngestService:
         except Exception as exc:
             result.record_exception(f"season fetch: {type(exc).__name__}: {exc}", exc)
             return result, None
+        if revalidate_from:
+            result.metadata["calendar_revalidation"] = {
+                "previous_content_hash": revalidate_from, "http_status": fetch.http_status,
+                "stale": fetch.stale, "outcome": fetch.status,
+            }
+            if fetch.stale:
+                result.retryable.append("calendar revalidation returned stale raw")
+                return result, None
         if not fetch.ok:
-            if persist:
+            if persist and not revalidate_from:
                 self._commit_for_fetch(
                     fetch,
                     target_type="league_season",
@@ -2054,6 +2138,7 @@ class FotMobIngestService:
                     validate_selected_season(fetch.data, str(source_season_key))
                 except SelectedSeasonMismatch as exc:
                     result.metadata["raw_replay_fallback"] = {"error": str(exc)}
+                    replay_existing = False
                     fetch = self._fetch(exact.canonical_url)
                     if not fetch.ok:
                         self._record_failure(result, fetch.url, fetch)
@@ -2073,10 +2158,7 @@ class FotMobIngestService:
                     return result, None
                 if known_matches:
                     raise
-                reason = f"source_calendar_unavailable: {competition_id}={source_season_key}; source publishes season metadata only"
-                result.retryable.append(reason)
-                result.metadata["calendar_available"] = False
-                result.metadata["calendar_unavailability"] = {
+                evidence = {
                     "reason": "source_calendar_unavailable",
                     "url": fetch.url,
                     "target_key": fetch.target_key,
@@ -2087,6 +2169,25 @@ class FotMobIngestService:
                     "cache_hit": fetch.cache_hit,
                     "stale": fetch.stale,
                 }
+                if revalidate_unavailable and replay_existing and fetch.content_hash:
+                    # Only an admitted, due retry may revalidate this archived stub.
+                    checked, recovered = self._season_bundle(
+                        competition_id, source_season_key, prefetched=None, persist=True,
+                        revalidate_from=fetch.content_hash,
+                    )
+                    revalidation = checked.metadata.get("calendar_revalidation", {})
+                    if checked.retryable and (
+                        revalidation.get("stale")
+                        or revalidation.get("outcome") in {FetchOutcome.RETRYABLE_FAILURE.value, FetchOutcome.NOT_AVAILABLE.value}
+                    ):
+                        # A failed request leaves the last calendar evidence and
+                        # its retry schedule intact. Keep the new outcome separate.
+                        checked.metadata.setdefault("calendar_unavailability", evidence)
+                    return checked, recovered
+                reason = f"source_calendar_unavailable: {competition_id}={source_season_key}; source publishes season metadata only"
+                result.retryable.append(reason)
+                result.metadata["calendar_available"] = False
+                result.metadata["calendar_unavailability"] = evidence
                 if persist:
                     self._commit_for_fetch(
                         fetch,
@@ -2179,6 +2280,17 @@ class FotMobIngestService:
                 ),
             ]
             paths = []
+            # A campaign that covered an absent calendar could not cover
+            # matches that appeared later. Carry the proof through restarts
+            # and byte-identical season writes, without changing batch identity.
+            old_capabilities = (previous or {}).get("capabilities_json") or {}
+            if isinstance(old_capabilities, str):
+                old_capabilities = json.loads(old_capabilities)
+            recovered_from = revalidate_from or old_capabilities.get("calendar_recovered_from")
+            capabilities = dict(bundle.capabilities)
+            if recovered_from:
+                capabilities["calendar_recovered_from"] = recovered_from
+                result.metadata["calendar_recovered_from"] = recovered_from
             if persist:
                 paths = self._commit_for_fetch(
                     fetch,
@@ -2198,7 +2310,7 @@ class FotMobIngestService:
                             + int(bundle.capabilities.get("team_category_count", 0))
                         ),
                     },
-                    capabilities=bundle.capabilities,
+                    capabilities=capabilities,
                     unknown_paths=unknown,
                 )
             result.tables.extend(paths)
