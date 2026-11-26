@@ -52,8 +52,10 @@ Never point this stage at a fetch DAG or the proxy filter.
 
 1. Create two isolated, empty, schema-identical Trino schemas and one
    disposable control database containing the two replay runs. Pre-seed the same outside-cohort match
-   sentinel in all 12 tables: three generic tables, eight typed match tables,
-   and dataset availability.
+   sentinel in all 13 tables, including the three generic tables, nine typed
+   match tables and dataset availability. Typed parser v8 adds
+   `fbref_match_meta`. To reproduce an archived v7 comparison, use the
+   recorded revision and its original 12-table baseline.
 2. Capture Iceberg snapshot IDs and sentinel digests before either replay:
 
    ```bash
@@ -80,7 +82,7 @@ Never point this stage at a fetch DAG or the proxy filter.
 5. Run the strict persistence evidence tool with both control run IDs. It must
    use dynamic installed columns, excluding only `_ingested_at` and
    `persisted_at`, and execute `EXCEPT ALL` in both directions for every one of
-   the 12 tables.
+   the 13 tables.
 
    ```bash
    /root/.venvs/dpf-test/bin/python scripts/research/bench_fbref_persistence.py \

@@ -13,7 +13,12 @@ from zoneinfo import ZoneInfo
 
 from urllib.parse import urlparse
 from scrapers.fbref.report_observations import played_score
-from scrapers.fbref.policy import CURRENT_ENRICHMENT, PUBLICATION_FRESHNESS_PAGE_KINDS
+from scrapers.fbref.policy import (
+    CURRENT_ENRICHMENT,
+    PUBLICATION_FRESHNESS_PAGE_KINDS,
+    RESTRICTED_DATA_REVIEW_INTERVAL,
+    SEASON_ROUTE_REVIEW_DATES,
+)
 
 REPORT_VERSION = "fbref-daily-v1"
 EXCLUDED_IDS = {"Big5", "850", "851", "852", "853"}
@@ -482,6 +487,15 @@ def build_daily_report(snapshot: Mapping, *, day: date, as_of: datetime,
         "match_to_first_fetch": _stats(fetch_lags), "match_to_bronze": _stats(bronze_lags),
         "competitions": by_competition, "matches": sorted(entries, key=lambda r: (r["competition_id"], r["match_id"] or "")),
         "page_ages": page_age_metrics(snapshot, as_of),
+        "season_route_reviews": {
+            route: {
+                "observed_on": observed.isoformat(),
+                "review_after": (observed + RESTRICTED_DATA_REVIEW_INTERVAL).isoformat(),
+                "review_due": as_of.date() >= observed + RESTRICTED_DATA_REVIEW_INTERVAL,
+            }
+            for route, observed in SEASON_ROUTE_REVIEW_DATES.items()
+            if observed <= as_of.date()
+        },
         "violators": [r for r in entries if r["status"] == "late"],
     }
 
@@ -562,4 +576,12 @@ def render_markdown(report: Mapping) -> str:
     output += ["", "## Ограничения доказательств", ""]
     for problem in [*report["scope_gaps"], *report["fotmob_problems"], *report["errors"]]:
         output.append(f"- {problem}")
+    reviews = report.get("season_route_reviews", {})
+    if reviews:
+        output.extend(["", "## Доступность сезонной статистики", "",
+                       "| Раздел | Проверен | Следующая проверка | Статус |",
+                       "| --- | --- | --- | --- |"])
+        for route, entry in sorted(reviews.items()):
+            status = "Пора проверить" if entry["review_due"] else "В пределах срока"
+            output.append(f"| {route} | {entry['observed_on']} | {entry['review_after']} | {status} |")
     return "\n".join(output) + "\n"

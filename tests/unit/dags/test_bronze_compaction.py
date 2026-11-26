@@ -175,12 +175,12 @@ def test_deadline_stop_and_window():
 
 
 def test_physical_writer_contracts_and_omitted_tables():
-    from scrapers.fbref.typed_bronze import MATCH_DATASET_TABLES, SEASON_DATASET_TABLES
+    from scrapers.fbref.typed_bronze import MATCH_DATASET_TABLES, SEASON_DATASET_TABLES, SQUAD_ROSTER_TABLE
     from scrapers.espn.bronze_schema import TABLES
 
     assert set(MATCH_DATASET_TABLES.values()) | set(
         SEASON_DATASET_TABLES.values()
-    ) <= set(compaction.FBREF_TABLES)
+    ) | {SQUAD_ROSTER_TABLE} <= set(compaction.FBREF_TABLES)
     assert set(TABLES) == set(compaction.ESPN_TABLES)
     assert "fbref_schedule" in compaction.BRONZE_COMPACTION_TABLES
     assert "sofascore_schedule" in compaction.BRONZE_COMPACTION_TABLES

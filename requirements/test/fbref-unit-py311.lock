@@ -1,5 +1,5 @@
 # fbref-unit-py311: Linux x86_64 CPython 3.11 wheel lock
-# Full direct + transitive closure from successful CI run 37644381187, job unit.
+# Base from CI run 37644381187, job unit. SQL wheels match sofascore-unit-py311.
 # Update and preparation: requirements/test/README.md
 attrs==26.1.0 --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
 beautifulsoup4==4.15.0 --hash=sha256:d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9
@@ -7,6 +7,7 @@ boto3==1.42.61 --hash=sha256:156efcc298a33206be6dfd220815c64aa8b09424017534cabe7
 botocore==1.42.97 --hash=sha256:77d2c8ce1bc592d3fbd7c01c35836f4a5b0cac2ca03ccdf6ffc60faa16b5fadc
 certifi==2026.7.22 --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
 charset-normalizer==3.5.2 --hash=sha256:211d5a3eb6af8f513b8d4ca19a8c1b7accab1b5f0d3175f9826b03c1a920dc1f
+duckdb==1.5.4 --hash=sha256:ccc7f2694d02b4763fee61021d45e12f7bc5743993686563957df0cef799fbae
 idna==3.20 --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
 iniconfig==2.3.1 --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
 jinja2==3.1.6 --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
@@ -40,6 +41,7 @@ ruff==0.15.20 --hash=sha256:309809086c2acb67624950a3c8133e80f32d0d3e27106c0cd60f
 s3transfer==0.16.1 --hash=sha256:61bcd00ccb83b21a0fe7e91a553fff9729d46c83b4e0106e7c314a733891f7c2
 six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
 soupsieve==2.10 --hash=sha256:8596eb8967d744174820280fa62b4542a2e955bfaccca73ed8a13c6eb8e9b502
+sqlglot==30.12.0 --hash=sha256:86cccc610073c645c03e72b55b60ae0518aa3253a7fc3bd56551370d003c6554
 tenacity==9.2.1 --hash=sha256:9e56f17539296baab7beabb08b92f6ee3d7be92d8be72d763360677c2ad6580e
 trino==0.340.0 --hash=sha256:908aa292d7216e79370581f1fb089e8052d08a5f48e839c6f6713a4fa2998e1c
 typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

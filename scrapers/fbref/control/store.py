@@ -6778,20 +6778,13 @@ class ControlStore:
         if not 1 <= normalized_limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
         from scrapers.fbref.policy import (
+            MATCH_TYPED_MANIFESTS,
             PAGE_DOCUMENT_VERSION,
+            SQUAD_NON_ROSTER_PATH,
             TYPED_BRONZE_PARSER_VERSION,
         )
 
-        match_datasets = [
-            "typed:shot_events",
-            "typed:match_events",
-            "typed:lineups",
-            "typed:match_team_stats",
-            "typed:match_managers",
-            "typed:match_officials",
-            "typed:match_keeper_stats",
-            "typed:match_player_stats",
-        ]
+        match_datasets = sorted(MATCH_TYPED_MANIFESTS)
         with self._transaction() as cursor:
             cursor.execute(
                 _FRONTIER_SCOPE_CTE
@@ -6831,7 +6824,7 @@ class ControlStore:
                     SELECT latest.target_id,
                            count(DISTINCT manifest.dataset) FILTER (
                              WHERE manifest.dataset = ANY(%s::text[])
-                           ) AS dataset_count,
+                           ) = %s AS all_datasets,
                            bool_and(
                              manifest.parse_status = 'succeeded'
                              AND manifest.persistence_status IN (
@@ -6897,13 +6890,13 @@ class ControlStore:
                               AND page_evidence.all_empty
                                THEN 'empty_player'
                              WHEN frontier.page_kind = 'match'
-                              AND match_evidence.dataset_count = 8
+                              AND match_evidence.all_datasets
                               AND match_evidence.all_safe
                               AND match_evidence.completed
                               AND match_evidence.player_stats_populated
                                THEN 'full_match'
                              WHEN frontier.page_kind = 'match'
-                              AND match_evidence.dataset_count = 8
+                              AND match_evidence.all_datasets
                               AND match_evidence.all_safe
                               AND match_evidence.completed
                               AND match_evidence.player_stats_sparse
@@ -6924,13 +6917,13 @@ class ControlStore:
                                   AND page_evidence.all_empty
                                    THEN 'empty_player'
                                  WHEN frontier.page_kind = 'match'
-                                  AND match_evidence.dataset_count = 8
+                                  AND match_evidence.all_datasets
                                   AND match_evidence.all_safe
                                   AND match_evidence.completed
                                   AND match_evidence.player_stats_populated
                                    THEN 'full_match'
                                  WHEN frontier.page_kind = 'match'
-                                  AND match_evidence.dataset_count = 8
+                                  AND match_evidence.all_datasets
                                   AND match_evidence.all_safe
                                   AND match_evidence.completed
                                   AND match_evidence.player_stats_sparse
@@ -6977,6 +6970,10 @@ class ControlStore:
                     LEFT JOIN match_evidence
                       ON match_evidence.target_id = frontier.target_id
                     WHERE frontier.source = 'fbref'
+                      AND (
+                        frontier.page_kind <> 'squad'
+                        OR split_part(split_part(frontier.canonical_url, '?', 1), '#', 1) !~ %s
+                      )
                       AND (
                         frontier.state IN ('queued', 'fetched')
                         OR (
@@ -7099,11 +7096,13 @@ class ControlStore:
                 (
                     PAGE_DOCUMENT_VERSION,
                     match_datasets,
+                    len(match_datasets),
                     match_datasets,
                     match_datasets,
                     TYPED_BRONZE_PARSER_VERSION,
                     normalized_scope,
                     normalized_scope,
+                    SQUAD_NON_ROSTER_PATH,
                     normalized_scope,
                     normalized_scope,
                     normalized_scope,
@@ -9380,6 +9379,7 @@ class ControlStore:
 
         from scrapers.fbref.policy import (
             DISCOVERY_PARSER_VERSION,
+            MATCH_TYPED_MANIFESTS,
             PAGE_DOCUMENT_VERSION,
             TYPED_BRONZE_PARSER_VERSION,
         )
@@ -9566,16 +9566,7 @@ class ControlStore:
             datasets_by_target.setdefault(dataset["target_id"], []).append(
                 dataset
             )
-        required_match_datasets = {
-            "typed:shot_events",
-            "typed:match_events",
-            "typed:lineups",
-            "typed:match_team_stats",
-            "typed:match_managers",
-            "typed:match_officials",
-            "typed:match_keeper_stats",
-            "typed:match_player_stats",
-        }
+        required_match_datasets = MATCH_TYPED_MANIFESTS
         explicit_empty = {"empty", "restricted", "not_applicable"}
         for target in targets:
             manifests = datasets_by_target.get(target["target_id"], [])

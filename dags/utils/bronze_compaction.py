@@ -23,6 +23,8 @@ MAX_INPUT_BYTES = 8 * 1024**3
 # legacy FotMob/ESPN relations and ClubElo historical are intentionally absent.
 FBREF_TABLES = (
     "fbref_schedule",
+    "fbref_standings",
+    "fbref_squad_roster",
     "fbref_target_scope",
     "fbref_page_manifest",
     "fbref_table_inventory",
@@ -35,6 +37,7 @@ FBREF_TABLES = (
     "fbref_match_managers",
     "fbref_match_officials",
     "fbref_match_keeper_stats",
+    "fbref_match_meta",
     "fbref_match_player_stats",
     *(
         f"fbref_{entity}_{dataset}"

@@ -9,17 +9,24 @@ import os
 import re
 import sys
 import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from scrapers.base.trino_manager import TrinoTableManager
 from scrapers.fbref.constants import UNAVAILABLE_SEASON_STAT_ROUTES
 from scrapers.fbref.control import ControlStore
+from scrapers.fbref.policy import (
+    PAGE_DOCUMENT_VERSION,
+    RESTRICTED_DATA_REVIEW_INTERVAL,
+    SEASON_ROUTE_REVIEW_DATES,
+)
 from scrapers.fbref.typed_bronze import (
     MATCH_AVAILABILITY_TABLE,
     MATCH_DATASET_TABLES,
     SEASON_DATASET_TABLES,
     SEASON_ROUTE_DATASETS,
+    SQUAD_ROSTER_TABLE,
 )
 
 
@@ -33,6 +40,153 @@ _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _LIVE_REQUEST_LIMIT = 100
 _LIVE_BYTE_LIMIT = 50 * 1024 * 1024
 
+# The isolated acceptance image ships scripts, but does not ship docs. Its two
+# executable queries also appear in the DataGrip companions, checked in tests.
+PAGE_RECEIPTS_SQL = """
+WITH selected_run AS (
+    SELECT run_id,
+           CASE WHEN run_type <> 'replay' THEN run_id
+                WHEN metadata -> 'raw_audit' ->> 'audited_control_run_id'
+                     ~* '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+                THEN (metadata -> 'raw_audit' ->> 'audited_control_run_id')::uuid
+           END AS evidence_run_id
+    FROM fbref_control.crawl_run WHERE run_id = CAST(:control_run_id AS uuid)
+), pages AS (
+    SELECT target.target_id, target.logical_refresh_id, run_fetch.content_hash,
+           frontier.source_ids ->> 'competition_id' AS competition_id,
+           frontier.source_ids ->> 'season_id' AS season_id,
+           CASE frontier.page_kind WHEN 'match' THEN 'match_meta'
+                WHEN 'squad' THEN 'squad_roster' ELSE 'standings' END AS dataset,
+           CASE WHEN frontier.page_kind = 'squad' THEN
+                    scope.is_complete AND NOT scope.pending AND scope.gender_classified
+                    AND scope.gender_class = 'male' AND NOT scope.competition_missing
+                    AND NOT scope.has_unknown AND NOT scope.has_female
+                    AND NOT scope.inactive_competition AND NOT scope.invalid_season
+                    AND (scope.has_current_ownership OR frontier.refresh_policy = 'historical_once')
+                    AND jsonb_array_length(scope.scopes) > 0
+                    AND NOT EXISTS (SELECT 1 FROM fbref_control.page_scope_registry_dirty)
+                ELSE competition.gender = 'male' AND competition.crawl_state = 'active'
+                    AND competition.lifecycle_state IN ('present', 'missing_once') AND competition.present
+                    AND season.lifecycle_state = 'present' AND season.present
+                    AND (frontier.page_kind <> 'match'
+                         OR target.target_id = 'fbref:match:' || (frontier.source_ids ->> 'match_id'))
+           END AS scope_ok
+    FROM selected_run
+    JOIN fbref_control.run_target target ON target.run_id = selected_run.evidence_run_id
+    JOIN fbref_control.page_frontier frontier ON frontier.target_id = target.target_id
+    JOIN LATERAL (
+        SELECT attempt.content_hash FROM fbref_control.fetch_attempt attempt
+        WHERE attempt.run_id = target.run_id AND attempt.target_id = target.target_id
+          AND attempt.logical_refresh_id = target.logical_refresh_id
+          AND attempt.status = 'succeeded' AND attempt.raw_manifest_key IS NOT NULL
+          AND attempt.content_hash IS NOT NULL
+        ORDER BY COALESCE(attempt.finished_at, attempt.heartbeat_at) DESC,
+                 attempt.attempt_number DESC LIMIT 1
+    ) run_fetch ON true
+    LEFT JOIN fbref_control.page_scope_summary scope ON scope.target_id = target.target_id
+    LEFT JOIN fbref_control.competition_registry competition ON competition.source = frontier.source
+         AND competition.competition_id = frontier.source_ids ->> 'competition_id'
+    LEFT JOIN fbref_control.season_alias alias ON alias.source = competition.source
+         AND alias.competition_id = competition.competition_id AND alias.alias = frontier.source_ids ->> 'season_id'
+    LEFT JOIN fbref_control.season_registry season ON season.source = competition.source
+         AND season.competition_id = competition.competition_id
+         AND season.season_id = COALESCE(alias.season_id, frontier.source_ids ->> 'season_id')
+    WHERE frontier.source = 'fbref' AND (
+        frontier.page_kind IN ('match', 'season', 'standings')
+        OR (frontier.page_kind = 'squad' AND split_part(split_part(frontier.canonical_url, '?', 1), '#', 1)
+            !~ '/+squads/+[^/]+/+(?:[^/]+/+)*(?:matchlogs|goallogs|history|wages)(?:/|$)')
+    )
+), receipts AS (
+    SELECT pages.dataset, pages.target_id, pages.content_hash, pages.competition_id, pages.season_id,
+           manifest.row_count AS expected_rows,
+           COALESCE(pages.scope_ok AND observation.status = 'succeeded'
+               AND observation.generic_status = 'succeeded' AND observation.typed_status = 'succeeded'
+               AND observation.validation_status = 'succeeded' AND completion.dataset IS NOT NULL
+               AND manifest.parse_status = 'succeeded' AND manifest.validation_status = 'succeeded'
+               AND ((manifest.availability = 'available' AND manifest.persistence_status = 'succeeded'
+                    AND manifest.row_count > 0 AND (pages.dataset <> 'match_meta' OR manifest.row_count = 1))
+                    OR (manifest.availability IN ('empty', 'restricted', 'not_applicable')
+                        AND manifest.persistence_status IN ('succeeded', 'skipped') AND manifest.row_count = 0
+                        AND (pages.dataset <> 'match_meta' OR completion.error_message IS DISTINCT FROM 'scored_match_requires_rows')
+                        AND NULLIF(btrim(manifest.error_message), '') IS NOT NULL)), false) AS ready
+    FROM pages
+    LEFT JOIN fbref_control.observation_processing observation
+      ON observation.logical_refresh_id = pages.logical_refresh_id AND observation.target_id = pages.target_id
+     AND observation.content_hash = pages.content_hash AND observation.parser_version = 'fbref-page-document-v6'
+     AND observation.typed_parser_version = 'fbref-typed-bronze-v8'
+     AND observation.stateful_parser_version = 'fbref-discovery-parser-v6'
+    LEFT JOIN fbref_control.dataset_manifest completion ON completion.target_id = pages.target_id
+     AND completion.content_hash = pages.content_hash AND completion.parser_version = observation.typed_parser_version
+     AND completion.dataset = 'typed:__complete__' AND completion.parse_status = 'succeeded'
+     AND completion.persistence_status = 'succeeded' AND completion.validation_status = 'succeeded'
+    LEFT JOIN fbref_control.dataset_manifest manifest ON manifest.target_id = pages.target_id
+     AND manifest.content_hash = pages.content_hash AND manifest.parser_version = observation.typed_parser_version
+     AND manifest.dataset = 'typed:' || pages.dataset
+)
+SELECT jsonb_build_object(
+    'control_run_id', run_id, 'evidence_run_id', evidence_run_id,
+    'generic_parser_version', 'fbref-page-document-v6', 'typed_parser_version', 'fbref-typed-bronze-v8',
+    'receipts', COALESCE((SELECT jsonb_agg(to_jsonb(receipts) ORDER BY dataset, target_id) FROM receipts), '[]'::jsonb)
+) AS control_page_receipts_json
+FROM selected_run WHERE evidence_run_id IS NOT NULL
+"""
+
+PAGE_DATASET_KEYS = {
+    "match_meta": "'fbref:match:' || match_id",
+    "standings": "source_target_id",
+    "squad_roster": "source_target_id",
+}
+
+PAGE_READBACK_SQL = """
+WITH args AS (
+    SELECT CAST(:control_run_id AS varchar) AS run_id,
+           json_parse(CAST(:control_page_receipts_json AS varchar)) AS envelope,
+           '%s' AS dataset
+), expected AS (
+    SELECT json_extract_scalar(item, '$.target_id') AS target_id,
+           json_extract_scalar(item, '$.content_hash') AS content_hash,
+           json_extract_scalar(item, '$.competition_id') AS competition_id,
+           json_extract_scalar(item, '$.season_id') AS season_id,
+           CAST(json_extract_scalar(item, '$.expected_rows') AS bigint) AS expected_rows,
+           CAST(json_extract_scalar(item, '$.ready') AS boolean) AS ready
+    FROM args CROSS JOIN UNNEST(CAST(json_extract(envelope, '$.receipts') AS array(json))) AS receipts(item)
+    WHERE json_extract_scalar(item, '$.dataset') = args.dataset
+), physical AS (
+    %s
+), counts AS (
+    SELECT p.target_id, sum(p.n) AS physical_rows,
+           count_if(args.dataset <> 'squad_roster' AND
+               (p.competition_id IS DISTINCT FROM e.competition_id OR p.season_id IS DISTINCT FROM e.season_id))
+               AS wrong_scope
+    FROM physical p CROSS JOIN args LEFT JOIN expected e ON e.target_id = p.target_id
+    GROUP BY p.target_id
+), pages AS (
+    SELECT page.target_id, min(page.content_hash) AS content_hash, count(*) AS versions
+    FROM iceberg.bronze.fbref_page_manifest page JOIN args ON page.run_id = args.run_id
+    WHERE page.parser_version = 'fbref-page-document-v6'
+      AND page.parse_status = 'success' AND page.persist_status = 'success' AND page.validation_status = 'success'
+    GROUP BY page.target_id
+), checked AS (
+    SELECT COALESCE(e.target_id, c.target_id) AS target_id,
+           e.expected_rows, COALESCE(c.physical_rows, 0) AS physical_rows,
+           COALESCE(e.ready AND page.versions = 1 AND page.content_hash = e.content_hash
+               AND e.expected_rows = COALESCE(c.physical_rows, 0) AND COALESCE(c.wrong_scope, 0) = 0, false) AS ok
+    FROM expected e FULL OUTER JOIN counts c ON c.target_id = e.target_id
+    LEFT JOIN pages page ON page.target_id = e.target_id
+)
+SELECT args.dataset, CASE WHEN json_extract_scalar(envelope, '$.control_run_id') = run_id
+           AND json_extract_scalar(envelope, '$.generic_parser_version') = 'fbref-page-document-v6'
+           AND json_extract_scalar(envelope, '$.typed_parser_version') = 'fbref-typed-bronze-v8'
+           AND cardinality(CAST(json_extract(envelope, '$.receipts') AS array(json))) IS NOT NULL
+           AND failures = 0 THEN 'PASS' ELSE 'FAIL' END AS verdict,
+       expected_rows, physical_rows, failures, failed_targets
+FROM args CROSS JOIN (
+    SELECT COALESCE(sum(expected_rows), 0) AS expected_rows, COALESCE(sum(physical_rows), 0) AS physical_rows,
+           COALESCE(count_if(NOT ok), 0) AS failures, array_agg(target_id ORDER BY target_id) FILTER (WHERE NOT ok) AS failed_targets
+    FROM checked
+) result
+"""
+
 
 def _policy_exempt_datasets() -> set[str]:
     datasets: set[str] = set()
@@ -42,10 +196,47 @@ def _policy_exempt_datasets() -> set[str]:
     return datasets
 
 
+def _run_date_utc(run: Mapping[str, Any]) -> date | None:
+    for key in ("started_at", "created_at"):
+        value = run.get(key)
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        if isinstance(value, datetime) and value.utcoffset() is not None:
+            return value.astimezone(timezone.utc).date()
+    return None
+
+
+def _route_reviews(as_of: date | None, required_routes: set[str]) -> list[dict]:
+    reviews = []
+    for route, observed in sorted(SEASON_ROUTE_REVIEW_DATES.items()):
+        review_after = observed + RESTRICTED_DATA_REVIEW_INTERVAL
+        if as_of is None:
+            status = "run_date_unknown"
+        elif as_of < observed:
+            status = "not_yet_observed"
+        elif as_of < review_after:
+            status = "within_review_period"
+        else:
+            status = "review_required"
+        reviews.append({
+            "route": route,
+            "observed_on": observed.isoformat(),
+            "review_after": review_after.isoformat(),
+            "claimed": route in required_routes,
+            "current": status == "within_review_period",
+            "status": status,
+        })
+    return reviews
+
+
 def _typed_tables() -> dict[str, tuple[str, str]]:
     exempt = _policy_exempt_datasets()
     result = {
         "schedule": ("fbref_schedule", "supported"),
+        "squad_roster": (SQUAD_ROSTER_TABLE, "supported"),
         **{
             dataset: (
                 table,
@@ -74,14 +265,15 @@ def _generic_evidence(manager: TrinoTableManager, run_id: str) -> dict:
         SELECT count(*), coalesce(sum(table_count), 0),
                coalesce(sum(cell_count), 0),
                count_if(
-                   parse_status <> 'success'
-                   OR persist_status <> 'success'
-                   OR validation_status <> 'success'
+                   parser_version IS DISTINCT FROM ?
+                   OR parse_status IS DISTINCT FROM 'success'
+                   OR persist_status IS DISTINCT FROM 'success'
+                   OR validation_status IS DISTINCT FROM 'success'
                )
         FROM iceberg.bronze.fbref_page_manifest
         WHERE run_id = ?
         """,
-        (run_id,),
+        (PAGE_DOCUMENT_VERSION, run_id),
     )
     if len(manifest) != 1 or len(manifest[0]) != 4:
         raise RuntimeError("Unexpected Trino result for generic manifest")
@@ -150,6 +342,43 @@ def _typed_evidence(manager: TrinoTableManager, run_id: str) -> list[dict]:
                 "batch_rows": rows,
             }
         )
+    return evidence
+
+
+def _page_readback(
+    control: ControlStore, manager: TrinoTableManager, run_id: str, inventory: list[dict],
+) -> list[dict]:
+    with control._transaction() as cursor:
+        cursor.execute(PAGE_RECEIPTS_SQL.replace(":control_run_id", "%s"), (run_id,))
+        row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError(f"Missing FBref page receipts for {run_id}")
+    envelope = json.dumps(row["control_page_receipts_json"])
+    evidence = []
+    for item in inventory:
+        target_key = PAGE_DATASET_KEYS.get(item["dataset"])
+        if target_key is None:
+            continue
+        # A zero-row typed SELECT works before the first populated page creates its table.
+        source = (
+            f"SELECT {target_key} AS target_id, source_competition_id AS competition_id, "
+            f'source_season_id AS season_id, count(*) AS n FROM iceberg.bronze."{item["table"]}" '
+            "WHERE _batch_id = (SELECT run_id FROM args) GROUP BY 1, 2, 3"
+            if item["table_exists"] else
+            "SELECT CAST(NULL AS varchar) AS target_id, CAST(NULL AS varchar) AS competition_id, "
+            "CAST(NULL AS varchar) AS season_id, CAST(0 AS bigint) AS n WHERE false"
+        )
+        query = (PAGE_READBACK_SQL % (item["dataset"], source)).replace(
+            ":control_run_id", "?"
+        ).replace(":control_page_receipts_json", "?")
+        result = manager.execute_query(query, (run_id, envelope))
+        if len(result) != 1 or len(result[0]) != 6 or result[0][0] != item["dataset"]:
+            raise RuntimeError(f"Unexpected page readback for {item['dataset']}")
+        dataset, verdict, expected, physical, failures, targets = result[0]
+        evidence.append({
+            "dataset": dataset, "verdict": verdict, "expected_rows": expected,
+            "physical_rows": physical, "failed_pages": failures, "failed_targets": targets or [],
+        })
     return evidence
 
 
@@ -266,15 +495,22 @@ def build_evidence(
         else "bronze_acceptance"
     )
     strict = metadata.get(strict_key)
+    as_of = _run_date_utc(run)
     if scope == "replay":
         generic = {
             "status": "not_applicable",
             "reason": "replay validates zero network/raw delta",
         }
         typed = []
+        pages = []
+        reviews = []
     else:
         generic = _generic_evidence(manager, control_run_id)
         typed = _typed_evidence(manager, control_run_id)
+        pages = _page_readback(control, manager, control_run_id, typed)
+        cohort = metadata.get("acceptance_cohort")
+        required_routes = set(cohort.get("required_routes") or ()) if isinstance(cohort, Mapping) else set()
+        reviews = _route_reviews(as_of, required_routes)
     gate_failures = _provenance_errors(
         git_sha=git_sha, image_digest=image_digest
     )
@@ -290,11 +526,17 @@ def build_evidence(
     )
     if scope != "replay" and generic.get("status") != "passed":
         gate_failures.append("generic_bronze_parity_failed")
+    if any(item["verdict"] != "PASS" for item in pages):
+        gate_failures.append("typed_page_readback_failed")
+    if any(review["claimed"] and not review["current"] for review in reviews):
+        gate_failures.append("season_route_review_due")
     return {
         "schema_version": "fbref-bronze-acceptance-report-v1",
         "verdict": "GO" if not gate_failures else "NO-GO",
         "gate_failures": gate_failures,
         "scope": scope,
+        "verdict_scope": "source_replay" if scope == "replay" else "frozen_cohort",
+        "run_date_utc": as_of.isoformat() if as_of else None,
         "control_run_id": control_run_id,
         "git_sha": git_sha,
         "image_digest": image_digest,
@@ -310,6 +552,8 @@ def build_evidence(
         "control_summary": summary,
         "generic_bronze": generic,
         "typed_bronze": typed,
+        "typed_page_readback": pages,
+        "season_route_reviews": reviews,
     }
 
 
@@ -321,6 +565,8 @@ def render_markdown(evidence: Mapping[str, Any]) -> str:
         "",
         f"- Verdict: **{evidence['verdict']}**",
         f"- Scope: `{evidence['scope']}`",
+        f"- Verdict covers: `{evidence['verdict_scope']}`",
+        f"- Run date (UTC): `{evidence['run_date_utc'] or 'unknown'}`",
         f"- Control run: `{evidence['control_run_id']}`",
         f"- Git SHA: `{evidence['git_sha']}`",
         f"- Image: `{evidence['image_digest']}`",
@@ -359,6 +605,19 @@ def render_markdown(evidence: Mapping[str, Any]) -> str:
             f"| {item['dataset']} | {item['table']} | {item['policy']} | "
             f"{item['batch_rows']} |"
         )
+    if evidence["typed_page_readback"]:
+        rows.extend(["", "## Page receipts", "", "| Dataset | Control rows | Physical rows | Failed pages | Verdict |",
+                     "|---|---:|---:|---:|---|"])
+        for item in evidence["typed_page_readback"]:
+            rows.append(f"| {item['dataset']} | {item['expected_rows']} | {item['physical_rows']} "
+                        f"| {item['failed_pages']} | {item['verdict']} |")
+    if evidence["season_route_reviews"]:
+        rows.extend(["", "## Season route reviews", "",
+                     "| Route | Observed | Review due | At run date | Required by cohort |", "|---|---|---|---|---|"])
+        for item in evidence["season_route_reviews"]:
+            status = item["status"].replace("_", " ")
+            rows.append(f"| {item['route']} | {item['observed_on']} | {item['review_after']} | {status} "
+                        f"| {'yes' if item['claimed'] else 'no'} |")
     rows.append("")
     return "\n".join(rows)
 

@@ -8,6 +8,42 @@ PyArrow schemas for FBref data tables.
 import pyarrow as pa
 from scrapers.schemas.common import create_schema_with_metadata
 
+# A row belongs to one source table on one page. Several group tables can
+# share an ID within an edition; their original captions distinguish them.
+_PAGE_TABLE_FIELDS = [
+    pa.field('source_target_id', pa.string(), nullable=False),
+    pa.field('source_table_id', pa.string(), nullable=False),
+    pa.field('source_table_caption', pa.string()),
+    pa.field('source_row_index', pa.int64(), nullable=False),
+    pa.field('_entity_type', pa.string(), nullable=False),
+]
+FBREF_STANDINGS_SCHEMA = create_schema_with_metadata([
+    *_PAGE_TABLE_FIELDS,
+    pa.field('source_competition_id', pa.string(), nullable=False),
+    pa.field('source_season_id', pa.string(), nullable=False),
+    pa.field('league', pa.string(), nullable=False),
+    pa.field('season', pa.int64()),
+    pa.field('team', pa.string(), nullable=False),
+    pa.field('team_id', pa.string()),
+    *[pa.field(name, pa.int64()) for name in (
+        'rank', 'games', 'wins', 'ties', 'losses', 'goals_for', 'goals_against', 'goal_diff', 'points',
+    )],
+    *[pa.field(name, pa.float64()) for name in ('points_avg', 'xg_for', 'xg_against', 'xg_diff')],
+    pa.field('notes', pa.string()),
+])
+FBREF_SQUAD_ROSTER_SCHEMA = create_schema_with_metadata([
+    *_PAGE_TABLE_FIELDS,
+    pa.field('source_competition_id', pa.string()),
+    pa.field('source_season_id', pa.string()),
+    pa.field('league', pa.string()),
+    pa.field('season', pa.int64()),
+    pa.field('squad_id', pa.string(), nullable=False),
+    pa.field('player', pa.string(), nullable=False),
+    pa.field('player_id', pa.string()),
+    *[pa.field(name, pa.string()) for name in ('nationality', 'position', 'age', 'shirtnumber')],
+    *[pa.field(name, pa.int64()) for name in ('games', 'games_starts', 'minutes')],
+])
+
 # Schedule/Fixtures schema
 FBREF_SCHEDULE_SCHEMA = create_schema_with_metadata([
     pa.field('league', pa.string(), nullable=False),

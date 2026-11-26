@@ -62,6 +62,18 @@ def test_exact_24_hours_is_success_and_fetch_is_not_bronze_readiness():
     assert report(data)["late"] == 1
 
 
+def test_restricted_routes_require_review_at_expiry_without_reopening_coverage():
+    before = report(cutoff=datetime(2026, 8, 12, 23, 59, tzinfo=timezone.utc))
+    after = report(cutoff=datetime(2026, 8, 13, 0, 0, tzinfo=timezone.utc))
+    expected_routes = {"passing", "passing_types", "gca", "defense", "possession", "keepersadv"}
+    assert set(after["season_route_reviews"]) == expected_routes
+    assert all(not entry["review_due"] for entry in before["season_route_reviews"].values())
+    assert all(entry == {"observed_on": "2026-07-14", "review_after": "2026-08-13", "review_due": True}
+               for entry in after["season_route_reviews"].values())
+    assert "Пора проверить" in render_markdown(after)
+    assert report(cutoff=datetime(2026, 7, 13, tzinfo=timezone.utc))["season_route_reviews"] == {}
+
+
 def test_pending_cohort_is_provisional_even_if_already_collected():
     result = report(cutoff=ANCHOR + timedelta(hours=12))
     assert result["pending"] == 1 and not result["final"]

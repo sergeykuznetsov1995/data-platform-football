@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import inspect
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -261,6 +262,34 @@ def _match_item(
         run_id=f"run-{match_id}",
         target_identity=target_identity or f"match:{match_id}",
     )
+
+
+@pytest.mark.unit
+def test_availability_review_uses_source_fetch_even_on_later_replay() -> None:
+    manager = RecordingManager()
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    item = _match_item("aged-match")
+    item.parsed.datasets["shot_events"] = DatasetParseResult(
+        "shot_events", DatasetStatus.RESTRICTED, reason="source_shots_restricted"
+    )
+    item.parsed.source_observed_at = datetime(2026, 7, 2, 8, tzinfo=timezone.utc)
+    writer.persist_matches([item])
+    first = manager.writes[-1]["frame"].set_index("dataset")
+    assert first.at["match_events", "source_observed_at"] == pd.Timestamp("2026-07-02 08:00")
+    assert pd.isna(first.at["match_events", "review_after"])
+    assert first.at["match_player_stats", "review_after"] == pd.Timestamp("2026-07-09 08:00")
+    assert first.at["shot_events", "review_after"] == pd.Timestamp("2026-08-01 08:00")
+    item.parsed.parsed_at = "2026-09-20T11:20:00+00:00"
+    writer.persist_matches([item])
+    replay = manager.writes[-1]["frame"].set_index("dataset")
+    pd.testing.assert_series_equal(first["review_after"], replay["review_after"])
+
+    undated = _match_item("unverified-fetch-time")
+    writer.persist_matches([undated])
+    legacy = manager.writes[-1]["frame"]
+    assert legacy["source_observed_at"].isna().all()
+    assert legacy["review_after"].isna().all()
+    assert manager.columns[typed.MATCH_AVAILABILITY_TABLE]["review_after"] == "TIMESTAMP"
 
 
 @pytest.mark.unit
@@ -1875,4 +1904,4 @@ def test_both_summary_tables_from_one_comment_reach_typed_match_parser():
     assert dataset.frame["Player"].tolist() == ["Alpha Player", "Beta Player"]
     assert dataset.frame["Min"].tolist() == [90, 88]
     assert set(dataset.frame["team_side"]) == {"home", "away"}
-    assert parsed.parser_version == "fbref-match-parser-v4"
+    assert parsed.parser_version == "fbref-match-parser-v5"

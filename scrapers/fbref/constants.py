@@ -5,6 +5,8 @@ FBref Constants
 Configuration constants for FBref scraper.
 """
 
+from scrapers.fbref.policy import UNAVAILABLE_SEASON_STAT_ROUTES as UNAVAILABLE_SEASON_STAT_ROUTES
+
 # FBref base URL
 BASE_URL = 'https://fbref.com'
 
@@ -53,20 +55,6 @@ PLAYER_STAT_TYPES = [
 KEEPER_STAT_TYPES = [
     'keeper',          # Goalkeeper basic stats
 ]
-
-# Source-advertised season routes that are intentionally not fetched.  Live
-# audits found that these pages still exist but their statistical cells are
-# restricted/empty, so following every nav link would spend one paid request
-# per competition-season without producing data.  Discovery must skip them
-# explicitly rather than misclassifying them as season overview pages.
-UNAVAILABLE_SEASON_STAT_ROUTES = frozenset({
-    'passing',
-    'passing_types',
-    'gca',
-    'defense',
-    'possession',
-    'keepersadv',
-})
 
 # Player match-level stat types (per-game statistics)
 #

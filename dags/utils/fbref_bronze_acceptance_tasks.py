@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from typing import Any
 
+from scrapers.fbref.policy import MATCH_TYPED_MANIFESTS, is_squad_non_roster_url
 from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
 
 logger = logging.getLogger(__name__)
@@ -55,18 +56,7 @@ SEASON_STAT_ROUTES = (
 EXPLICIT_EMPTY_STATES = frozenset(
     {"empty", "restricted", "not_applicable"}
 )
-MATCH_TYPED_DATASETS = frozenset(
-    {
-        "typed:shot_events",
-        "typed:match_events",
-        "typed:lineups",
-        "typed:match_team_stats",
-        "typed:match_managers",
-        "typed:match_officials",
-        "typed:match_keeper_stats",
-        "typed:match_player_stats",
-    }
-)
+MATCH_TYPED_DATASETS = MATCH_TYPED_MANIFESTS
 SEASON_ROUTE_TYPED_DATASETS = {
     "standard": frozenset({"typed:player_stats", "typed:team_stats"}),
     "shooting": frozenset(
@@ -86,7 +76,7 @@ _CURRENT_SIMPLE_SLOTS = (
     ("schedule", "schedule"),
     # 'standings' is intentionally excluded from the required slots: FBref serves
     # no standalone standings page, so discovery never mints a standings target
-    # (0 in the frontier under any code) and no typed:standings dataset exists.
+    # in the current frontier. Its typed standings are read from season pages.
     # Requiring it made the cohort permanently un-assemblable.  See #949.
     ("squad", "squad"),
     ("matchlog", "matchlog"),
@@ -294,6 +284,8 @@ def _normalize_candidate(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 def _candidate_slot(candidate: Mapping[str, Any]) -> str | None:
     page_kind = candidate["page_kind"]
+    if page_kind == "squad" and is_squad_non_roster_url(candidate["canonical_url"]):
+        return None
     if page_kind == "season_stats":
         route = str(candidate["source_ids"].get("stat_route") or "").casefold()
         if route in SEASON_STAT_ROUTES:
@@ -856,9 +848,13 @@ def _validate_fresh_coverage(
             if page_kind != expected_kind:
                 failures.append(f"{slot}:page_kind_changed")
             elif slot == "season" and not _has_typed_completion(
-                datasets, SEASON_ROUTE_TYPED_DATASETS["standard"]
+                datasets, SEASON_ROUTE_TYPED_DATASETS["standard"] | {"typed:standings"}
             ):
                 failures.append(f"{slot}:typed_datasets_incomplete")
+            elif slot == "squad" and not _has_typed_completion(
+                datasets, frozenset({"typed:squad_roster"})
+            ):
+                failures.append(f"{slot}:typed_dataset_incomplete")
             elif slot == "schedule" and not _has_typed_completion(
                 datasets, frozenset({"typed:schedule"})
             ):

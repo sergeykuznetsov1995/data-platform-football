@@ -114,6 +114,7 @@ from scrapers.fbref.typed_bronze import (
     TYPED_BRONZE_PARSER_VERSION,
     TypedMatchPersistItem,
     TypedSourceContext,
+    typed_result_requires_persistence,
 )
 
 
@@ -449,8 +450,12 @@ class FakeTypedWriter:
         return {
             name: dataset.row_count
             for name, dataset in parsed.items()
-            if dataset.status.value == "available"
+            if typed_result_requires_persistence(dataset)
         }
+
+    def persist_table_snapshot(self, parsed, **kwargs):
+        self.calls.append((parsed.dataset, parsed, kwargs))
+        return {parsed.dataset: parsed.row_count} if typed_result_requires_persistence(parsed) else {}
 
     def persist_match(self, parsed, **kwargs):
         self.calls.append(("match", parsed, kwargs))
@@ -3115,8 +3120,8 @@ def test_repeated_table_ids_keep_distinct_immutable_manifests_on_replay(
             raise StateConflict("A completed dataset manifest is immutable")
 
     destination.record_dataset_manifest = immutable_manifest
-    # A failed historical attempt already committed the first table's legacy
-    # manifest. Recovery must retain it and finish every other table offline.
+    # A failed attempt already committed the first table's manifest at this
+    # parser version. Recovery must retain it and finish the rest offline.
     first = replace(page, tables=page.tables[:1])
     kwargs = {"control": destination} if alternate_control else {}
     pipeline._record_generic_table_results(record, first, **kwargs)
@@ -3132,9 +3137,10 @@ def test_repeated_table_ids_keep_distinct_immutable_manifests_on_replay(
     assert {value["availability"] for value in manifests.values()} == (
         {"unknown", "duplicate"} if identical else {"unknown"}
     )
-    assert next(iter(previous))[-1] == (
-        f"table:{page.tables[0].table_id}:{page.tables[0].source_location}"
-    )
+    assert next(iter(previous))[-1] == page.tables[0].dataset
+    assert {key[-1] for key in manifests} == {
+        "table:results2009-20103111_overall", "table:results2009-20103111_overall:instance:2",
+    }
     if alternate_control:
         assert control.manifests == []
 
@@ -3191,8 +3197,10 @@ def test_history_recovery_replays_real_atlas_raw_with_repeated_table_ids(tmp_pat
 
     control.record_dataset_manifest = immutable_manifest
     writer = FakeWriter()
+    typed_writer = FakeTypedWriter()
     pipeline = FBrefPipeline(
-        control, raw, generic_writer=writer, fetcher_factory=forbidden_transport
+        control, raw, generic_writer=writer, fetcher_factory=forbidden_transport,
+        typed_adapter=FakeTypedAdapter(typed_writer),
     )
     page = pipeline._parse_generic(html, record)
     repeated = [
@@ -3231,6 +3239,9 @@ def test_history_recovery_replays_real_atlas_raw_with_repeated_table_ids(tmp_pat
     assert result.parsed == 1
     assert result.failures == []
     assert replay.cohort_size == replay.parsed == 0
+    roster, = [value for value in manifests.values() if value["dataset"] == "typed:squad_roster"]
+    assert (roster["row_count"], roster["persistence_status"]) == (34, "succeeded")
+    assert [name for name, _, _ in typed_writer.calls] == ["squad_roster"]
     table_manifests = [
         value for value in manifests.values()
         if value["dataset"].startswith("table:")
@@ -3481,8 +3492,8 @@ def test_page_v3_recovers_verified_tableless_player_from_v2_raw_offline(
         settings=_settings("current"),
     )
 
-    assert PAGE_DOCUMENT_VERSION == "fbref-page-document-v5"
-    assert TYPED_BRONZE_PARSER_VERSION == "fbref-typed-bronze-v7"
+    assert PAGE_DOCUMENT_VERSION == "fbref-page-document-v6"
+    assert TYPED_BRONZE_PARSER_VERSION == "fbref-typed-bronze-v8"
     assert result.parsed == 1
     assert writer.pages[0][0].tables == ()
     assert writer.pages[0][0].errors == ()
@@ -6024,7 +6035,8 @@ def test_seed_filter_applies_from_competition_and_discovery_paths(tmp_path):
     ))
     html = """
     <main id="content">
-      <table id="results2025-20269_overall"><tr><td>x</td></tr></table>
+      <table id="results2025-20269_overall"><tr><td data-stat="team"
+        ><a href="/en/squads/abcd1234/2025-2026/Team-Stats">Squad</a></td></tr></table>
       <a href="/en/comps/9/2025-2026/schedule/PL-Scores-and-Fixtures"
         >Scores &amp; Fixtures</a>
       <a href="/en/players/1234abcd/Player">Top scorer</a>
@@ -6075,6 +6087,50 @@ def test_seed_filter_applies_from_competition_and_discovery_paths(tmp_path):
         edge["metadata"]["child_page_kind"] in {"schedule", "squad"}
         for edge in control.provenance
     )
+    name, parsed, kwargs = pipeline.typed_adapter.writer.calls[0]
+    assert name == "season" and parsed["standings"].frame.team_id.tolist() == ["abcd1234"]
+    assert kwargs["source_target_id"] == target.target_id
+    manifest = next(row for row in control.manifests if row["dataset"] == "typed:standings")
+    assert (manifest["availability"], manifest["persistence_status"], manifest["row_count"]) == ("available", "succeeded", 1)
+
+
+@pytest.mark.parametrize("run_type", ["current", "replay"])
+def test_standalone_standings_run_through_the_same_guard_and_manifest(tmp_path, run_type):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="standings",
+        canonical_url="https://fbref.com/en/comps/9/2025-2026/standings/Premier-League-Standings",
+        source_ids={"competition_id": "9", "season_id": "2025-2026"},
+    ))
+    html = """
+    <main id="content"><table id="results2025-20269_overall"><tbody>
+    <tr><td data-stat="team"><a href="/en/squads/abcd1234/Team-Stats">Team</a></td></tr>
+    </tbody></table></main>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.upsert_frontier_target(frontier_target(target, historical=False))
+    control.frontier[target.target_id].update(state="fetched", last_content_hash=record.content_hash)
+    control.fetches = [{
+        "source_run_type": "current", "target_id": target.target_id,
+        "page_kind": "standings", "logical_refresh_id": refresh,
+    }]
+    typed = FakeTypedWriter()
+    pipeline = FBrefPipeline(control, raw, generic_writer=ContractWriter(), typed_adapter=FakeTypedAdapter(typed))
+    source_run_id = None
+    if run_type == "replay":
+        source_run_id = str(uuid.uuid4())
+        control.get_run = lambda _: _accepted_replay_source(source_run_id)
+    pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["standings"], settings=_settings(run_type), source_run_id=source_run_id,
+    )
+    [(name, parsed, kwargs)] = typed.calls
+    assert name == "season" and parsed["standings"].frame.team_id.tolist() == ["abcd1234"]
+    assert kwargs["source_target_id"] == target.target_id
+    assert kwargs["context"].source_season_id == "2025-2026"
+    manifests = [row for row in control.manifests if row["dataset"].startswith("typed:")]
+    assert [row["dataset"] for row in manifests] == ["typed:standings", "typed:__complete__"]
+    assert all(row["persistence_status"] == "succeeded" for row in manifests)
 
 
 @pytest.mark.parametrize(
@@ -15850,7 +15906,7 @@ def test_acceptance_rejects_zero_rows_for_scored_match(dataset, availability, co
     manifests = []
     for name in ("__page__", "typed:__complete__", "typed:shot_events", "typed:match_events",
                  "typed:lineups", "typed:match_team_stats", "typed:match_managers",
-                 "typed:match_officials", "typed:match_keeper_stats", "typed:match_player_stats"):
+                 "typed:match_officials", "typed:match_keeper_stats", "typed:match_meta", "typed:match_player_stats"):
         manifests.append(dict(target_id=target_id, dataset=name, availability="available",
                               row_count=1, parse_status="succeeded", persistence_status="succeeded",
                               validation_status="succeeded",
@@ -15872,7 +15928,7 @@ def test_acceptance_allows_zero_rows_only_for_proven_competition_source_gap():
     manifests = []
     for name in ("__page__", "typed:__complete__", "typed:shot_events", "typed:match_events",
                  "typed:lineups", "typed:match_team_stats", "typed:match_managers",
-                 "typed:match_officials", "typed:match_keeper_stats", "typed:match_player_stats"):
+                 "typed:match_officials", "typed:match_keeper_stats", "typed:match_meta", "typed:match_player_stats"):
         manifests.append(dict(target_id=target_id, dataset=name, availability="available",
                               row_count=1, parse_status="succeeded", persistence_status="succeeded",
                               validation_status="succeeded",
@@ -15890,6 +15946,20 @@ def test_acceptance_allows_zero_rows_only_for_proven_competition_source_gap():
     }
     anchor = {"target_ids": [target_id], "coverage_slots": {"match_full": target_id}}
     assert _acceptance_coverage_errors(anchor, evidence) == []
+
+    absent_meta = dict(evidence, datasets=[row for row in manifests if row["dataset"] != "typed:match_meta"])
+    assert any(
+        f"{target_id}:typed:match_meta" in error
+        for error in _acceptance_coverage_errors(anchor, absent_meta)
+    )
+    meta = next(row for row in manifests if row["dataset"] == "typed:match_meta")
+    for wrong_count in (0, 2):
+        meta["row_count"] = wrong_count
+        assert any(
+            f"{target_id}:typed:match_meta" in error
+            for error in _acceptance_coverage_errors(anchor, evidence)
+        )
+    meta["row_count"] = 1
 
     for dataset in ("typed:match_events", "typed:lineups"):
         row = next(m for m in manifests if m["dataset"] == dataset)

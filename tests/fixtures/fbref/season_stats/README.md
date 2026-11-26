@@ -15,3 +15,11 @@ without a request to fbref.com.
   allowlist, this page produced `page_contract:no_tables` and killed
   `recover_raw_before_fetch` on every `dag_ingest_fbref` run from 2026-09-16
   onward, before a single paid request (#1317).
+
+## Indian Super League 2026–27 standings
+
+`indian-super-league-2026-2027-e260cb62.html.gz` contains the full saved
+competition overview at `https://fbref.com/en/comps/82/Indian-Super-League-Stats`.
+The October 2026 archive supplied the bytes. The decompressed SHA-256 is
+`e260cb62ab62441227d5a62c72d62cbf90867ae530cf42fa20efbec435c0ed4f`.
+Table `results2026-2027821_overall` has 13 teams with 13 native FBref IDs.

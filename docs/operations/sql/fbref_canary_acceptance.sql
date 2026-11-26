@@ -5,6 +5,8 @@
 -- UUID and bindings current/100/50. This script deliberately has no
 -- fbref_target_scope or Silver check: the canary branch publishes neither.
 -- Every statement below is read-only.
+-- The verdict covers the run's cohort. OUTSIDE_COHORT route reviews in
+-- PostgreSQL describe other routes without contributing a PASS or FAIL.
 
 -- 1. Lossless generic Bronze parity for this canary batch.
 WITH manifest AS (
@@ -21,9 +23,10 @@ WITH manifest AS (
         (SELECT count(*) FROM iceberg.bronze.fbref_table_cells
           WHERE run_id = CAST(:control_run_id AS varchar)) AS cell_rows,
         (SELECT count(*) FROM manifest
-          WHERE parse_status <> 'success'
-             OR persist_status <> 'success'
-             OR validation_status <> 'success') AS failed_pages
+          WHERE parser_version IS DISTINCT FROM 'fbref-page-document-v6'
+             OR parse_status IS DISTINCT FROM 'success'
+             OR persist_status IS DISTINCT FROM 'success'
+             OR validation_status IS DISTINCT FROM 'success') AS failed_pages
 )
 SELECT
     'generic_bronze' AS check_name,
@@ -44,6 +47,8 @@ WITH expected(
 ) AS (
     VALUES
         ('schedule', 'fbref_schedule', 'season', 'supported', 'required'),
+        ('standings', 'fbref_standings', 'season', 'supported', 'optional'),
+        ('squad_roster', 'fbref_squad_roster', 'squad', 'supported', 'optional'),
         ('player_stats', 'fbref_player_stats', 'season', 'supported', 'optional'),
         ('team_stats', 'fbref_team_stats', 'season', 'supported', 'optional'),
         ('player_shooting', 'fbref_player_shooting', 'season', 'supported', 'optional'),
@@ -71,6 +76,7 @@ WITH expected(
         ('match_managers', 'fbref_match_managers', 'match', 'supported', 'optional'),
         ('match_officials', 'fbref_match_officials', 'match', 'supported', 'optional'),
         ('match_keeper_stats', 'fbref_match_keeper_stats', 'match', 'supported', 'optional'),
+        ('match_meta', 'fbref_match_meta', 'match', 'supported', 'optional'),
         ('match_player_stats', 'fbref_match_player_stats', 'match', 'supported', 'optional'),
         ('dataset_availability', 'fbref_dataset_availability', 'match', 'evidence', 'required')
 ), materialized AS (
@@ -89,7 +95,8 @@ WITH expected(
 SELECT
     'typed_table_inventory' AS check_name,
     CASE
-        WHEN route_policy = 'policy_exempt' THEN 'PASS_POLICY_EXEMPT'
+        WHEN route_policy = 'policy_exempt' THEN 'VERIFY_POSTGRES_DATED_ROUTE_REVIEW'
+        WHEN expected.dataset IN ('standings', 'squad_roster', 'match_meta') THEN 'VERIFY_PAGE_RECEIPTS'
         WHEN physical_requirement = 'required'
          AND materialized.table_name IS NULL THEN 'FAIL'
         WHEN evidence_level = 'match'
@@ -127,6 +134,7 @@ ORDER BY evidence_level, dataset;
 WITH expected(dataset, table_name) AS (
     VALUES
         ('schedule', 'fbref_schedule'),
+        ('standings', 'fbref_standings'),
         ('player_stats', 'fbref_player_stats'),
         ('team_stats', 'fbref_team_stats'),
         ('player_shooting', 'fbref_player_shooting'),
@@ -155,6 +163,7 @@ WITH expected(dataset, table_name) AS (
         ('match_officials', 'fbref_match_officials'),
         ('match_keeper_stats', 'fbref_match_keeper_stats'),
         ('match_player_stats', 'fbref_match_player_stats'),
+        ('match_meta', 'fbref_match_meta'),
         ('dataset_availability', 'fbref_dataset_availability')
 ), materialized AS (
     SELECT DISTINCT table_name
@@ -170,6 +179,77 @@ SELECT
 FROM expected
 JOIN materialized
   ON materialized.table_name = expected.table_name
+ORDER BY dataset;
+
+-- Physical page readback for each source target.
+-- Run each generated query with the same :control_run_id and the unmodified
+-- :control_page_receipts_json returned by the PostgreSQL companion.
+-- Both directions are checked, including missing optional tables and extra targets.
+WITH candidate(dataset, table_name, target_key) AS (
+    VALUES
+        ('match_meta', 'fbref_match_meta', '''fbref:match:'' || match_id'),
+        ('standings', 'fbref_standings', 'source_target_id'),
+        ('squad_roster', 'fbref_squad_roster', 'source_target_id')
+), materialized AS (
+    SELECT table_name FROM iceberg.information_schema.tables WHERE table_schema = 'bronze'
+)
+SELECT dataset, format(
+'WITH args AS (
+    SELECT CAST(:control_run_id AS varchar) AS run_id,
+           json_parse(CAST(:control_page_receipts_json AS varchar)) AS envelope,
+           ''%s'' AS dataset
+), expected AS (
+    SELECT json_extract_scalar(item, ''$.target_id'') AS target_id,
+           json_extract_scalar(item, ''$.content_hash'') AS content_hash,
+           json_extract_scalar(item, ''$.competition_id'') AS competition_id,
+           json_extract_scalar(item, ''$.season_id'') AS season_id,
+           CAST(json_extract_scalar(item, ''$.expected_rows'') AS bigint) AS expected_rows,
+           CAST(json_extract_scalar(item, ''$.ready'') AS boolean) AS ready
+    FROM args CROSS JOIN UNNEST(CAST(json_extract(envelope, ''$.receipts'') AS array(json))) AS receipts(item)
+    WHERE json_extract_scalar(item, ''$.dataset'') = args.dataset
+), physical AS (
+    %s
+), counts AS (
+    SELECT p.target_id, sum(p.n) AS physical_rows,
+           count_if(args.dataset <> ''squad_roster'' AND
+               (p.competition_id IS DISTINCT FROM e.competition_id OR p.season_id IS DISTINCT FROM e.season_id))
+               AS wrong_scope
+    FROM physical p CROSS JOIN args LEFT JOIN expected e ON e.target_id = p.target_id
+    GROUP BY p.target_id
+), pages AS (
+    SELECT page.target_id, min(page.content_hash) AS content_hash, count(*) AS versions
+    FROM iceberg.bronze.fbref_page_manifest page JOIN args ON page.run_id = args.run_id
+    WHERE page.parser_version = ''fbref-page-document-v6''
+      AND page.parse_status = ''success'' AND page.persist_status = ''success'' AND page.validation_status = ''success''
+    GROUP BY page.target_id
+), checked AS (
+    SELECT COALESCE(e.target_id, c.target_id) AS target_id,
+           e.expected_rows, COALESCE(c.physical_rows, 0) AS physical_rows,
+           COALESCE(e.ready AND page.versions = 1 AND page.content_hash = e.content_hash
+               AND e.expected_rows = COALESCE(c.physical_rows, 0) AND COALESCE(c.wrong_scope, 0) = 0, false) AS ok
+    FROM expected e FULL OUTER JOIN counts c ON c.target_id = e.target_id
+    LEFT JOIN pages page ON page.target_id = e.target_id
+)
+SELECT args.dataset, CASE WHEN json_extract_scalar(envelope, ''$.control_run_id'') = run_id
+           AND json_extract_scalar(envelope, ''$.generic_parser_version'') = ''fbref-page-document-v6''
+           AND json_extract_scalar(envelope, ''$.typed_parser_version'') = ''fbref-typed-bronze-v8''
+           AND cardinality(CAST(json_extract(envelope, ''$.receipts'') AS array(json))) IS NOT NULL
+           AND failures = 0 THEN ''PASS'' ELSE ''FAIL'' END AS verdict,
+       expected_rows, physical_rows, failures, failed_targets
+FROM args CROSS JOIN (
+    SELECT COALESCE(sum(expected_rows), 0) AS expected_rows, COALESCE(sum(physical_rows), 0) AS physical_rows,
+           COALESCE(count_if(NOT ok), 0) AS failures, array_agg(target_id ORDER BY target_id) FILTER (WHERE NOT ok) AS failed_targets
+    FROM checked
+) result',
+    dataset,
+    CASE WHEN materialized.table_name IS NULL THEN
+         'SELECT CAST(NULL AS varchar) AS target_id, CAST(NULL AS varchar) AS competition_id, ' ||
+         'CAST(NULL AS varchar) AS season_id, CAST(0 AS bigint) AS n WHERE false'
+    ELSE 'SELECT ' || target_key || ' AS target_id, source_competition_id AS competition_id, ' ||
+         'source_season_id AS season_id, count(*) AS n FROM iceberg.bronze."' || candidate.table_name ||
+         '" WHERE _batch_id = (SELECT run_id FROM args) GROUP BY 1, 2, 3' END
+) AS datagrip_verification_sql
+FROM candidate LEFT JOIN materialized ON materialized.table_name = candidate.table_name
 ORDER BY dataset;
 
 -- 4. Explicit match-dataset availability written by this canary batch.

@@ -588,6 +588,24 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             "team",
             *META_COLS,
         },
+        "fbref_match_meta": {
+            "source_competition_id", "source_season_id", "league", "season", "match_id",
+            "home_team_id", "away_team_id", "home_team", "away_team", "home_goals", "away_goals",
+            "home_xg", "away_xg", "home_captain_id", "away_captain_id", "home_captain",
+            "away_captain", "attendance", "venue", *META_COLS,
+        },
+        "fbref_dataset_availability": {
+            "source_competition_id", "source_season_id", "match_id", "dataset",
+            "availability", "source_observed_at", "review_after", *META_COLS,
+        },
+        "fbref_standings": {
+            "source_target_id", "source_competition_id", "source_season_id", "source_table_id",
+            "source_table_caption", "source_row_index", "team_id", "team", "rank", "points", *META_COLS,
+        },
+        "fbref_squad_roster": {
+            "source_target_id", "source_competition_id", "source_season_id", "source_table_id",
+            "source_table_caption", "source_row_index", "squad_id", "player_id", "player", "position", *META_COLS,
+        },
         "fbref_lineups": {
             "league",
             "season",
@@ -596,6 +614,7 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
             "player",
             "is_starter",
             "position",
+            "formation",
             *META_COLS,
         },
         "fbref_match_team_stats": {
