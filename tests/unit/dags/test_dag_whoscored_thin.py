@@ -111,6 +111,53 @@ def test_daily_passes_only_prior_match_failures_to_the_runner(ingest):
     assert "WHOSCORED_PREVIEW_FIRST_SCOPES" not in _bash("ingest_stages")._init_kwargs["env"]
 
 
+@pytest.mark.unit
+def test_daily_shares_turns_after_a_match_or_preview_failure(ingest, monkeypatch, tmp_path):
+    from tests.unit.scrapers.test_run_whoscored_scraper import _result, _run
+
+    england = "ENG-Premier League=2526"
+    world_cup = "INT-World Cup=2026"
+    args = ["daily", "--scope", england, "--skip-profiles", "--split-lanes", "true"]
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_whoscored")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_matches")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+    previous = None
+
+    def collect(run_id, behaviors, scopes=args):
+        nonlocal previous
+        monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", run_id)
+        monkeypatch.setenv(
+            "WHOSCORED_PREVIEW_FIRST_SCOPES", ingest._preview_first_scopes(previous, run_id)
+        )
+        rc, previous, service, _ = _run(monkeypatch, tmp_path, scopes, behaviors=behaviors)
+        calls = {
+            item._scope_spec(): [name for name, *_ in item.calls]
+            for item in service.instances
+        }
+        return rc, calls
+
+    match_error = {"matches": _result("matches", retryable=["123"])}
+    assert collect("first", match_error) == (2, {england: ["schedule", "matches"]})
+
+    preview = _result("previews", counts={"missing_players": 3})
+    rc, calls = collect(
+        "second", {**match_error, "previews": preview}, [*args, "--scope", world_cup]
+    )
+    assert rc == 2
+    assert calls[england] == ["schedule", "previews", "matches"]
+    assert calls[world_cup] == ["schedule", "matches"]
+    assert previous["entities"]["missing_players"]["rows_written"] == 3
+
+    preview_error = {"previews": TimeoutError("preview unavailable")}
+    assert collect("third", {**match_error, **preview_error}) == (
+        2, {england: ["schedule", "previews"]}
+    )
+    assert collect("fourth", preview_error) == (
+        2, {england: ["schedule", "matches", "previews"]}
+    )
+    assert previous["entities"]["events"]["rows_written"] == 2
+
+
 def test_ingest_stages_is_a_separate_weekly_task(ingest):
     # #1474: stage feeds live in their own task; its failure never fails
     # ingest_matches, and it runs whatever ingest_matches ended with.

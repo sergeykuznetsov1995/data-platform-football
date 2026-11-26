@@ -975,53 +975,6 @@ def test_daily_keeps_match_data_when_preview_fails(
 
 
 @pytest.mark.unit
-def test_daily_shares_turns_after_a_match_or_preview_failure(monkeypatch, tmp_path):
-    from dag_ingest_whoscored import _preview_first_scopes
-
-    england = "ENG-Premier League=2526"
-    world_cup = "INT-World Cup=2026"
-    args = ["daily", "--scope", england, "--skip-profiles", "--split-lanes", "true"]
-    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_whoscored")
-    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_matches")
-    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
-    previous = None
-
-    def collect(run_id, behaviors, scopes=args):
-        nonlocal previous
-        monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", run_id)
-        monkeypatch.setenv(
-            "WHOSCORED_PREVIEW_FIRST_SCOPES", _preview_first_scopes(previous, run_id)
-        )
-        rc, previous, service, _ = _run(monkeypatch, tmp_path, scopes, behaviors=behaviors)
-        calls = {
-            item._scope_spec(): [name for name, *_ in item.calls]
-            for item in service.instances
-        }
-        return rc, calls
-
-    match_error = {"matches": _result("matches", retryable=["123"])}
-    assert collect("first", match_error) == (2, {england: ["schedule", "matches"]})
-
-    preview = _result("previews", counts={"missing_players": 3})
-    rc, calls = collect(
-        "second", {**match_error, "previews": preview}, [*args, "--scope", world_cup]
-    )
-    assert rc == 2
-    assert calls[england] == ["schedule", "previews", "matches"]
-    assert calls[world_cup] == ["schedule", "matches"]
-    assert previous["entities"]["missing_players"]["rows_written"] == 3
-
-    preview_error = {"previews": TimeoutError("preview unavailable")}
-    assert collect("third", {**match_error, **preview_error}) == (
-        2, {england: ["schedule", "previews"]}
-    )
-    assert collect("fourth", preview_error) == (
-        2, {england: ["schedule", "matches", "previews"]}
-    )
-    assert previous["entities"]["events"]["rows_written"] == 2
-
-
-@pytest.mark.unit
 def test_retryable_service_result_has_distinct_exit_code(monkeypatch, tmp_path):
     retryable = _result("matches", retryable=["123"])
     rc, report, _, _ = _run(
