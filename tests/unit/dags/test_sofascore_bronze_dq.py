@@ -248,6 +248,51 @@ def test_season_fields_admission_counts_core_and_league_table_freshness():
     assert missing["fresh"] is False
 
 
+def test_freshness_excludes_only_the_three_knockout_seasons(monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    census = [
+        ("SS-281", "2627", now),
+        ("SS-737", "2627", None),
+        ("SS-14710", "2026", None),
+        ("SS-281", "2526", None),
+        ("SS-9", "2627", now),
+    ]
+    monkeypatch.setattr(refresh, "RESULT_DIR", str(tmp_path))
+    monkeypatch.setattr(refresh, "_season_fields_census", lambda: census)
+    monkeypatch.setattr(refresh.state, "read_refresh_snapshot", lambda *a, **kw: {})
+    selected = []
+
+    def plan(snapshot, pairs, **kwargs):
+        selected.extend(pairs)
+        return [], []
+
+    monkeypatch.setattr(refresh.state, "plan_season_fields_batch", plan)
+    summary = refresh._refresh_season_fields(run_id="cup-season-freshness")
+
+    for line in ("before", "after", "season_fields_freshness"):
+        assert summary[line]["core_ongoing"] == 2
+        assert summary[line]["standings_not_applicable"] == 3
+        assert summary[line]["fresh_7d"] == 1
+        assert summary[line]["ratio"] == 0.5
+    # The seasonal workload still collects rounds and brackets for cups.
+    assert set(selected) == {("SS-737", "2627"), ("SS-14710", "2026"), ("SS-281", "2526")}
+
+
+def test_only_knockout_seasons_have_no_standings_freshness_ratio():
+    from datetime import datetime, timezone
+
+    admission = refresh._season_fields_admission(
+        [("SS-14710", "2026", None)],
+        as_of=datetime.now(timezone.utc),
+        core_keys=frozenset({"SS-14710"}),
+    )
+
+    assert admission["core_ongoing"] == admission["fresh_7d"] == 0
+    assert admission["ratio"] is None
+
+
 def test_season_fields_selection_orders_and_respects_backoff():
     from datetime import datetime, timedelta, timezone
 
@@ -317,7 +362,6 @@ def test_season_fields_scope_timeout_is_a_failed_outcome(monkeypatch, tmp_path):
     """#1368 review r1: a scope timeout must not abort the renewal — it is
     one failed outcome, so backoff and the report survive it."""
     import subprocess as subprocess_module
-    from datetime import datetime, timezone
 
     env = {
         "SOFASCORE_CAMPAIGN_SNAPSHOT": str(tmp_path / "snapshot.json"),

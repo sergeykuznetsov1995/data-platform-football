@@ -136,6 +136,14 @@ tournament to another class, edit its one row (`class`, the matching
 `queue_priority`, and `basis` saying why) and ship it; planners reread the file
 on their next plan without a DAG restart.
 
+For the #1368 league-table freshness check, `core_ongoing` counts all ongoing
+core seasons except the three approved knockout editions listed in
+`STANDINGS_NOT_APPLICABLE` in
+[`denominator.py`](../../scrapers/sofascore/denominator.py).
+The report counts those currently in the window under `standings_not_applicable`.
+The match and seasonal queues still cover these editions. Every other missing
+table counts against freshness.
+
 ## Production table bootstrap
 
 Before the first raw-first deployment, render and inspect the idempotent Iceberg
