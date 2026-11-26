@@ -1,10 +1,9 @@
 [Unit]
-Description=Check stored SofaScore standings three times a day
+Description=Check stored SofaScore standings every eight hours
 
 [Timer]
 OnActiveSec=20s
-OnCalendar=*-*-* 00,08,16:15:00 UTC
-Persistent=yes
+OnUnitInactiveSec=8h
 AccuracySec=15s
 
 [Install]

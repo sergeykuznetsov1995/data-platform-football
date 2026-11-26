@@ -27,7 +27,8 @@ def test_census_ranks_corrections_and_preserves_missing_tables(monkeypatch):
             ("SS-8", "2627", 2, EPOCH - 36 * 3600, 1),
             ("SS-8", "2627", 3, EPOCH, 1),
             ("SS-281", "2627", 4, EPOCH + 6 * 3600, 1),
-            ("SS-9", "2026's", 5, EPOCH, 1),
+            ("SS-9", "2026's", 5, EPOCH - 40 * 3600, 1),
+            ("SS-9", "2026's", 5, EPOCH, 2),
             ("noncore", "2627", 6, EPOCH, 1),
         ],
     )
@@ -53,8 +54,16 @@ def test_census_ranks_corrections_and_preserves_missing_tables(monkeypatch):
 
     monkeypatch.setattr(report, "trino_rows", query)
     try:
-        result = report.read_census(
-            EPOCH, 101, 202, frozenset({"SS-7", "SS-8", "SS-281", "SS-9"})
+        core = frozenset({"SS-7", "SS-8", "SS-281", "SS-9"})
+        result = report.read_census(EPOCH, 101, 202, core)
+        canonical = (
+            refresh.SEASON_FIELDS_CENSUS_SQL.format(hours=36)
+            .replace("to_unixtime(current_timestamp)", str(EPOCH))
+            .replace("iceberg.bronze.sofascore_schedule", "schedule")
+            .replace("iceberg.bronze.sofascore_league_table", "standings")
+        )
+        assert sorted(result) == sorted(
+            row for row in db.execute(canonical) if row[0] in core
         )
         assert sorted(result) == [
             ("SS-281", "2627", None),
@@ -63,6 +72,12 @@ def test_census_ranks_corrections_and_preserves_missing_tables(monkeypatch):
         ]
     finally:
         db.close()
+
+
+def test_invalid_core_season_cannot_produce_a_green_report(monkeypatch):
+    monkeypatch.setattr(report, "trino_rows", lambda *_: [("SS-8", None)])
+    with pytest.raises(ValueError, match="Missing season"):
+        report.read_census(EPOCH, 101, 202, frozenset({"SS-8"}))
 
 
 def test_report_agrees_with_scheduled_metric_at_seven_days():
