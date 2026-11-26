@@ -15,12 +15,14 @@ from datetime import datetime, timezone
 from functools import partial
 import hashlib
 from itertools import batched
+import json
 import re
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import attendance, core, native_writer, parsing, rumours, sections
+from . import attendance, club_sections, core, native_writer, parsing, rumours, section_catalog, sections
 from .models import FetchOutcome, FetchStatus
+from .raw_store import RawStoreError
 from .referee_capture import _next_directory_page, referee_directory_url, referee_profile_url
 
 
@@ -32,6 +34,7 @@ Fetch = Callable[..., FetchOutcome]
 TM_BASE = "https://www.transfermarkt.com"
 TM_API_BASE = "https://tmapi.transfermarkt.technology"
 _REPRESENTATION_PACKET_LIMIT = 100
+_SECTION_PAGE_LIMIT = 100
 
 
 def squad_url(club_slug: str, club_id: str, saison_year: int) -> str:
@@ -142,6 +145,12 @@ class RefereeDirectoryTarget:
 
 
 @dataclass(frozen=True)
+class SectionTarget:
+    endpoint: str
+    url: str
+
+
+@dataclass(frozen=True)
 class CoreScopePlan:
     league: str
     season: str
@@ -162,6 +171,7 @@ class CoreScopePlan:
     # An inferred edition describes the season. Only an explicit edition
     # constrains independently dated section targets in a mixed fixture.
     edition_inferred: bool = False
+    section_targets: tuple[SectionTarget, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -199,9 +209,12 @@ class _Request:
     referee_id: str = ""
     stichtag: str = ""
     player_ids: tuple[str, ...] = ()
+    section_scope: Mapping[str, str] | None = None
 
     @property
     def as_json(self) -> bool:
+        if self.section_scope is not None:
+            return self.label in section_catalog.JSON_ENDPOINTS
         return bool(self.player_id) or self.label in (
             "player_achievement", "club_achievement", "representation",
         )
@@ -210,6 +223,8 @@ class _Request:
         # The replacement scope follows the entity's own scope columns:
         # squad lanes replace (league, season, club_id), stints replace the
         # club's whole history, career and coach profiles the single id.
+        if self.section_scope is not None:
+            return dict(self.section_scope)
         if self.label == "squad":
             return {"league": plan.league, "season": plan.season, "club_id": self.club.club_id}
         if self.label == "coach_history":
@@ -299,6 +314,26 @@ def _target_requests(plan: CoreScopePlan):
                   for value in plan.representation_player_ids)
     for batch in batched(player_ids, _REPRESENTATION_PACKET_LIMIT):
         yield _Request("representation", representation_url(batch), player_ids=batch), None
+    seen = set()
+    for target in plan.section_targets:
+        endpoint = target.endpoint
+        values = section_catalog.source_scope(
+            endpoint, target.url, edition_id=plan.edition_id or str(core.saison_year(plan.season)),
+            competition_id=plan.league,
+        )
+        module = section_catalog.BY_ENDPOINT[endpoint]
+        if endpoint in module.PAGINATED and module.page_number(endpoint, target.url) != 1:
+            raise ValueError(f'{endpoint}:first_page_missing')
+        for entity in module.ENDPOINT_ENTITIES[endpoint]:
+            physical_scope = section_catalog.entity_scope(entity, endpoint, values)
+            identity = (entity, tuple(sorted(physical_scope.items())))
+            if identity in seen:
+                raise ValueError(f'{endpoint}:duplicate_section_target')
+            seen.add(identity)
+        club = ClubTarget(values['club_id'], '') if 'club_id' in values else None
+        yield _Request(endpoint, target.url, section_scope=values, club=club,
+                       player_id=values.get('player_id', ''), competition_id=values.get('competition_id', ''),
+                       edition_id=values.get('edition_id')), None
 
 
 def planned_urls(plan: CoreScopePlan) -> tuple[str, ...]:
@@ -331,9 +366,26 @@ def _requests(plan: CoreScopePlan):
     return requests
 
 
-def _capture(request, result, raw_loader):
+def _capture(request, result, raw_loader, *, paired_scope=None):
     if raw_loader is not None:
         body, record = raw_loader(result.raw_capture_id, request.url)
+        if paired_scope is not None:
+            expected = {'capture_id': result.raw_capture_id, 'endpoint': request.label,
+                        'url': request.url, 'content_hash': result.raw_body_hash,
+                        'scope_id': paired_scope.scope_id, 'cycle_id': paired_scope.cycle_id,
+                        'status_code': result.status_code}
+            if (not isinstance(body, bytes) or type(getattr(record, 'status_code', None)) is not int
+                    or any(getattr(record, key, None) != value for key, value in expected.items())
+                    or not result.raw_fetched_at or not getattr(record, 'fetched_at', None)
+                    or _normalise_ts(record.fetched_at) != _normalise_ts(result.raw_fetched_at)):
+                raise CoreRunError('paired club raw manifest differs')
+            if result.status_code == 200:
+                payload = json.loads(body.decode('utf-8'), parse_int=sections.parse_json_integer)
+                value = result.value
+                if isinstance(value, (str, bytes)):
+                    value = json.loads(value, parse_int=sections.parse_json_integer)
+                if core.canonical_json(payload) != core.canonical_json(value):
+                    raise CoreRunError('paired club JSON body differs')
         if getattr(record, "endpoint", request.label) != request.label:
             raise CoreRunError(f"{request.label} raw capture endpoint differs")
         if record.content_hash != result.raw_body_hash or record.url != request.url:
@@ -379,6 +431,7 @@ def _summary(outcome):
 
 
 _ENTITIES = {
+    **section_catalog.ENTITIES,
     "squad": ("squad_memberships", "player_attribute_observations", "player_contract_observations"),
     "coach_history": ("coach_stints",),
     "market_value_points": ("market_value_points",),
@@ -394,7 +447,7 @@ _ENTITIES = {
     "referee_profile": ("referee_profiles",),
     "representation": ("player_representation_observations",),
 }
-_PAGINATED_ENDPOINTS = frozenset({"attendance", "rumours", "referee_directory"})
+_PAGINATED_ENDPOINTS = frozenset({"attendance", "rumours", "referee_directory"}) | section_catalog.PAGINATED
 _SUCCESS = {FetchStatus.OK, FetchStatus.AUTHORITATIVE_EMPTY, FetchStatus.NOT_APPLICABLE}
 
 
@@ -414,7 +467,7 @@ def _request_subject(request, plan) -> str:
 
 
 def _observations(request, result, plan, extracted_at, universe_version, capture_response, captures=(),
-                  competition=None, walk_failure=None, walk_failed=None):
+                  competition=None, walk_failure=None, walk_failed=None, paired_club=False):
     scope = core.ScopeContext(
         league=plan.league, season=plan.season, scope_id=plan.scope_id, cycle_id=plan.cycle_id,
         edition_id=request.edition_id or plan.edition_id or None, player_id=request.player_id or None,
@@ -426,6 +479,29 @@ def _observations(request, result, plan, extracted_at, universe_version, capture
     run_id = core._run_id(scope, extracted_at)
     subject = _request_subject(request, plan)
     paginated = request.label in _PAGINATED_ENDPOINTS
+    if request.section_scope is not None:
+        module = section_catalog.BY_ENDPOINT[request.label]
+        failure = walk_failure
+        if paired_club and result.raw_capture_id and (
+                result.status is FetchStatus.OK and result.status_code == 200
+                or request.label == 'club_stadium' and result.status_code == 404):
+            try:
+                capture = capture_response(request, result, paired_scope=scope)
+            except (CoreRunError, RawStoreError, OSError, EOFError, KeyError, TypeError, ValueError):
+                failure = 'paired_raw_mismatch'
+            else:
+                return module.extract((capture,), scope, **metadata), capture.captured_at
+        elif paired_club and result.status is FetchStatus.OK:
+            failure = 'paired_raw_mismatch'
+        if failure or result.status is not FetchStatus.OK or not result.raw_capture_id:
+            reason = failure or result.status.value
+            status = 'error' if failure or result.status in _SUCCESS | {FetchStatus.SCHEMA_ERROR} else 'unavailable'
+            return tuple(core.captureless_outcome(
+                entity, scope, status=status, reason=f'{request.label}:{reason}',
+                run_id=run_id, subject=subject, **metadata,
+            ) for entity in module.ENDPOINT_ENTITIES[request.label]), None
+        pages = captures if paginated else (capture_response(request, result),)
+        return module.extract(pages, scope, **metadata), max(page.captured_at for page in pages)
     if request.label == "representation" and (
         result.status in (FetchStatus.NOT_APPLICABLE, FetchStatus.SCHEMA_ERROR)
         or (result.status in _SUCCESS and not result.raw_capture_id)
@@ -516,6 +592,8 @@ def _outcome_scope_values(outcome, request, plan):
     # against it, so a wrong-holder page can never be written under another
     # identity. Only explicit fan-out sections (one capture, many row scopes)
     # derive the scope from their rows.
+    if request.section_scope is not None:
+        return section_catalog.entity_scope(outcome.entity, request.label, request.section_scope)
     requested = None
     try:
         requested = request.scope_values(plan)
@@ -626,12 +704,16 @@ class CoreRun:
         # offline replays pin their own clocks.
         pinned = None if self._extracted_at is None else _normalise_ts(self._extracted_at)
         context = {"scope_id": plan.scope_id, "cycle_id": plan.cycle_id}
-        outcomes = []
-        captured_units = []
+        evaluated = []
+        profiles = {}
         capture_response = partial(_capture, raw_loader=self._raw_loader)
         hashes_by_capture = {}
         fetched = cache_hits = 0
-        for request, competition in _requests(plan):
+        requests = _requests(plan)
+        profiles_requested = {req.url for req, _ in requests if req.label == 'club_profile'}
+        stadiums_requested = {req.url for req, _ in requests if req.label == 'club_stadium'}
+        paired_profiles = {url for url in profiles_requested if url + '/stadium' in stadiums_requested}
+        for request, competition in requests:
             as_json = request.as_json
             page = request
             captures = []
@@ -667,6 +749,27 @@ class CoreRun:
                     page = replace(request, url=next_url)
                     continue
                 captures.append(capture)
+                if request.section_scope is not None:
+                    module = section_catalog.BY_ENDPOINT[request.label]
+                    number = len(captures)
+                    try:
+                        next_url = module.next_page(capture, number)
+                        if next_url is None:
+                            break
+                        if number >= _SECTION_PAGE_LIMIT:
+                            raise ValueError('pagination_limit')
+                        values = section_catalog.source_scope(
+                            request.label, next_url, edition_id=request.edition_id or '',
+                            competition_id=request.competition_id,
+                        )
+                        if (values != request.section_scope or module.page_number(request.label, next_url) != number + 1
+                                or any(previous.url == next_url for previous in captures)):
+                            raise ValueError('pagination_identity_mismatch')
+                    except (ValueError, UnicodeError) as exc:
+                        walk_failure = getattr(exc, 'reason', None) or 'invalid_pagination'
+                        break
+                    page = replace(request, url=next_url)
+                    continue
                 if request.label == "referee_directory":
                     number = len(captures)
                     try:
@@ -707,10 +810,20 @@ class CoreRun:
             if walk is not None:
                 captures = walk.ordered()
             extracted_at = pinned or datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            paired_club = request.url.removesuffix('/stadium') in paired_profiles
             unit, captured_at = _observations(
                 request, result, plan, extracted_at, self._universe_version, capture_response,
                 captures, competition=competition, walk_failure=walk_failure,
-                walk_failed=walk_failed)
+                walk_failed=walk_failed, paired_club=paired_club)
+            if paired_club and request.label == 'club_profile':
+                profiles[request.url] = unit[0]
+            evaluated.append((request, unit, captured_at))
+
+        outcomes = []
+        captured_units = []
+        for request, unit, captured_at in evaluated:
+            if request.label == 'club_stadium':
+                unit = club_sections.confirm_stadium_absence(unit, profiles.get(request.url.removesuffix('/stadium')))
             outcomes.extend(unit)
             if captured_at is not None and writer is not None and connection_factory is not None:
                 # A multi-page merge writes one plan per contributing page capture.
@@ -720,7 +833,7 @@ class CoreRun:
                     if item.status in core.CONCLUSIVE_CORE_STATUSES and item.capture is not None
                 ]
                 if entries:
-                    captured_units.append((unit[0].run_id, extracted_at, entries))
+                    captured_units.append((unit[0].run_id, unit[0].extracted_at, entries))
 
         bundles = []
         for run_id, committed_at, entries in captured_units:

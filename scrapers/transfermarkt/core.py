@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from urllib.parse import parse_qs, urlsplit
 
-from scrapers.transfermarkt import parsing
+from scrapers.transfermarkt import parsing, section_catalog
 
 
 CORE_PARSER_REVISION = 'core-v1'
@@ -55,7 +56,7 @@ _ENDPOINTS = frozenset({
     'squad', 'market_value_points', 'transfer_events', 'coach_profile', 'coach_history',
     # stage C sections (#2405)
     'attendance', 'club_values', 'player_achievement', 'club_achievement', 'coach_achievement',
-    'rumours', 'referee_directory', 'referee_profile', 'representation',
+    'rumours', 'referee_directory', 'referee_profile', 'representation', *section_catalog.ENTITIES,
 })
 _OUTCOMES_WITH_ROWS = frozenset({'observed_present', 'explicit_none'})
 _PROOF_STATUSES = frozenset({'observed_empty', 'not_applicable'})
@@ -82,7 +83,7 @@ _PRESENCE_ENTITIES = frozenset({
 # These lanes can accumulate rows from the same response at multiple clocks.
 _OBSERVATION_CLOCK_ENTITIES = frozenset({
     'referee_aggregate_observations', 'player_attribute_observations', 'player_contract_observations',
-})
+}) | section_catalog.CLOCK_ENTITIES
 
 LINEAGE_COLUMNS = (
     'source_url', 'source_endpoint', 'raw_capture_id', 'source_capture_id',
@@ -99,9 +100,11 @@ CORE_ENTITIES = (
     'attendance_observations', 'club_value_observations', 'achievement_observations',
     'rumour_observations', 'referee_aggregate_observations', 'referee_profiles',
     'player_representation_observations',
+    *section_catalog.TABLES,
 )
 CORE_TABLES = {entity: f'transfermarkt_{entity}' for entity in CORE_ENTITIES}
 CORE_NATURAL_KEYS = {
+    **{entity: table.natural_key for entity, table in section_catalog.TABLES.items()},
     'squad_memberships': ('league', 'season', 'club_id', 'player_id'),
     'player_attribute_observations': ('league', 'season', 'club_id', 'player_id', 'observed_at'),
     'player_contract_observations': ('league', 'season', 'club_id', 'player_id', 'observed_at'),
@@ -121,6 +124,7 @@ CORE_NATURAL_KEYS = {
     ),
 }
 CORE_SCOPE_COLUMNS = {
+    **{entity: table.scope_columns for entity, table in section_catalog.TABLES.items()},
     'squad_memberships': ('league', 'season', 'club_id'),
     'player_attribute_observations': ('league', 'season', 'club_id'),
     'player_contract_observations': ('league', 'season', 'club_id'),
@@ -138,6 +142,7 @@ CORE_SCOPE_COLUMNS = {
     'player_representation_observations': ('player_id',),
 }
 CORE_WRITE_MODES = {
+    **{entity: table.write_mode for entity, table in section_catalog.TABLES.items()},
     'squad_memberships': 'replace',
     'player_attribute_observations': 'merge',
     'player_contract_observations': 'merge',
@@ -222,6 +227,7 @@ REPRESENTATION_BUSINESS = (
     'status_reason', 'evidence_type', 'evidence_locator', 'observed_at',
 )
 _BUSINESS_COLUMNS = {
+    **{entity: table.columns for entity, table in section_catalog.TABLES.items()},
     'squad_memberships': SQUAD_MEMBERSHIP_BUSINESS,
     'player_attribute_observations': ATTRIBUTE_BUSINESS,
     'player_contract_observations': CONTRACT_BUSINESS,
@@ -267,6 +273,13 @@ class CoreParseError(ValueError):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+def _column_type(entity: str, column: str) -> str:
+    table = section_catalog.TABLES.get(entity)
+    if table is not None and column in table.types:
+        return table.types[column]
+    return COLUMN_TYPES[column]
 
 
 def _nonempty(value: object) -> bool:
@@ -562,11 +575,15 @@ def _render(
         if value is None:
             row[col] = None
             continue
-        kind = COLUMN_TYPES[col]
+        kind = _column_type(entity, col)
+        if isinstance(value, float) and kind != 'double':
+            raise CoreParseError('row_value_not_json_safe')
         if kind == 'varchar' and not isinstance(value, str):
             raise CoreParseError('row_value_not_text')
         if kind == 'boolean' and not isinstance(value, bool):
             raise CoreParseError('row_value_not_boolean')
+        if kind == 'double' and (type(value) is not float or not math.isfinite(value)):
+            raise CoreParseError('row_value_not_finite_double')
         if kind == 'bigint' and type(value) is not int:
             if not isinstance(value, str) or not re.fullmatch(r'[0-9]+', value):
                 raise CoreParseError('row_value_not_integer')
@@ -594,7 +611,7 @@ def _render(
         _source='transfermarkt', _entity_type=entity, _batch_id=_batch_id(run_id),
         _ingested_at=extracted_at,
     )
-    if any(value is not None and not isinstance(value, (str, int, bool)) for value in row.values()):
+    if any(value is not None and not isinstance(value, (str, int, float)) for value in row.values()):
         raise CoreParseError('row_value_not_json_safe')
     if any(type(value) is int and not -2 ** 63 <= value < 2 ** 63 for value in row.values()):
         raise CoreParseError('row_value_exceeds_bigint')
@@ -828,7 +845,7 @@ def core_ddl(entity: str) -> str:
         raise CoreParseError('invalid_entity')
     columns = []
     for col in CORE_COLUMNS[entity]:
-        sql_type = COLUMN_TYPES[col]
+        sql_type = _column_type(entity, col)
         columns.append(f"    {col} {'timestamp(6)' if sql_type == 'timestamp' else sql_type}")
     definitions = ',\n'.join(columns)
     return (
@@ -973,6 +990,19 @@ def _check_scope_against_capture(entity: str, scope_values: Mapping[str, str], c
 def _check_scope_against_url(
     entity: str, scope_values: Mapping[str, str], source_url: str, source_endpoint: str,
 ) -> None:
+    if entity in section_catalog.TABLES:
+        if entity not in section_catalog.ENTITIES.get(source_endpoint, ()):
+            raise CoreParseError('row_scope_mismatch')
+        try:
+            expected = section_catalog.source_scope(
+                source_endpoint, source_url, edition_id=scope_values.get('edition_id', ''),
+                competition_id=scope_values.get('competition_id', ''),
+            )
+        except ValueError as exc:
+            raise CoreParseError('row_scope_mismatch') from exc
+        if dict(scope_values) != section_catalog.entity_scope(entity, source_endpoint, expected):
+            raise CoreParseError('row_scope_mismatch')
+        return
     url = urlsplit(source_url)
     path = url.path
     # The complete origin and route of the lane: https from its own authority

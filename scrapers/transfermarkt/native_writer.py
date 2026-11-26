@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import fcntl
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
@@ -23,7 +24,7 @@ from re import fullmatch
 from typing import Any, NamedTuple, Sequence
 from uuid import uuid4
 
-from . import write_journal
+from . import section_catalog, write_journal
 import random
 import re
 import threading
@@ -659,8 +660,8 @@ class NativeWritePlan:
             _check_columns(row)
             if missing := required.difference(row):
                 raise ValueError(f'core plan row is missing columns: {sorted(missing)}')
-            if any(value is not None and not isinstance(value, (int, str)) for value in row.values()):
-                raise ValueError('core plan row values must be strings, integers or null')
+            if any(value is not None and not isinstance(value, (int, float, str)) for value in row.values()):
+                raise ValueError('core plan row values must be strings, numbers or null')
             if any(type(value) is int and not -2 ** 63 <= value < 2 ** 63 for value in row.values()):
                 # The bigint column cannot hold it; refuse it before anything
                 # is staged.
@@ -675,8 +676,7 @@ class NativeWritePlan:
                     and _timestamp(row['observed_at']) != _timestamp(row['captured_at'])):
                 raise ValueError('core observation clock must equal its capture clock')
             for column, value in row.items():
-                kind = (None if value is None else 'bool' if isinstance(value, bool)
-                        else 'int' if isinstance(value, int) else 'str')
+                kind = type(value) if value is not None else None
                 if kind and column_types.setdefault(column, kind) != kind:
                     raise ValueError(f'core plan column mixes value types: {column}')
             for column, value in row.items():
@@ -787,14 +787,14 @@ def _committed_clock(connection, table_sql: str, params: tuple) -> object:
 # plan honest is that no other capture may already own one of its keys.
 _MULTI_CAPTURE_MERGE_ENTITIES = frozenset({
     'rumour_observations', 'referee_aggregate_observations', 'club_value_observations',
-})
+}) | section_catalog.PAGED_ENTITIES
 # Pages of the referee directory re-own rows between walks: the donor keeps
 # the first page that lists a referee, and a later walk may list it earlier.
 # Every other capture is exactly its committed rows, rumours included.
 _PAGE_OWNED_ROWS_ENTITIES = frozenset({'referee_aggregate_observations'})
 _OBSERVATION_CLOCK_ENTITIES = _PAGE_OWNED_ROWS_ENTITIES | {
     'player_attribute_observations', 'player_contract_observations',
-}
+} | section_catalog.CLOCK_ENTITIES
 # Varchar key columns that narrow the ownership lookup of a large scope; a
 # lane without an entry is read scope-wide (date and timestamp key columns
 # are never bound as parameters).
@@ -1561,7 +1561,7 @@ def _entity_registry(entity: str) -> dict:
 def _value_has_type(kind: str, value) -> bool:
     """Whether a row value has the Python form of its declared SQL column.
 
-    A plan carries text, integers, booleans or null. The engine would store
+    A plan carries text, integers, finite doubles, booleans or null. The engine would store
     something else than the plan states for any other combination: text in
     a numeric column is cast on the way in and reads back as a number.
     """
@@ -1569,8 +1569,9 @@ def _value_has_type(kind: str, value) -> bool:
         return type(value) is int
     if kind.startswith('boolean'):
         return type(value) is bool
-    if kind.startswith(('double', 'real', 'decimal', 'float')):
-        # Exact decimal text is kept in a varchar column instead.
+    if kind == 'double':
+        return type(value) is float and math.isfinite(value)
+    if kind.startswith(('real', 'decimal', 'float')):
         return False
     if kind.startswith('date'):
         # The engine casts the text to a calendar date: it has to be one.

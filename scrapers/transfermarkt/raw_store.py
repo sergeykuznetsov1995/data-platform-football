@@ -60,6 +60,7 @@ _API_REGULATION_PATH_RE = re.compile(
 )
 _API_CLUB_PATH_RE = re.compile(r"^/competition/[A-Za-z0-9_-]+/club$", re.ASCII)
 _API_CLUB_PROFILE_PATH_RE = re.compile(r"^/club/[1-9][0-9]*(?:/stadium)?$", re.ASCII)
+_API_PLAYER_SECTION_PATH_RE = re.compile(r"^/player/[1-9][0-9]*/(?:injury|absence|national-career-history)$", re.ASCII)
 _ERROR_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$", re.ASCII)
 _ATTEMPT_KINDS = frozenset({"response", "transport_error"})
 _TRANSPORT_ERROR_KINDS = frozenset(
@@ -150,7 +151,7 @@ def _safe_url(value: object) -> str:
         if _API_REGULATION_PATH_RE.fullmatch(parsed.path):
             if query:
                 raise ValueError(invalid)
-        elif _API_CLUB_PROFILE_PATH_RE.fullmatch(parsed.path):
+        elif _API_CLUB_PROFILE_PATH_RE.fullmatch(parsed.path) or _API_PLAYER_SECTION_PATH_RE.fullmatch(parsed.path):
             if query:
                 raise ValueError(invalid)
         elif _API_CLUB_PATH_RE.fullmatch(parsed.path):
@@ -176,6 +177,20 @@ def _safe_url(value: object) -> str:
                 raise ValueError(invalid)
         else:
             raise ValueError(invalid)
+    elif host == 'www.transfermarkt.com' and parsed.path == '/schnellsuche/ergebnis/schnellsuche':
+        from .agency_sections import agency_directory_route
+
+        try:
+            agency_directory_route(candidate)
+        except ValueError:
+            raise ValueError(invalid) from None
+    elif host == 'www.transfermarkt.com' and parsed.path == '/berater/beraterfirmenuebersicht/berater':
+        from .agency_sections import agency_statistics_route
+
+        try:
+            agency_statistics_route(candidate)
+        except ValueError:
+            raise ValueError(invalid) from None
     else:
         for name, query_value in query:
             if (
