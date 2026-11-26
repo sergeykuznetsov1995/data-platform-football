@@ -10,6 +10,8 @@ in {"section_targets": [{"endpoint": "club_staff", "url":
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
+from contextlib import closing
 from dataclasses import asdict
 import gzip
 import hashlib
@@ -28,6 +30,8 @@ def _parser():
     modes = parser.add_subparsers(dest="mode", required=True)
     offline = modes.add_parser("offline", help="Replay a fixture manifest")
     offline.add_argument("--fixtures-root", type=Path, required=True)
+    offline.add_argument("--require-complete", action="store_true",
+                         help="Require a conclusive result for each outcome and a physical receipt for each write")
     live = modes.add_parser("live", help="Fetch using the configured transport")
     live.add_argument("--club", action="append", default=[], metavar="ID:SLUG[:NAME]")
     live.add_argument("--player", action="append", default=[], metavar="ID")
@@ -139,18 +143,86 @@ class _RawRecord:
         self.fetched_at = record["fetched_at"]
 
 
-def _report(report, plan, path):
+def _report(report, plan, path, completion=None):
     if path:
-        summary = asdict(plan)
-        path.write_text(
-            json.dumps({**asdict(report), "plan": summary}, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        summary = {**asdict(report), "plan": asdict(plan)}
+        if completion is not None:
+            summary["completion"] = completion
+        path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     else:
         print("entity\tstatus\trows")
         for item in report.outcomes:
             print(item["entity"], item["status"], item["rows"], sep="\t")
         print(f"DQ passed: {report.dq['passed']}")
+
+
+def completion_error(report, connection_factory) -> str | None:
+    """Check every outcome and, for a write, bind it to the writer's physical proof."""
+    from scrapers.transfermarkt import core, native_writer
+
+    if report.dq["passed"] is not True or not report.outcomes:
+        return "data-quality checks failed or the plan returned no outcomes"
+    for outcome in report.outcomes:
+        if (outcome["scope_id"], outcome["cycle_id"]) != (report.scope_id, report.cycle_id):
+            return "outcome scope or cycle differs from the plan"
+        if outcome["status"] not in core.CONCLUSIVE_CORE_STATUSES or not outcome["source_capture_id"]:
+            return f"{outcome['entity']}: {outcome['status']} ({outcome['status_reason']})"
+    if connection_factory is None:
+        return None
+
+    # The writer has physically read back its tables. Match its per-member
+    # proofs to the immutable warehouse receipts and every reported capture.
+    proofs = Counter()
+    bundle_digests = defaultdict(set)
+    for receipt in report.receipts:
+        diagnostics = core._receipt_diagnostics(receipt)
+        if diagnostics:
+            return "invalid writer receipt: " + ", ".join(diagnostics)
+        run = receipt["run_id"]
+        # An acknowledgement recovered from an older writer can have an alias.
+        digest = receipt.get("identity", {}).get("digest", receipt["plan_sha256"])
+        if digest in bundle_digests[run]:
+            return "duplicate writer bundle"
+        bundle_digests[run].add(digest)
+        for proof in receipt.get("plans", ()):
+            if not proof.get("physical_hash") or proof["expected_rows"] != proof["rows"]:
+                return "writer member has no matching physical readback"
+            proofs[(run, digest, receipt["committed_batch"], proof["entity"],
+                    "iceberg.bronze." + proof["table"], proof["rows"], proof["physical_hash"])] += 1
+    if sum(proofs.values()) != len(report.outcomes):
+        return "number of writer member proofs differs from the number of outcomes"
+
+    expected = Counter((o["run_id"], o["entity"], o["source_capture_id"], o["status"],
+                        o["status_reason"], o["rows"]) for o in report.outcomes)
+    run_ids = list(dict.fromkeys(o["run_id"] for o in report.outcomes))
+    stored_outcomes, stored_proofs = Counter(), Counter()
+    receipt_ids = set()
+    with closing(connection_factory()) as connection, closing(connection.cursor()) as cursor:
+        for start in range(0, len(run_ids), 100):
+            group = run_ids[start:start + 100]
+            placeholders = ", ".join("?" for _ in group)
+            rows = native_writer._query_rows(cursor, f"""
+                SELECT receipt_id, plan_sha256, run_id, entity, source_capture_id, observation_status, status_reason,
+                       expected_rows, row_count, committed_batch, target_table, physical_hash
+                FROM {native_writer.CORE_RECEIPTS_TABLE}
+                WHERE scope_id = ? AND cycle_id = ? AND run_id IN ({placeholders})
+            """, (report.scope_id, report.cycle_id, *group))
+            for receipt_id, plan_hash, run, entity, capture, status, reason, planned, actual, batch, table, physical in rows:
+                # Separate packets may share a run ID when replay pins the extraction time.
+                digest = next((d for d in bundle_digests[run]
+                               if native_writer._receipt_id(plan_hash, run, d) == receipt_id), None)
+                if digest is None:
+                    continue
+                if receipt_id in receipt_ids:
+                    return "duplicate warehouse receipt"
+                receipt_ids.add(receipt_id)
+                if planned != actual:
+                    return "stored receipt row count differs from its plan"
+                stored_outcomes[(run, entity, capture, status, reason, actual)] += 1
+                stored_proofs[(run, digest, batch, entity, table, actual, physical)] += 1
+    if stored_outcomes != expected or stored_proofs != proofs:
+        return "stored receipts differ from the outcomes or their physical readbacks"
+    return None
 
 
 def _season_year(season):
@@ -205,11 +277,15 @@ _SECTION_FIELDS = {
 
 
 def _section_options(path):
-    from scrapers.transfermarkt import orchestrator as runner
-
     if path is None:
         return {}
     document = json.loads(path.read_text(encoding='utf-8'))
+    return section_options(document)
+
+
+def section_options(document):
+    from scrapers.transfermarkt import orchestrator as runner
+
     models = {
         'attendance_editions': runner.AttendanceEditionTarget, 'club_value_targets': runner.ClubValueTarget,
         'achievement_holders': runner.AchievementHolderTarget, 'rumour_competitions': runner.RumourCompetitionTarget,
@@ -237,26 +313,34 @@ def _section_options(path):
 
 
 def _live_plan(args):
+    return build_scope_plan(
+        league=args.league, season=args.season, scope_id=args.scope_id, cycle_id=args.cycle_id,
+        edition_id=args.edition_id, clubs=args.club, players=args.player, coaches=args.coach,
+        options=_section_options(getattr(args, 'section_plan', None)),
+    )
+
+
+def build_scope_plan(*, league, season, scope_id, cycle_id, edition_id=None,
+                     clubs=(), players=(), coaches=(), options=None):
     from scrapers.transfermarkt.orchestrator import (
         ClubTarget, CoreScopePlan, coach_history_url, squad_url,
     )
 
-    year = _season_year(args.season)
-    options = _section_options(getattr(args, 'section_plan', None))
-    if not (args.club or args.player or args.coach or options):
+    year = _season_year(season)
+    if not (clubs or players or coaches or options):
         raise ValueError('supply a club, player, coach or section plan')
-    clubs = tuple(
+    club_targets = tuple(
         ClubTarget(club_id, slug, name, squad_url(slug, club_id, year),
                    coach_history_url(slug, club_id))
-        for club_id, slug, name in map(_club_parts, args.club)
+        for club_id, slug, name in map(_club_parts, clubs)
     )
     return CoreScopePlan(
-        league=args.league, season=args.season, scope_id=args.scope_id, cycle_id=args.cycle_id,
-        edition_id=args.edition_id or str(year), edition_inferred=args.edition_id is None, clubs=clubs,
-        market_value_player_ids=tuple(args.player),
-        transfer_player_ids=tuple(args.player),
-        coach_profile_ids=tuple(map(_coach_parts, args.coach)),
-        **options,
+        league=league, season=season, scope_id=scope_id, cycle_id=cycle_id,
+        edition_id=edition_id or str(year), edition_inferred=edition_id is None, clubs=club_targets,
+        market_value_player_ids=tuple(players),
+        transfer_player_ids=tuple(players),
+        coach_profile_ids=tuple(map(_coach_parts, coaches)),
+        **(options or {}),
     )
 
 
@@ -436,7 +520,7 @@ def main(argv=None):
             run = CoreRun(client.fetch, raw_loader=raw_loader)
         write_args = _write_options(args) if args.write else {}
         report = run.run(plan, **write_args)
-        _report(report, plan, args.report_out)
+        incomplete_fixtures = False
         if args.mode == "offline":
             # A record of a section the core replay plans for that the run
             # never reached is a plan that skipped it in silence: nothing may
@@ -455,8 +539,18 @@ def main(argv=None):
                 print("Missing fixture responses:", *sorted(missing), sep="\n", file=sys.stderr)
             if unreached:
                 print("Unreached fixture records:", *sorted(unreached), sep="\n", file=sys.stderr)
-            if missing or unreached:
-                return 2
+            incomplete_fixtures = bool(missing or unreached)
+        completion = None
+        if args.mode == "offline" and args.require_complete:
+            error = ("incomplete fixture replay" if incomplete_fixtures
+                     else completion_error(report, write_args.get("connection_factory")))
+            completion = {"passed": error is None, "error": error}
+        _report(report, plan, args.report_out, completion)
+        if incomplete_fixtures:
+            return 2
+        if completion is not None and not completion["passed"]:
+            print("Incomplete run:", completion["error"], file=sys.stderr)
+            return 1
     except (ValueError, KeyError, OSError, CoreRunError) as exc:
         parser.exit(2, f"{parser.prog}: {exc}\n")
     finally:
