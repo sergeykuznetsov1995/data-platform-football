@@ -354,11 +354,10 @@ def _season_fields_admission(
 ) -> dict[str, Any]:
     """One shared definition for the acceptance ratio and the work selection.
 
-    Returns the census counts (every core ongoing partition, ingest lanes
-    included — they stay in the denominator) plus the refresh-owned
-    admission list: SS partitions only, missing tables first, then oldest,
-    each past the renewal interval and outside its backoff window.
+    Count ongoing core seasons where a standings table applies. Keep all
+    core entries available for the seasonal workload, including cup brackets.
     """
+    from scrapers.sofascore.denominator import STANDINGS_NOT_APPLICABLE
 
     entries: list[dict[str, Any]] = []
     for league, season, last_ingested in census:
@@ -381,11 +380,16 @@ def _season_fields_admission(
             "age_days": age_days,
             "fresh": age_days is not None and age_days <= 7,
         })
-    core_ongoing = len(entries)
-    fresh_7d = sum(1 for item in entries if item["fresh"])
+    standings = [
+        item for item in entries
+        if (item["league"], item["season"]) not in STANDINGS_NOT_APPLICABLE
+    ]
+    core_ongoing = len(standings)
+    fresh_7d = sum(1 for item in standings if item["fresh"])
     return {
         "as_of": as_of.isoformat(),
         "core_ongoing": core_ongoing,
+        "standings_not_applicable": len(entries) - core_ongoing,
         "fresh_7d": fresh_7d,
         "ratio": (fresh_7d / core_ongoing) if core_ongoing else None,
         "entries": entries,
@@ -605,23 +609,18 @@ def _refresh_season_fields(**context: Any) -> dict[str, Any]:
     after = _season_fields_admission(
         after_census, as_of=datetime.now(timezone.utc), core_keys=core_keys
     )
+    freshness_fields = ("core_ongoing", "standings_not_applicable", "fresh_7d", "ratio")
     summary = {
         "run_id": run_id,
         "before": {
             name: admission[name]
-            for name in ("as_of", "core_ongoing", "fresh_7d", "ratio")
+            for name in ("as_of", *freshness_fields)
         },
         "after": {
             name: after[name]
-            for name in ("as_of", "core_ongoing", "fresh_7d", "ratio")
+            for name in ("as_of", *freshness_fields)
         },
-        # допущение а: the contract line is the league-table freshness of
-        # ongoing core partitions; target ratio >= 0.95.
-        "season_fields_freshness": {
-            "core_ongoing": after["core_ongoing"],
-            "fresh_7d": after["fresh_7d"],
-            "ratio": after["ratio"],
-        },
+        "season_fields_freshness": {name: after[name] for name in freshness_fields},
         "selected": len(pairs),
         "executed": len(outcomes),
         "failed": sum(1 for item in outcomes if item.get("exit_code") != 0),

@@ -20,9 +20,10 @@ PUBLISH_BATCH = 2000
 class PaceIO:
     def __init__(self, *, factory, gate, journal, store, targets, now,
                  read_freshness, observe_seconds=10, freshness_seconds=60,
-                 publish_seconds=60, maximum_gap=30):
+                 publish_seconds=60, maximum_gap=30, freshness_targets=None):
         self.factory, self.gate, self.journal, self.store = factory, gate, journal, store
         self.targets, self.now, self.read_freshness = targets, now, read_freshness
+        self.freshness_targets = targets if freshness_targets is None else freshness_targets
         self.intervals = dict(debt=observe_seconds, freshness=freshness_seconds, publication=publish_seconds)
         self.maximum_gap = maximum_gap
         self.stop = threading.Event()
@@ -98,7 +99,7 @@ class PaceIO:
                         debt = live_debt(manager, self.targets, started)
                         result = dict(debt=debt)
                     elif name == 'freshness':
-                        result = self.read_freshness(manager, self.targets, started)
+                        result = self.read_freshness(manager, self.freshness_targets, started)
                     else:
                         result = dict(published=self._publish(manager),
                                       total_pending=self.journal.pending())

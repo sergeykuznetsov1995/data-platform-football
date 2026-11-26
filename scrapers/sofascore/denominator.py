@@ -42,6 +42,13 @@ CLASS_PRIORITY = {
 }
 MISSING_PRIORITY = 9
 
+# Confirmed knockout editions for the #1368 standings freshness check.
+STANDINGS_NOT_APPLICABLE = frozenset({
+    ("SS-281", "2627"),     # Puchar Polski
+    ("SS-737", "2627"),     # Coppa Titano
+    ("SS-14710", "2026"),   # Kuwait Emir Cup
+})
+
 
 class DenominatorError(ValueError):
     """The denominator file is malformed; planners must not guess."""
