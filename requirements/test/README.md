@@ -24,7 +24,9 @@ Jinja2 3.1.6, tls-client-python 1.15.1, sqlglot 30.12.0 and duckdb 1.5.4.
 Discovery's typing-extensions stays at 4.15.0. The fresh SofaScore baseline includes
 the current SQL dependencies; the older run 31415840227 predates that profile.
 Ruff's pin prevents upstream rule changes from silently changing the merge gate;
-SofaScore's SQL type and execution tests need sqlglot and duckdb.
+FBref's day-14 lineup tests and SofaScore's SQL tests use sqlglot to parse
+Trino queries and duckdb to execute them on fixture data. The FBref profile
+uses the same Python 3.11 wheel versions and hashes as the SofaScore unit job.
 
 ## Local preparation
 

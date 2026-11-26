@@ -11,7 +11,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 PROFILES = (
     ('fbref-ci.yml', 'unit', 'fbref-unit-py311', '3.11',
-     'pytest ruff pandas numpy pyarrow boto3 trino requests beautifulsoup4 lxml psycopg2-binary python-dotenv tenacity pybreaker rapidfuzz unidecode nicknames pyyaml jsonschema psutil jinja2'),
+     'pytest ruff pandas numpy pyarrow boto3 trino requests beautifulsoup4 lxml psycopg2-binary python-dotenv tenacity pybreaker rapidfuzz unidecode nicknames pyyaml jsonschema psutil jinja2 sqlglot duckdb'),
     ('fbref-ci.yml', 'postgres-semantics', 'fbref-postgres-py311', '3.11',
      'pytest psycopg2-binary'),
     ('fbref-ci.yml', 'seaweedfs-raw-smoke', 'fbref-s3-py311', '3.11',
