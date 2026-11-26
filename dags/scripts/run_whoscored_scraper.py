@@ -307,7 +307,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=DAILY_PARTS,
         default="matches",
         help=(
-            "daily only: 'matches' = schedule, previews and matches; "
+            "daily only: 'matches' = schedule, matches and previews; "
             "'stages' = weekly stage statistics feeds"
         ),
     )
@@ -1452,9 +1452,15 @@ def _run_service_operations(
     operations: Sequence[str],
 ) -> None:
     proxy_unavailable = _proxy_unavailable_type()
+    daily_matches = args.command == "daily" and args.daily_part == "matches"
+    preview_first = set(os.environ.get("WHOSCORED_PREVIEW_FIRST_SCOPES", "").splitlines())
     for scope, runtime_scope in selected:
         scope_record = _scope_record(report, scope)
         scope_record["status"] = "running"
+        # Start with finished games unless matches failed last run in this scope.
+        scope_operations = operations
+        if daily_matches and scope.spec not in preview_first:
+            scope_operations = ("schedule", "matches", "previews")
         try:
             with _transport_scope_environment(scope, "+".join(operations)):
                 service_context = service_cls(
@@ -1469,7 +1475,7 @@ def _run_service_operations(
                     except proxy_unavailable:
                         _collect_traffic(report, scope, service)
                         raise
-                    for operation in operations:
+                    for operation in scope_operations:
                         try:
                             result = _invoke(service, operation, args)
                             _merge_result(report, result, scope_record=scope_record)
@@ -1477,10 +1483,7 @@ def _run_service_operations(
                                 report, scope_record, scope, operation, result
                             )
                             if scope_record["errors"]:
-                                # Schedule is a hard prerequisite for preview
-                                # and match candidate selection.  Continuing
-                                # after any entity failure can scrape stale
-                                # candidates and spend source requests needlessly.
+                                # Stop this scope on its first failed operation.
                                 break
                         except proxy_unavailable:
                             _collect_traffic(report, scope, service)

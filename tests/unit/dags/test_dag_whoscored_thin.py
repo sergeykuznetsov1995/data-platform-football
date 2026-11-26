@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
+from unittest.mock import Mock
 
 import pytest
+from jinja2 import Environment
 
 
 def _reload(module_name: str):
@@ -79,6 +82,33 @@ def test_ingest_matches_has_eight_hour_timeout(ingest):
 
     daily = _bash("ingest_matches")
     assert daily._init_kwargs["execution_timeout"] == timedelta(hours=8)
+
+
+def test_daily_passes_only_prior_match_failures_to_the_runner(ingest):
+    prior = {
+        "schema_version": 3,
+        "command": "daily",
+        "airflow": {"dag_run_id": "previous"},
+        "error_details": [
+            {"scope": "ENG-Premier League=2526", "entity": "matches"},
+            {"scope": "INT-World Cup=2026", "entity": "previews"},
+            {"scope": None, "entity": "matches"},
+        ],
+    }
+    macros = ingest.dag._dag_kwargs["user_defined_macros"]
+    template = Environment().from_string(
+        _bash("ingest_matches")._init_kwargs["env"]["WHOSCORED_PREVIEW_FIRST_SCOPES"]
+    )
+    ti = Mock()
+    for value in (json.dumps(prior), prior):
+        ti.xcom_pull.return_value = value
+        assert template.render(**macros, ti=ti, run_id="next") == "ENG-Premier League=2526"
+        ti.xcom_pull.assert_called_with(task_ids="ingest_matches", include_prior_dates=True)
+        assert template.render(**macros, ti=ti, run_id="previous") == ""
+    for value in (None, "bad json", [], {"error_details": 1}):
+        ti.xcom_pull.return_value = value
+        assert template.render(**macros, ti=ti, run_id="next") == ""
+    assert "WHOSCORED_PREVIEW_FIRST_SCOPES" not in _bash("ingest_stages")._init_kwargs["env"]
 
 
 def test_ingest_stages_is_a_separate_weekly_task(ingest):

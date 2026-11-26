@@ -414,7 +414,10 @@ def _runtime(
             limit,
             force_replay,
             historical_replay=False,
+            lane=None,
         ):
+            if lane is not None:
+                assert lane == "current"
             self.match_force_replays.append(bool(force_replay))
             self.match_historical_replays.append(bool(historical_replay))
             if historical_replay:
@@ -919,8 +922,8 @@ def test_daily_runs_each_v2_entity_once_in_order(monkeypatch, tmp_path):
     assert rc == 0
     assert service_cls.instances[0].calls == [
         ("schedule", None),
-        ("previews", None),
         ("matches", runner.DAILY_MATCH_LIMIT_PER_SCOPE),
+        ("previews", None),
     ]
     assert report["rows"] == 4
     assert report["scopes"][0]["entities"]["missing_players"]["rows_written"] == 0
@@ -943,6 +946,79 @@ def test_daily_scope_stops_after_schedule_failure(monkeypatch, tmp_path):
     assert rc == 1
     assert report["status"] == "failed"
     assert service_cls.instances[0].calls == [("schedule", None)]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("preview", "expected_rc", "expected_status"),
+    [
+        (_result("previews", retryable=["1990116"]), 2, "retryable"),
+        (_result("previews", errors=["preview manifest write failed"]), 1, "failed"),
+    ],
+)
+def test_daily_keeps_match_data_when_preview_fails(
+    monkeypatch, tmp_path, preview, expected_rc, expected_status
+):
+    rc, report, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["daily", "--scope", "ENG-Premier League=2526", "--skip-profiles"],
+        behaviors={"previews": preview},
+    )
+
+    scope = report["scopes"][0]
+    assert scope["entities"]["events"]["rows_written"] == 2
+    assert scope["entities"]["lineups"]["rows_written"] == 1
+    assert [error["entity"] for error in scope["errors"]] == ["previews"]
+    assert scope["status"] == expected_status
+    assert rc == expected_rc
+
+
+@pytest.mark.unit
+def test_daily_shares_turns_after_a_match_or_preview_failure(monkeypatch, tmp_path):
+    from dag_ingest_whoscored import _preview_first_scopes
+
+    england = "ENG-Premier League=2526"
+    world_cup = "INT-World Cup=2026"
+    args = ["daily", "--scope", england, "--skip-profiles", "--split-lanes", "true"]
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_whoscored")
+    monkeypatch.setenv("AIRFLOW_CTX_TASK_ID", "ingest_matches")
+    monkeypatch.setenv("AIRFLOW_CTX_TRY_NUMBER", "1")
+    previous = None
+
+    def collect(run_id, behaviors, scopes=args):
+        nonlocal previous
+        monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", run_id)
+        monkeypatch.setenv(
+            "WHOSCORED_PREVIEW_FIRST_SCOPES", _preview_first_scopes(previous, run_id)
+        )
+        rc, previous, service, _ = _run(monkeypatch, tmp_path, scopes, behaviors=behaviors)
+        calls = {
+            item._scope_spec(): [name for name, *_ in item.calls]
+            for item in service.instances
+        }
+        return rc, calls
+
+    match_error = {"matches": _result("matches", retryable=["123"])}
+    assert collect("first", match_error) == (2, {england: ["schedule", "matches"]})
+
+    preview = _result("previews", counts={"missing_players": 3})
+    rc, calls = collect(
+        "second", {**match_error, "previews": preview}, [*args, "--scope", world_cup]
+    )
+    assert rc == 2
+    assert calls[england] == ["schedule", "previews", "matches"]
+    assert calls[world_cup] == ["schedule", "matches"]
+    assert previous["entities"]["missing_players"]["rows_written"] == 3
+
+    preview_error = {"previews": TimeoutError("preview unavailable")}
+    assert collect("third", {**match_error, **preview_error}) == (
+        2, {england: ["schedule", "previews"]}
+    )
+    assert collect("fourth", preview_error) == (
+        2, {england: ["schedule", "matches", "previews"]}
+    )
+    assert previous["entities"]["events"]["rows_written"] == 2
 
 
 @pytest.mark.unit
@@ -1205,8 +1281,8 @@ def test_daily_without_scope_reads_the_denominator_scopes(monkeypatch, tmp_path)
         service.calls
         == [
             ("schedule", None),
-            ("previews", None),
             ("matches", runner.DAILY_MATCH_LIMIT_PER_SCOPE),
+            ("previews", None),
         ]
         for service in service_cls.instances
     )
