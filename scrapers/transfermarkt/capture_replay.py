@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from .client import TransfermarktHttpClient
 from .models import FetchOutcome, FetchStatus
@@ -149,3 +150,74 @@ def capture_replay(store: RawResponseStore, envelope_ids: Sequence[str], *, scop
             if profile == page.record.url or ("club_profile", profile) not in pages:
                 raise ValueError("capture replay stadium 404 requires its club profile")
     return CaptureReplay(pages, scope_id, cycle_id)
+
+
+def read_input_json(data):
+    def unique_keys(pairs):
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError('Duplicate JSON key in Transfermarkt cycle input')
+            obj[key] = value
+        return obj
+
+    return json.loads(data, object_pairs_hook=unique_keys)
+
+
+def _attempt_entries(document):
+    if isinstance(document, dict) and "raw_attempts" in document:
+        entries = document["raw_attempts"]
+        if not isinstance(entries, list):
+            raise ValueError("Invalid raw_attempts journal")
+        if any(document.get(field) for field in (
+            "error", "errors", "failures", "failed_attempts", "failure_kind", "failure_stage", "check_failures", "cache_sources",
+        )) or ("status" in document and document["status"] not in ("complete", "completed", "success", "ok")):
+            raise ValueError("Bounded collection reported a failure or used prior-cycle evidence")
+        if "network_fetches" in document and (
+            type(document["network_fetches"]) is not int or document["network_fetches"] != len(entries)
+        ):
+            raise ValueError("Journal does not account for every reported network attempt")
+    else:
+        entries = document if isinstance(document, list) else [document]
+    if not entries:
+        raise ValueError("Empty bounded attempt journal")
+    return entries
+
+
+def verify_attempt_journals(store, cycle_id, scope_ids, journals, traffic):
+    """Reconstruct all captured attempts from the originals and an independent run-specific counter."""
+    if (not isinstance(traffic, dict) or not (traffic.keys() & {"cycle_id", "run_id"})
+            or any(traffic[key] != cycle_id for key in ("cycle_id", "run_id") if key in traffic)
+            or "raw_attempts" in traffic):
+        raise ValueError("Traffic receipt must identify this exact Airflow run and come from its separate counter")
+    expected_count = traffic.get("request_attempts")
+    if type(expected_count) is not int or expected_count <= 0:
+        raise ValueError("Traffic receipt requires a positive integer request_attempts")
+    by_scope = {scope_id: set() for scope_id in scope_ids}
+    ordinals = Counter()
+    for journal in journals:
+        for entry in _attempt_entries(journal):
+            envelope_id = entry.get("envelope_id") if isinstance(entry, dict) else entry
+            if not isinstance(envelope_id, str):
+                raise ValueError("Expected a raw attempt record or envelope ID")
+            envelope = store.load_attempt_envelope(envelope_id)
+            if isinstance(entry, dict) and json.dumps(entry, sort_keys=True) != json.dumps(asdict(envelope), sort_keys=True):
+                raise ValueError("Journal record differs from its immutable raw envelope")
+            if envelope.cycle_id != cycle_id or envelope.scope_id not in by_scope:
+                raise ValueError("Original attempt belongs to another cycle or an unplanned scope")
+            if envelope.outcome_kind != "response":
+                raise ValueError(f"Original attempt recorded a transport error: {envelope.error_kind}")
+            ids = by_scope[envelope.scope_id]
+            if envelope_id in ids:
+                raise ValueError("Repeated raw attempt in the submitted journal")
+            ids.add(envelope_id)
+            ordinals[envelope.attempt] += 1
+    if sum(ordinals.values()) != expected_count:
+        raise ValueError("Raw journal does not account for every request_attempts entry in the traffic receipt")
+    # Concurrent clients may each start at one. Every later ordinal needs a distinct predecessor.
+    if any(i < 1 or (i > 1 and count > ordinals[i - 1]) for i, count in ordinals.items()):
+        raise ValueError("Missing earlier raw attempt ordinal")
+    envelopes = {key: sorted(ids) for key, ids in by_scope.items()}
+    if not all(envelopes.values()):
+        raise ValueError("Missing originals for a planned scope")
+    return envelopes

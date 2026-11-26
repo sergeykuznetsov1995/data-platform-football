@@ -6,8 +6,6 @@ import argparse
 import hashlib
 import json
 import sys
-from collections import Counter
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -56,36 +54,6 @@ def stage_plan(root: Path, cycle_id: str, inventory: Path) -> Path:
     return target
 
 
-def _attempt_entries(document):
-    if isinstance(document, dict) and "raw_attempts" in document:
-        entries = document["raw_attempts"]
-        if not isinstance(entries, list):
-            raise ValueError("Invalid raw_attempts journal")
-        if any(document.get(field) for field in (
-            "error", "errors", "failures", "failed_attempts", "failure_kind", "failure_stage", "check_failures", "cache_sources",
-        )) or ("status" in document and document["status"] not in ("complete", "completed", "success", "ok")):
-            raise ValueError("Bounded collection reported a failure or used prior-cycle evidence")
-        if "network_fetches" in document and (
-            type(document["network_fetches"]) is not int or document["network_fetches"] != len(entries)
-        ):
-            raise ValueError("Journal does not account for every reported network attempt")
-    else:
-        entries = document if isinstance(document, list) else [document]
-    if not entries:
-        raise ValueError("Empty bounded attempt journal")
-    return entries
-
-
-def _traffic_attempts(path: Path, cycle_id: str) -> int:
-    receipt = cycle.read_input_json(path.read_bytes())
-    if not isinstance(receipt, dict) or any(receipt.get(key, cycle_id) != cycle_id for key in ("cycle_id", "run_id")):
-        raise ValueError("Invalid traffic receipt or traffic belongs to another Airflow run")
-    count = receipt.get("request_attempts")
-    if type(count) is not int or count <= 0:
-        raise ValueError("Traffic receipt requires a positive integer request_attempts")
-    return count
-
-
 def stage_captures(root: Path, cycle_id: str, journals: list[Path], *, store: RawResponseStore,
                    started_at: datetime, traffic: Path) -> Path:
     """Validate all supplied attempts and dry-run the complete published plan before sealing it."""
@@ -96,40 +64,29 @@ def stage_captures(root: Path, cycle_id: str, journals: list[Path], *, store: Ra
     universe, scopes = cycle.validate_inventory(cycle.read_input_json(plan), cycle_id)
     if any(traffic.samefile(journal) for journal in journals):
         raise ValueError("Traffic must come from the collector's separate request counter")
-    expected_count = _traffic_attempts(traffic, cycle_id)
-    by_scope = {scope.scope_id: set() for scope in scopes}
-    ordinals = Counter()
+    traffic_bytes = traffic.read_bytes()
+    originals = {}
     for journal in journals:
-        for entry in _attempt_entries(cycle.read_input_json(journal.read_bytes())):
-            envelope_id = entry.get("envelope_id") if isinstance(entry, dict) else entry
-            if not isinstance(envelope_id, str):
-                raise ValueError("Expected a raw attempt record or envelope ID")
-            envelope = store.load_attempt_envelope(envelope_id)
-            if isinstance(entry, dict) and _json_bytes(entry) != _json_bytes(asdict(envelope)):
-                raise ValueError("Journal record differs from its immutable raw envelope")
-            if envelope.cycle_id != cycle_id or envelope.scope_id not in by_scope:
-                raise ValueError("Original attempt belongs to another cycle or an unplanned scope")
-            if envelope.outcome_kind != "response":
-                raise ValueError(f"Original attempt recorded a transport error: {envelope.error_kind}")
-            ids = by_scope[envelope.scope_id]
-            if envelope_id in ids:
-                raise ValueError("Repeated raw attempt in the submitted journal")
-            ids.add(envelope_id)
-            ordinals[envelope.attempt] += 1
-    if sum(ordinals.values()) != expected_count:
-        raise ValueError("Raw journal does not account for every request_attempts entry in the traffic receipt")
-    # Concurrent clients may each start at one. Every later ordinal needs a distinct predecessor.
-    if any(i < 1 or (i > 1 and count > ordinals[i - 1]) for i, count in ordinals.items()):
-        raise ValueError("Missing earlier raw attempt ordinal")
-    envelopes = {key: sorted(ids) for key, ids in by_scope.items()}
-    if not all(envelopes.values()):
-        raise ValueError("Missing originals for a planned scope")
+        data = journal.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in originals:
+            raise ValueError("Repeated raw attempt journal")
+        originals[digest] = data
+    envelopes = cycle.verify_attempt_journals(
+        store, cycle_id, (scope.scope_id for scope in scopes),
+        [cycle.read_input_json(data) for data in originals.values()], cycle.read_input_json(traffic_bytes),
+    )
     for scope in scopes:
         capture = cycle.CapturedScope(scope, tuple(envelopes[scope.scope_id]))
         # Use the consumer's complete replay and data-quality checks without opening a Bronze writer.
         cycle._parse(capture, store, universe=universe, started_at=started_at, write_options={})
     target = directory / "captures.json"
-    index = {"cycle_id": cycle_id, "plan_sha256": hashlib.sha256(plan).hexdigest(), "envelopes_by_scope": envelopes}
+    for digest, data in originals.items():
+        _write_once(directory / "evidence" / f"{digest}.json", data, "Original attempt journal differs")
+    _write_once(directory / "traffic.json", traffic_bytes, "Bounded traffic receipt differs for this cycle")
+    index = {"cycle_id": cycle_id, "plan_sha256": hashlib.sha256(plan).hexdigest(),
+             "envelopes_by_scope": envelopes, "attempt_journals": sorted(originals),
+             "traffic_sha256": hashlib.sha256(traffic_bytes).hexdigest()}
     _write_once(target, _json_bytes(index), "A different capture index is already published for this cycle")
     return target
 

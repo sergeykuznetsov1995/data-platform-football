@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from dags.scripts import run_transfermarkt_core as cli
 from dags.utils.transfermarkt_approval import load_standing_policy
 from scrapers.transfermarkt import core, native_writer
-from scrapers.transfermarkt.capture_replay import capture_replay
+from scrapers.transfermarkt.capture_replay import capture_replay, read_input_json, verify_attempt_journals
 from scrapers.transfermarkt.orchestrator import CoreRun, CoreScopePlan, planned_urls
 from scrapers.transfermarkt.raw_store import RawResponseStore
 from scrapers.transfermarkt.write_journal import _write_once
@@ -23,18 +23,6 @@ from scrapers.transfermarkt.write_journal import _write_once
 class CapturedScope:
     plan: CoreScopePlan
     envelopes: tuple[str, ...]
-
-
-def read_input_json(data):
-    def unique_keys(pairs):
-        obj = {}
-        for key, value in pairs:
-            if key in obj:
-                raise ValueError('Duplicate JSON key in Transfermarkt cycle input')
-            obj[key] = value
-        return obj
-
-    return json.loads(data, object_pairs_hook=unique_keys)
 
 
 def validate_inventory(inventory, cycle_id):
@@ -74,12 +62,14 @@ def validate_inventory(inventory, cycle_id):
     return universe, list(result.values())
 
 
-def _load_cycle(directory: Path, cycle_id: str):
+def _load_cycle(directory: Path, cycle_id: str, store):
     # The expected inventory is published independently of the responses.
     plan_bytes = (directory / 'plan.json').read_bytes()
     universe, plans = validate_inventory(read_input_json(plan_bytes), cycle_id)
     captures = read_input_json((directory / 'captures.json').read_bytes())
-    if not isinstance(captures, dict) or captures.keys() != {'cycle_id', 'plan_sha256', 'envelopes_by_scope'}:
+    if not isinstance(captures, dict) or captures.keys() != {
+        'cycle_id', 'plan_sha256', 'envelopes_by_scope', 'attempt_journals', 'traffic_sha256'
+    }:
         raise ValueError('Invalid Transfermarkt capture index fields')
     if (captures['cycle_id'] != cycle_id
             or captures['plan_sha256'] != hashlib.sha256(plan_bytes).hexdigest()):
@@ -96,6 +86,23 @@ def _load_cycle(directory: Path, cycle_id: str):
         result.append(CapturedScope(plan, tuple(envelopes)))
     if len(result) != len(by_scope):
         raise ValueError('Captured and planned scopes differ')
+    digests = captures['attempt_journals']
+    if (not isinstance(digests, list) or not digests or not all(
+            isinstance(d, str) and re.fullmatch('[0-9a-f]{64}', d) for d in digests)
+            or len(digests) != len(set(digests))):
+        raise ValueError('Missing or invalid original attempt journal identities')
+    traffic = (directory / 'traffic.json').read_bytes()
+    if hashlib.sha256(traffic).hexdigest() != captures['traffic_sha256']:
+        raise ValueError('Bounded traffic receipt digest differs')
+    journals = []
+    for digest in digests:
+        data = (directory / 'evidence' / (digest + '.json')).read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError('Original attempt journal digest differs')
+        journals.append(read_input_json(data))
+    observed = verify_attempt_journals(store, cycle_id, by_scope, journals, read_input_json(traffic))
+    if observed != by_scope:
+        raise ValueError('Capture index differs from the complete bounded attempt journal')
     return universe, result
 
 
@@ -172,15 +179,19 @@ def publish_cycle(root, policy_file, *, cycle_id, started_at):
     if not cycle_id or started_at is None or started_at.utcoffset() is None:
         raise ValueError('Missing Airflow run identity or start time')
     plan_file = prepare_scheduled_plan(root, cycle_id=cycle_id, started_at=started_at)
-    universe, scopes = _load_cycle(plan_file.parent, cycle_id)
     store = RawResponseStore.from_env()
     if store.uri_prefix != 's3://warehouse/raw/transfermarkt':
         raise ValueError('Scheduled ingestion requires the Transfermarkt source store')
+    universe, scopes = _load_cycle(plan_file.parent, cycle_id, store)
 
     # Validate every original, result and table grant before the first write.
+    cycle_plans = []
     for scope in scopes:
-        report = _parse(scope, store, universe=universe, started_at=started_at, write_options={})
+        report = _parse(scope, store, universe=universe, started_at=started_at,
+                        write_options={'collect_plans': cycle_plans})
         tables.update('iceberg.bronze.' + core.CORE_TABLES[item['entity']] for item in report.outcomes)
+    native_writer.validate_run_plans(cycle_plans)
+    del cycle_plans  # Release the parsed rows before replaying each scope for publication.
     _check_grant(policy, tables)
     write_options = cli._write_options(SimpleNamespace(trino_host=None, trino_port=None, trino_user=None))
     rows = receipts = 0

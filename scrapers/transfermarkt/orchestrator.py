@@ -703,7 +703,12 @@ class CoreRun:
         self._universe_version = universe_version
         self._extracted_at = extracted_at
 
-    def run(self, plan: CoreScopePlan, *, writer=None, connection_factory=None) -> CoreRunReport:
+    def run(self, plan: CoreScopePlan, *, writer=None, connection_factory=None,
+            collect_plans: list[native_writer.NativeWritePlan] | None = None) -> CoreRunReport:
+        """A dry run can collect native plans for validation across the caller's entire cycle."""
+        if collect_plans is not None and (writer is not None or connection_factory is not None):
+            raise ValueError('dry-run plan collection cannot take a writer or connection factory')
+        prepare_plans = collect_plans is not None or (writer is not None and connection_factory is not None)
         # An auto-sampled extraction clock must postdate every capture of its
         # own target (donor contracts reject extracted_at < captured_at), so
         # it is sampled after each target's walk: one clock and run identity
@@ -832,7 +837,7 @@ class CoreRun:
             if request.label == 'club_stadium':
                 unit = club_sections.confirm_stadium_absence(unit, profiles.get(request.url.removesuffix('/stadium')))
             outcomes.extend(unit)
-            if captured_at is not None and writer is not None and connection_factory is not None:
+            if captured_at is not None and prepare_plans:
                 # A multi-page merge writes one plan per contributing page capture.
                 entries = [
                     (item, _freshness_clock(item), _outcome_scope_values(item, request, plan))
@@ -847,20 +852,21 @@ class CoreRun:
             plans = [core.plan_for_outcome(item, captured_at=captured_at, scope_values=values)
                      for item, captured_at, values in entries]
             bundles.append((run_id, committed_at, plans))
-        # Every plan of the run is checked against every other before the
-        # first mutation: a collision between two targets must not surface
-        # after the first one has committed.
-        native_writer.validate_run_plans(
-            [plan for _run_id, _committed_at, plans in bundles for plan in plans])
+        scope_plans = [plan for _run_id, _committed_at, plans in bundles for plan in plans]
         receipts = []
-        for run_id, committed_at, plans in bundles:
-            receipt = native_writer.write_core_bundle(
-                connection_factory, writer, plans, run_id=run_id,
-                universe_version=self._universe_version, committed_at=committed_at,
-            )
-            if not isinstance(receipt, dict):
-                raise CoreRunError(f"Missing receipt for capture run {run_id}")
-            receipts.append(receipt)
+        if collect_plans is not None:
+            collect_plans.extend(scope_plans)
+        else:
+            # Check all targets before committing the first bundle.
+            native_writer.validate_run_plans(scope_plans)
+            for run_id, committed_at, plans in bundles:
+                receipt = native_writer.write_core_bundle(
+                    connection_factory, writer, plans, run_id=run_id,
+                    universe_version=self._universe_version, committed_at=committed_at,
+                )
+                if not isinstance(receipt, dict):
+                    raise CoreRunError(f"Missing receipt for capture run {run_id}")
+                receipts.append(receipt)
         verified = None
         if receipts:
             verified = {

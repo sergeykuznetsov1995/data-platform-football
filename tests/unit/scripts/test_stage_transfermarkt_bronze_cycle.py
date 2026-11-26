@@ -58,7 +58,7 @@ def batch(tmp_path):
     root = tmp_path / "stage"
     return SimpleNamespace(root=root, tmp=tmp_path, plan=_json(tmp_path / "source.json", inventory),
                            inventory=inventory, store=store, response=response, url=url,
-                           traffic=_json(tmp_path / "traffic.json", {"request_attempts": 1,
+                           traffic=_json(tmp_path / "traffic.json", {"cycle_id": CYCLE, "request_attempts": 1,
                                "decoded_response_body_bytes": len(body), "provider_metered_bytes": None}),
                            directory=cycle.cycle_directory(root, CYCLE))
 
@@ -91,14 +91,17 @@ def test_two_stage_cli_accepts_archive_objects_and_ids_and_consumes_exact_plan(b
             "--started-at", START.isoformat(), "--traffic", str(batch.traffic), "--attempts"]
     assert stage.main([*args, str(journal1), str(journal2)]) == 0
     index = batch.directory / "captures.json"
-    assert json.loads(index.read_bytes()) == {
+    loaded_index = json.loads(index.read_bytes())
+    assert loaded_index == {
+        "traffic_sha256": hashlib.sha256(batch.traffic.read_bytes()).hexdigest(),
+        "attempt_journals": sorted(hashlib.sha256(j.read_bytes()).hexdigest() for j in (journal1, journal2)),
         "cycle_id": CYCLE, "plan_sha256": hashlib.sha256(published).hexdigest(),
         "envelopes_by_scope": {"one": [first.envelope_id], "two": [second.envelope_id]},
     }
     original = index.stat()
     assert stage.main([*args, str(journal2), str(journal1)]) == 0
     assert (index.stat().st_ino, index.stat().st_mtime_ns) == (original.st_ino, original.st_mtime_ns)
-    universe, scopes = cycle._load_cycle(batch.directory, CYCLE)
+    universe, scopes = cycle._load_cycle(batch.directory, CYCLE, batch.store)
     assert universe == "registry-v1"
     assert [s.envelopes for s in scopes] == [(first.envelope_id,), (second.envelope_id,)]
 
@@ -224,7 +227,7 @@ def test_invalid_inputs_never_seal_even_when_a_success_is_present(batch, bad):
     elif bad == "empty":
         entries = []
     if isinstance(entries, list) and len(entries) > 1:
-        _json(batch.traffic, {"request_attempts": 2})
+        _json(batch.traffic, {"cycle_id": CYCLE, "request_attempts": 2})
     with pytest.raises((ValueError, RuntimeError, RawStoreError)):
         _capture(batch, entries)
     assert not (batch.directory / "captures.json").exists()
@@ -250,7 +253,7 @@ def test_missing_predecessor_rejected_even_with_undercounted_receipt(batch):
 
 
 @pytest.mark.parametrize("traffic", [
-    {}, [], {"request_attempts": 0}, {"request_attempts": True}, {"request_attempts": 1.0},
+    {}, [], {"request_attempts": 1}, {"request_attempts": 0}, {"request_attempts": True}, {"request_attempts": 1.0},
     {"request_attempts": "1"}, {"request_attempts": 1, "cycle_id": "other"},
     {"request_attempts": 1, "run_id": "other"}, {"request_attempts": -1},
 ])

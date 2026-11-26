@@ -170,32 +170,55 @@ def completion_error(report, connection_factory) -> str | None:
     if connection_factory is None:
         return None
 
-    # The writer has physically read back its tables. Match its per-member
-    # proofs to the immutable warehouse receipts and every reported capture.
-    proofs = Counter()
+    # CoreRun makes one native plan per conclusive outcome in the same order.
+    # The writer returns its proofs and their original plan hashes in that order.
+    outcomes = iter(report.outcomes)
+    expected = Counter()
     bundle_digests = defaultdict(set)
+    digest_by_receipt_id = {}
     for receipt in report.receipts:
         diagnostics = core._receipt_diagnostics(receipt)
         if diagnostics:
             return "invalid writer receipt: " + ", ".join(diagnostics)
         run = receipt["run_id"]
-        # An acknowledgement recovered from an older writer can have an alias.
-        digest = receipt.get("identity", {}).get("digest", receipt["plan_sha256"])
+        members = receipt.get("plans", ())
+        if not members:
+            return "writer bundle has no member proofs"
+        digest = receipt["plan_sha256"]
+        hashes = [None] * len(members)
+        identity = receipt.get("identity")
+        if identity is not None:
+            # An alias keeps the digest and member hashes used by the warehouse.
+            if not isinstance(identity, dict):
+                return "invalid writer bundle identity"
+            digest, hashes = identity.get("digest"), identity.get("plan_hashes")
+            if (not isinstance(digest, str) or not digest or not isinstance(hashes, (list, tuple))
+                    or len(hashes) != len(members) or not all(isinstance(h, str) and h for h in hashes)):
+                return "invalid writer bundle identity"
         if digest in bundle_digests[run]:
             return "duplicate writer bundle"
         bundle_digests[run].add(digest)
-        for proof in receipt.get("plans", ()):
+        for proof, plan_hash in zip(members, hashes, strict=True):
             if not proof.get("physical_hash") or proof["expected_rows"] != proof["rows"]:
                 return "writer member has no matching physical readback"
-            proofs[(run, digest, receipt["committed_batch"], proof["entity"],
-                    "iceberg.bronze." + proof["table"], proof["rows"], proof["physical_hash"])] += 1
-    if sum(proofs.values()) != len(report.outcomes):
+            outcome = next(outcomes, None)
+            if outcome is None or (run, proof["entity"], proof["table"], proof["rows"]) != (
+                    outcome["run_id"], outcome["entity"], core.CORE_TABLES.get(outcome["entity"]), outcome["rows"]):
+                return "writer member differs from its planned outcome"
+            member_id = None
+            if plan_hash is not None:
+                member_id = native_writer._receipt_id(plan_hash, run, digest)
+                if member_id in digest_by_receipt_id:
+                    return "duplicate writer member"
+                digest_by_receipt_id[member_id] = digest
+            expected[(member_id, plan_hash, run, digest, receipt["committed_batch"], outcome["entity"],
+                      "iceberg.bronze." + proof["table"], outcome["source_capture_id"], outcome["status"],
+                      outcome["status_reason"], outcome["rows"], proof["physical_hash"])] += 1
+    if next(outcomes, None) is not None:
         return "number of writer member proofs differs from the number of outcomes"
 
-    expected = Counter((o["run_id"], o["entity"], o["source_capture_id"], o["status"],
-                        o["status_reason"], o["rows"]) for o in report.outcomes)
-    run_ids = list(dict.fromkeys(o["run_id"] for o in report.outcomes))
-    stored_outcomes, stored_proofs = Counter(), Counter()
+    run_ids = list(bundle_digests)
+    stored = Counter()
     receipt_ids = set()
     with closing(connection_factory()) as connection, closing(connection.cursor()) as cursor:
         for start in range(0, len(run_ids), 100):
@@ -208,19 +231,23 @@ def completion_error(report, connection_factory) -> str | None:
                 WHERE scope_id = ? AND cycle_id = ? AND run_id IN ({placeholders})
             """, (report.scope_id, report.cycle_id, *group))
             for receipt_id, plan_hash, run, entity, capture, status, reason, planned, actual, batch, table, physical in rows:
-                # Separate packets may share a run ID when replay pins the extraction time.
-                digest = next((d for d in bundle_digests[run]
-                               if native_writer._receipt_id(plan_hash, run, d) == receipt_id), None)
+                digest = digest_by_receipt_id.get(receipt_id)
+                member_id, member_hash = receipt_id, plan_hash
                 if digest is None:
-                    continue
+                    # Older packets have no ordered plan hashes. Their digest still binds each receipt ID.
+                    digest = next((d for d in bundle_digests[run]
+                                   if native_writer._receipt_id(plan_hash, run, d) == receipt_id), None)
+                    if digest is None:
+                        continue  # Unrelated packet sharing the pinned run time.
+                    member_id, member_hash = None, None
                 if receipt_id in receipt_ids:
                     return "duplicate warehouse receipt"
                 receipt_ids.add(receipt_id)
                 if planned != actual:
                     return "stored receipt row count differs from its plan"
-                stored_outcomes[(run, entity, capture, status, reason, actual)] += 1
-                stored_proofs[(run, digest, batch, entity, table, actual, physical)] += 1
-    if stored_outcomes != expected or stored_proofs != proofs:
+                stored[(member_id, member_hash, run, digest, batch, entity, table,
+                        capture, status, reason, actual, physical)] += 1
+    if stored != expected:
         return "stored receipts differ from the outcomes or their physical readbacks"
     return None
 

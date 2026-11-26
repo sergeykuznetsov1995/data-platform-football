@@ -43,6 +43,23 @@ def _publish_test_inventory(root, snapshot, monkeypatch):
     return digest
 
 
+def _save_evidence(directory, index):
+    # This fixture simulates the two separate outputs of a bounded collector.
+    ids = []
+    for value in index["envelopes_by_scope"].values():
+        value.sort()
+        ids.extend(value)
+    journal = _plan_bytes(ids)
+    journal_digest = hashlib.sha256(journal).hexdigest()
+    evidence = directory / "evidence"
+    evidence.mkdir(exist_ok=True)
+    (evidence / (journal_digest + ".json")).write_bytes(journal)
+    traffic = _plan_bytes({"cycle_id": index["cycle_id"], "request_attempts": len(ids)})
+    (directory / "traffic.json").write_bytes(traffic)
+    index.update(attempt_journals=[journal_digest], traffic_sha256=hashlib.sha256(traffic).hexdigest())
+    _write_json(directory / "captures.json", index)
+
+
 @pytest.fixture
 def archived(tmp_path, monkeypatch):
     store = RawResponseStore(fs.LocalFileSystem(), str(tmp_path / "raw"),
@@ -62,6 +79,11 @@ def archived(tmp_path, monkeypatch):
             "url", "status_code", "headers", "fetched_at", "cycle_id", "scope_id", "endpoint", "attempt",
         )})
         assert (original.capture_id, original.content_hash) == (record["capture_id"], record["content_hash"])
+        # The historical batch had other attempts. The complete two-call test
+        # cycle uses its own identity/ordinals and preserves the source page bytes.
+        original = store.store_attempt(original.url, body, 200, original.headers, original.fetched_at,
+                                       "scheduled__two_coaches", original.scope_id, original.endpoint,
+                                       len(profiles) + 1)
         slug, _, _, coach = urlsplit(original.url).path.strip("/").split("/")
         targets.append(f"{coach}:{slug}")
         profiles[coach] = original
@@ -82,7 +104,7 @@ def archived(tmp_path, monkeypatch):
     plan_file.write_bytes(_plan_bytes(plan))
     index = {"cycle_id": original.cycle_id, "plan_sha256": hashlib.sha256(plan_file.read_bytes()).hexdigest(),
              "envelopes_by_scope": {original.scope_id: envelope_ids}}
-    _write_json(index_file, index)
+    _save_evidence(directory, index)
 
     policy = json.loads(POLICY.read_text())
     now = datetime.now(timezone.utc)
@@ -114,7 +136,7 @@ def _save_plan_and_index(archive):
     archive.plan["registry_snapshot_id"] = _publish_test_inventory(archive.root, archive.snapshot, archive.monkeypatch)
     archive.plan_file.write_bytes(_plan_bytes(archive.plan))
     archive.index["plan_sha256"] = hashlib.sha256(archive.plan_file.read_bytes()).hexdigest()
-    _write_json(archive.index_file, archive.index)
+    _save_evidence(archive.index_file.parent, archive.index)
 
 
 def _assert_rejected(archive, message):
@@ -210,8 +232,8 @@ def test_foreign_original_fails_even_if_plan_and_capture_index_agree(archived, f
                                         endpoint=original.endpoint, attempt=1, **context)
     envelope = archived.store.store_response_envelope(other)
     archived.index["envelopes_by_scope"][original.scope_id] = [envelope.envelope_id]
-    _write_json(archived.index_file, archived.index)
-    _assert_rejected(archived, "requested scope and cycle")
+    _save_evidence(archived.index_file.parent, archived.index)
+    _assert_rejected(archived, "another cycle or an unplanned scope")
 
 
 def test_page_fetched_before_dag_start_is_rejected(archived):
@@ -253,3 +275,66 @@ def test_publisher_requires_the_current_independently_pinned_inventory(archived,
         _publish(archived)
     archived.write_options.assert_not_called()
     assert archived.writer.writes == []
+
+
+def test_two_scopes_claiming_the_same_observations_fail_before_any_write(archived):
+    second = dict(archived.scope, scope_id="another-coach-scope")
+    archived.plan["scopes"].append(second)
+    envelope_ids = []
+    for ordinal, original in enumerate(archived.profiles.values(), 1):
+        body, _ = archived.store.load_capture(original.capture_id)
+        capture = archived.store.store_attempt(original.url, body, original.status_code, original.headers,
+                                              original.fetched_at, original.cycle_id, second["scope_id"],
+                                              original.endpoint, ordinal)
+        envelope_ids.append(archived.store.store_response_envelope(capture).envelope_id)
+    archived.index["envelopes_by_scope"][second["scope_id"]] = sorted(envelope_ids)
+    _save_plan_and_index(archived)
+    _save_evidence(archived.index_file.parent, archived.index)
+
+    with pytest.raises((ValueError, RuntimeError), match="natural key") as failure:
+        _publish(archived)
+    assert archived.db.sql.execute(
+        "SELECT name FROM sqlite_master WHERE name IN ('transfermarkt_coach_profiles', "
+        "'transfermarkt_core_receipts_v1')"
+    ).fetchall() == []
+    archived.write_options.assert_not_called()
+    assert archived.writer.writes == []
+    assert str(failure.value) == "duplicate core natural key across plans"
+
+
+@pytest.mark.parametrize("damage", ["omitted-403", "other-cycle-meter", "unbound-meter", "missing-journal",
+                                    "wrong-journal-digest", "wrong-meter-digest", "index-only"])
+def test_writer_independently_verifies_bounded_input_evidence(archived, damage):
+    directory = archived.index_file.parent
+    index = archived.index
+    meter = {"cycle_id": archived.original.cycle_id, "request_attempts": 2}
+    error = "receipt|journal|index"
+    if damage == "omitted-403":
+        # Genuine valid originals still fill every planned target. A third
+        # original was refused. The immutable journal and meter recorded it.
+        original = archived.original
+        denied = archived.store.store_attempt(original.url, b"Forbidden", 403, {}, original.fetched_at,
+            original.cycle_id, original.scope_id, original.endpoint, 3)
+        denied_id = archived.store.store_response_envelope(denied).envelope_id
+        evidence = directory / "evidence"
+        ids = json.loads((evidence / (index["attempt_journals"][0] + ".json")).read_bytes()) + [denied_id]
+        data = _plan_bytes(ids)
+        key = hashlib.sha256(data).hexdigest()
+        (evidence / (key + ".json")).write_bytes(data)
+        index["attempt_journals"] = [key]
+        meter["request_attempts"] = 3
+    elif damage == "other-cycle-meter":
+        meter["cycle_id"] = "previous"
+    elif damage == "unbound-meter":
+        del meter["cycle_id"]
+    elif damage == "missing-journal":
+        index["attempt_journals"] = []
+    elif damage == "wrong-journal-digest":
+        (directory / "evidence" / (index["attempt_journals"][0] + ".json")).write_bytes(b"[]")
+    elif damage == "index-only":
+        index.pop("attempt_journals")
+    data = _plan_bytes(meter)
+    (directory / "traffic.json").write_bytes(data)
+    index["traffic_sha256"] = "0" * 64 if damage == "wrong-meter-digest" else hashlib.sha256(data).hexdigest()
+    _write_json(archived.index_file, index)
+    _assert_rejected(archived, error)

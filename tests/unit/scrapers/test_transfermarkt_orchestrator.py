@@ -352,7 +352,8 @@ def test_cli_require_complete_rejects_partial_replay(tmp_path, monkeypatch, writ
 
 @pytest.mark.parametrize('damage', ['none', 'missing_member', 'duplicate_member', 'wrong_run',
                                     'missing_physical_proof', 'missing_receipt_readback', 'wrong_capture',
-                                    'wrong_bundle', 'unrelated_receipt', 'legacy_identity'])
+                                    'wrong_bundle', 'reordered_plan_hashes', 'unrelated_receipt',
+                                    'legacy_identity', 'alias_identity'])
 def test_cli_require_complete_checks_each_written_outcome(tmp_path, monkeypatch, damage):
     from dags.scripts import run_transfermarkt_core as cli
 
@@ -379,8 +380,13 @@ def test_cli_require_complete_checks_each_written_outcome(tmp_path, monkeypatch,
                            "WHERE entity = 'squad_memberships'", ('a' * 64,))
         elif damage == 'wrong_bundle':
             receipt['identity']['digest'] = 'a' * 64
+        elif damage == 'reordered_plan_hashes':
+            receipt['identity']['plan_hashes'].reverse()
         elif damage == 'legacy_identity':
             receipt.pop('identity')
+        elif damage == 'alias_identity':
+            # An alias journal's descriptor digest differs from its original warehouse identity.
+            receipt['plan_sha256'] = receipt['descriptor_digest'] = 'a' * 64
         elif damage == 'unrelated_receipt':
             # A pinned extraction clock can produce other packets with the same run ID.
             nw = orchestrator.native_writer
@@ -395,7 +401,31 @@ def test_cli_require_complete_checks_each_written_outcome(tmp_path, monkeypatch,
     monkeypatch.setattr(orchestrator.native_writer, 'write_core_bundle', write_with_damaged_receipt)
     args = ['offline', '--fixtures-root', str(tmp_path), '--league', 'GB1',
             '--season', '2627', '--write', '--require-complete']
-    assert cli.main(args) == (0 if damage in {'none', 'unrelated_receipt', 'legacy_identity'} else 1)
+    assert cli.main(args) == (0 if damage in {'none', 'unrelated_receipt', 'legacy_identity', 'alias_identity'} else 1)
+
+
+@pytest.mark.parametrize('legacy', [False, True], ids=['current', 'without_identity'])
+def test_final_readback_rejects_swapped_capture_ids_for_two_coach_profiles(legacy):
+    from dags.scripts.run_transfermarkt_core import completion_error
+
+    replay = _ReplayFetch({'coach_profile'})
+    plan = _plan(clubs=(), coach_profile_ids=(('139997', 'arturo-berroa'), ('7898', 'theodore-whitmore')))
+    run = CoreRun(replay.fetch, raw_loader=replay.raw_loader, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
+    db = CoreDB()
+    report = run.run(plan, writer=CoreWriter(db), connection_factory=lambda: db)
+    assert len(report.receipts) == 2 and len({r['run_id'] for r in report.receipts}) == 1
+    if legacy:
+        for receipt in report.receipts:
+            receipt.pop('identity')
+    assert completion_error(report, lambda: db) is None
+
+    rows = db.sql.execute('SELECT receipt_id, source_capture_id, physical_hash FROM transfermarkt_core_receipts_v1 '
+                          'ORDER BY receipt_id').fetchall()
+    (id_a, source_a, hash_a), (id_b, source_b, hash_b) = rows
+    assert source_a != source_b and hash_a != hash_b
+    db.sql.executemany('UPDATE transfermarkt_core_receipts_v1 SET source_capture_id = ? WHERE receipt_id = ?',
+                       [(source_b, id_a), (source_a, id_b)])
+    assert completion_error(report, lambda: db) is not None
 
 
 def test_complete_replay_option_cannot_start_live_acquisition(monkeypatch):
