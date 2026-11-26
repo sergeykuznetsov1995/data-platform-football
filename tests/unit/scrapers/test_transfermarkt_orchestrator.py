@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -170,6 +171,15 @@ def test_json_capture_without_raw_loader_fails_closed():
     run = CoreRun(replay.fetch, universe_version=UNIVERSE, extracted_at=EXTRACTED_AT)
     with pytest.raises(CoreRunError, match='raw body loader'):
         run.run(plan)
+
+
+@pytest.mark.parametrize('count,packet_sizes', [(0, ()), (100, (100,)), (201, (100, 100, 1))])
+def test_representation_packets_keep_player_order_and_the_final_partial_packet(count, packet_sizes):
+    players = tuple(str(i) for i in range(1, count + 1))
+    plan = _plan(clubs=(), representation_player_ids=players)
+    packets = [parse_qs(urlsplit(url).query)['ids[]'] for url in orchestrator.planned_urls(plan)]
+    assert tuple(len(packet) for packet in packets) == packet_sizes
+    assert tuple(player for packet in packets for player in packet) == players
 
 
 def test_planned_urls_cover_every_target_kind():
