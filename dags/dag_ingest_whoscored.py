@@ -57,6 +57,31 @@ _TASK_ENV = {
     "WHOSCORED_PROXY_FILE": os.environ.get("WHOSCORED_PROXY_FILE", ""),
 }
 
+
+def _preview_first_scopes(previous: Any, run_id: str) -> str:
+    """Give previews the next turn in scopes where match collection stopped."""
+    if isinstance(previous, str):
+        try:
+            previous = json.loads(previous)
+        except ValueError:
+            return ""
+    if not isinstance(previous, dict) or previous.get("command") != "daily":
+        return ""
+    airflow = previous.get("airflow")
+    errors = previous.get("error_details")
+    if not isinstance(airflow, dict) or not isinstance(errors, list):
+        return ""
+    if not airflow.get("dag_run_id") or airflow["dag_run_id"] == run_id:
+        return ""
+    scopes = {
+        error["scope"]
+        for error in errors
+        if isinstance(error, dict) and error.get("entity") == "matches"
+        and isinstance(error.get("scope"), str) and error["scope"].isprintable()
+    }
+    return "\n".join(sorted(scopes))
+
+
 def _load_report(path: str) -> dict[str, Any]:
     try:
         with Path(path).open("r", encoding="utf-8") as handle:
@@ -318,6 +343,7 @@ with DAG(
     start_date=datetime(2024, 1, 1),
     catchup=False,
     max_active_runs=1,
+    user_defined_macros={"whoscored_preview_first_scopes": _preview_first_scopes},
     tags=DAG_TAGS.get("whoscored"),
 ) as dag:
     discover_catalog = BashOperator(
@@ -351,7 +377,13 @@ with DAG(
             "--output {result} "
             "|| [ -s {result} ]"
         ).format(root=RUNTIME_ROOT, runner=RUNNER, result=RESULT_PATH),
-        env=_TASK_ENV,
+        env={
+            **_TASK_ENV,
+            "WHOSCORED_PREVIEW_FIRST_SCOPES": (
+                "{{ whoscored_preview_first_scopes("
+                "ti.xcom_pull(task_ids='ingest_matches', include_prior_dates=True), run_id) }}"
+            ),
+        },
         append_env=True,
         # SCRAPER_ARGS gives 2h; one daily over the denominator needs more.
         execution_timeout=timedelta(hours=8),
