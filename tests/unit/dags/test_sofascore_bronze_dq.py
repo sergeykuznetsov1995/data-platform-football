@@ -1,6 +1,7 @@
 """DQ must survive DAG validation, failure XComs, and window summaries."""
 
 import json
+from collections import UserList
 from types import SimpleNamespace
 
 import pytest
@@ -42,13 +43,20 @@ class FakeTI:
     def xcom_pull(self, task_ids=None, key="return_value", **kwargs):
         if isinstance(task_ids, (list, tuple)):
             return [self.xcom_pull(task_ids=task_id, key=key, **kwargs) for task_id in task_ids]
-        return self.pulls.get((task_ids, key), self.pulls.get(key))
+        rows = self.pulls.get((task_ids, key), self.pulls.get(key))
+        indexes = kwargs.get("map_indexes")
+        if indexes is not None and isinstance(rows, list):
+            if isinstance(indexes, int):
+                return rows[indexes]
+            return [rows[i] for i in indexes if rows[i] is not None]
+        return rows
 
 
-def _dag_run(validation_state="success"):
+def _dag_run(*validation_states):
     tasks = [
         SimpleNamespace(task_id="run_refresh_scope", state="success", map_index=0),
-        SimpleNamespace(task_id="validate_refresh_scope", state=validation_state, map_index=0),
+        *(SimpleNamespace(task_id="validate_refresh_scope", state=state, map_index=i)
+          for i, state in enumerate(validation_states or ("success",))),
         SimpleNamespace(task_id="window_summary", state="success", map_index=-1),
     ]
     return SimpleNamespace(
@@ -143,8 +151,170 @@ def test_refresh_window_summary_includes_failed_validation_dq_xcom():
         # Successful validators may also push DQ. Do not count that report twice.
         ("validate_refresh_scope", "bronze_dq"): [successful, failed],
     })
-    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("failed"))
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("success", "failed"))
     _assert_totals(summary["bronze_dq"])
+
+
+def test_refresh_counts_lazy_mapped_outcomes_and_refill_once():
+    initial = UserList([
+        {"status": "partial", "elapsed_s": 20, "bronze_dq": _report(checks=4)},
+        {"status": "transient_failure", "elapsed_s": 3},
+    ])
+    refill = {"status": "refreshed", "elapsed_s": 7, "bronze_dq": _report(checks=5)}
+    ti = FakeTI({
+        ("validate_refresh_scope", "return_value"): initial,
+        ("refill_refresh_window", "return_value"): {"outcomes": [refill]},
+    })
+
+    summary = refresh._propagate_status(ti=ti, dag_run=_dag_run())
+
+    assert summary["scopes"] == 3
+    assert summary["partial"] == 1
+    assert summary["initial_transient_failures"] == 1
+    assert summary["window_used_s"] == 30
+    assert summary["bronze_dq"]["checks"] == 9
+    assert summary["bronze_dq"]["scopes"] == 2
+
+
+def test_sparse_mapped_xcom_keeps_failed_report_between_successes(capsys):
+    reports = [_report(checks=2), _report("failed", checks=3), _report(checks=5)]
+    by_key = {
+        "return_value": {i: {"status": "refreshed", "bronze_dq": reports[i]} for i in (0, 2)},
+        "bronze_dq": {0: reports[0], 1: reports[1]},
+    }
+
+    def pull(task_ids, key="return_value", map_indexes=None):
+        if task_ids != "validate_refresh_scope":
+            return None
+        rows = by_key[key]
+        if isinstance(map_indexes, int):
+            return rows.get(map_indexes)
+        return UserList([rows[i] for i in (rows if map_indexes is None else map_indexes) if i in rows])
+
+    dag_run = _dag_run("success", "failed", "success")
+    with pytest.raises(refresh.AirflowException, match="validate_refresh_scope"):
+        refresh._propagate_status(ti=SimpleNamespace(xcom_pull=pull), dag_run=dag_run)
+
+    prefix = "SofaScore refresh window: "
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith(prefix))
+    summary = json.loads(line.removeprefix(prefix))
+    assert summary["scopes"] == 2
+    assert summary["bronze_dq"]["scopes"] == 3
+    assert summary["bronze_dq"]["checks"] == 10
+    assert summary["bronze_dq"]["failed"] == 1
+    assert summary["bronze_dq"]["violations"] == ["child-season mismatch"]
+
+
+@pytest.mark.parametrize("include_failed_receipt", [False, True])
+def test_partial_attempt_archive_preserves_retries_and_missing_validations(include_failed_receipt):
+    good, bad = _report(checks=5), _report("failed", checks=3)
+    first = {"scope_key": "c:1:1", "elapsed_s": 2, "bronze_dq": good}
+    last = {"scope_key": "c:3:3", "elapsed_s": 3, "bronze_dq": good}
+    # Two attempts for the first group, no receipt for the last.
+    attempts = [dict(first, run_id="r-0") for _ in range(2)]
+    if include_failed_receipt:
+        attempts.append({"scope_key": "c:2:2", "run_id": "r-1", "bronze_dq": bad})
+    ti = FakeTI({
+        ("validate_refresh_scope", "return_value"): UserList([first, last]),
+        ("validate_refresh_scope", "bronze_dq"): [None, bad],
+        ("refill_refresh_window", "return_value"): {
+            "initial_outcomes": attempts, "expected_scope_run_ids": ["r-0", "r-1", "r-2"],
+        },
+    })
+
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("success", "failed", "success"))
+
+    assert summary["window_used_s"] == 7
+    assert summary["bronze_dq"]["scopes"] == 4
+    assert summary["bronze_dq"]["checks"] == 18
+    assert summary["bronze_dq"]["status"] == "failed"
+    assert summary["bronze_dq"]["violations"] == ["child-season mismatch"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("archived_latest", [False, True])
+def test_partial_archive_counts_each_attempt_of_same_scope(tmp_path, legacy, archived_latest):
+    report = _report(checks=5)
+    result = dict(_partial_result(report), started_at="2026-11-26T01:00:00Z", elapsed_s=11)
+    env = _env(tmp_path, result)
+    validated = refresh._validate_refresh_scope(env, ti=FakeTI())
+    if legacy:
+        validated.pop("started_at", None)
+    older = dict(result, status="failed", started_at="2026-11-26T00:00:00Z", elapsed_s=7)
+    archive = [dict(older, scope_key=env["SOFASCORE_SCOPE_KEY"])]
+    if archived_latest:
+        archive.append(dict(result, scope_key=env["SOFASCORE_SCOPE_KEY"]))
+    ti = FakeTI({
+        ("validate_refresh_scope", "return_value"): [validated],
+        ("refill_refresh_window", "return_value"): {"initial_outcomes": archive},
+    })
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run())
+    assert (summary["scopes"], summary["partial"], summary["window_used_s"]) == (2, 1, 18)
+    assert summary["bronze_dq"]["checks"] == 10
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("keep_latest", [False, True])
+def test_distinguishes_identical_retry_reports_by_start_time(tmp_path, failed, keep_latest):
+    report = _report("failed" if failed else "success", checks=5)
+    result = dict(_result(report), started_at="2026-11-26T01:00:00Z", elapsed_s=7)
+    env = _env(tmp_path, result)
+    ti = FakeTI()
+    if failed:
+        with pytest.raises(refresh.AirflowException):
+            refresh._validate_refresh_scope(env, ti=ti)
+    else:
+        ti.pulls["return_value"] = [refresh._validate_refresh_scope(env, ti=ti)]
+    ti.pulls.update(ti.pushed)
+    scope = dict(result, scope_key=env["SOFASCORE_SCOPE_KEY"])
+    archive = [dict(scope, started_at="2026-11-26T00:00:00Z")]
+    if keep_latest:
+        archive.append(scope)
+    ti.pulls[("refill_refresh_window", "return_value")] = {
+        "initial_outcomes": archive, "expected_scope_run_ids": ["scope"],
+    }
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("failed" if failed else "success"))
+    assert (summary["scopes"], summary["window_used_s"]) == (2, 14)
+    assert summary["bronze_dq"]["checks"] == 10
+    assert summary["bronze_dq"]["failed"] == (2 if failed else 0)
+
+
+@pytest.mark.parametrize("mismatch", [None, "run_id", "source_season_id", "stale", "missing"])
+def test_failed_refill_preserves_only_its_own_dq_report(tmp_path, monkeypatch, mismatch):
+    from datetime import datetime, timedelta, timezone
+
+    report = _report("failed", checks=3)
+    result = _result(report, status="failed")
+    env = _env(tmp_path, result)
+    env.update({
+        "SOFASCORE_REFRESH_WINDOW_DEADLINE_EPOCH": "4000000000",
+        "SOFASCORE_SCOPE_TIMEOUT_S": "60", "SOFASCORE_CAMPAIGN_SNAPSHOT": "snapshot",
+        "SOFASCORE_EXPECTED_SNAPSHOT_ID": "snapshot-id", "SOFASCORE_SCOPE_OUTPUT_DIR": str(tmp_path),
+        "SOFASCORE_WORKLOAD_ARTIFACT": "artifact",
+    })
+    path = tmp_path / "scope-result.json"
+
+    def finish(**kwargs):
+        started = datetime.now(timezone.utc)
+        if mismatch == "stale":
+            started -= timedelta(days=1)
+        result["started_at"] = started.isoformat()
+        if mismatch in ("run_id", "source_season_id"):
+            result[mismatch] = "other"
+        if mismatch == "missing":
+            path.unlink()
+        else:
+            path.write_text(json.dumps(result))
+        return 1
+
+    monkeypatch.setattr(refresh.subprocess, "Popen", lambda *a, **k: SimpleNamespace(wait=finish))
+    outcome = refresh._execute_refill_scope(env)
+    assert outcome["status"] == "failed"
+    assert outcome.get("bronze_dq") == (report if mismatch is None else None)
+    if mismatch is None:
+        ti = FakeTI({("refill_refresh_window", "return_value"): {"outcomes": [outcome]}})
+        dq = refresh._window_summary(ti=ti)["bronze_dq"]
+        assert (dq["status"], dq["checks"], dq["violations"]) == ("failed", 3, ["child-season mismatch"])
 
 
 def test_refresh_propagates_validation_failure_even_if_scope_process_succeeded():

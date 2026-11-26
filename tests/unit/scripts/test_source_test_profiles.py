@@ -17,7 +17,7 @@ PROFILES = (
     ('fbref-ci.yml', 'seaweedfs-raw-smoke', 'fbref-s3-py311', '3.11',
      'pytest pyarrow boto3 psycopg2-binary'),
     ('sofascore-ci.yml', 'unit', 'sofascore-unit-py311', '3.11',
-     'pytest ruff pandas numpy pyarrow trino requests pyyaml jinja2 jsonschema tls-client-python python-dotenv tenacity pybreaker rapidfuzz unidecode nicknames sqlglot duckdb'),
+     'pytest ruff pandas numpy pyarrow trino requests beautifulsoup4 pyyaml jinja2 jsonschema tls-client-python python-dotenv tenacity pybreaker rapidfuzz unidecode nicknames sqlglot duckdb'),
     ('sofascore-discovery.yml', 'validate', 'sofascore-discovery-py312', '3.12',
      'pytest pyyaml requests pandas typing-extensions tls-client-python'),
     ('fotmob-ci.yml', 'recipe', 'fotmob-recipe-py312', '3.12', 'pytest pyyaml'),
