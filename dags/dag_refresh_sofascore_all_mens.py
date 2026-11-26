@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -1149,12 +1150,13 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
     if dag_run is None:
         raise AirflowException("refresh watcher has no DagRun")
     failures = []
-    for task_instance in dag_run.get_task_instances():
+    task_instances = list(dag_run.get_task_instances())
+    for task_instance in task_instances:
         if task_instance.task_id not in REFRESH_TASK_IDS:
             continue
         if _task_state(task_instance) in {"failed", "upstream_failed"}:
             failures.append(task_instance.task_id)
-    summary = _window_summary(context)
+    summary = _window_summary(context, task_instances=task_instances)
     print(f"SofaScore refresh window: {json.dumps(summary, sort_keys=True)}")
     # One provider blip costs a scope; this many means the transport is down.
     if summary["initial_transient_failures"] >= MAX_INITIAL_TRANSIENT_FAILURES:
@@ -1164,6 +1166,19 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
             "SofaScore refresh attempt failed: " + ", ".join(sorted(failures))
         )
     return {"status": "success", **summary}
+
+
+def _validation_xcoms(ti: Any, **filters: Any) -> list[dict[str, Any]]:
+    try:
+        rows = ti.xcom_pull(task_ids="validate_refresh_scope", **filters)
+        if isinstance(rows, dict):
+            return [rows]
+        # Both supported Airflow versions return a lazy Sequence for mapped tasks.
+        if isinstance(rows, Sequence) and not isinstance(rows, (str, bytes, bytearray)):
+            return [row for row in rows if isinstance(row, dict)]
+    except Exception as exc:
+        print(f"refresh validation XCom unavailable ({filters}): {exc}")
+    return []
 
 
 def _window_summary(
@@ -1182,42 +1197,27 @@ def _window_summary(
     season_fields = None
     ti = context.get("ti")
     if ti is not None:
-        try:
-            pulled = ti.xcom_pull(task_ids="validate_refresh_scope")
-        except Exception as exc:  # the verdict above must not hinge on it
-            print(f"refresh window summary unavailable: {exc}")
-            pulled = None
-        if isinstance(pulled, dict):
-            pulled = [pulled]
-        elif not isinstance(pulled, list):
-            pulled = []
-        outcomes = [item for item in pulled if isinstance(item, dict)]
-        try:
-            # #1371: failed validators push their DQ report instead of
-            # returning it; read it alongside the return values.
-            explicit_dq = ti.xcom_pull(
-                task_ids="validate_refresh_scope", key="bronze_dq"
-            )
-        except Exception as exc:
-            print(f"refresh bronze DQ summary unavailable: {exc}")
-            explicit_dq = None
-        if isinstance(explicit_dq, dict):
-            explicit_dq = [explicit_dq]
-        elif not isinstance(explicit_dq, list):
-            explicit_dq = []
-        # Align the two forms by mapped index so one scope's report is never
-        # counted twice, while a report that exists in only one of them —
-        # typically a failed validator's — still reaches the summary.
-        for index, item in enumerate(pulled):
-            report = item.get("bronze_dq") if isinstance(item, dict) else None
-            if not isinstance(report, dict) and index < len(explicit_dq):
-                report = explicit_dq[index]
-            if isinstance(report, dict):
-                dq_reports.append(report)
-        dq_reports.extend(
-            report for report in explicit_dq[len(pulled):]
-            if isinstance(report, dict)
-        )
+        outcomes = _validation_xcoms(ti)
+        dq_reports = [
+            item["bronze_dq"] for item in outcomes if isinstance(item.get("bronze_dq"), dict)
+        ]
+        # A failed validator pushes its report before raising and has no return
+        # value. Airflow omits absent XComs, so list offsets are not map indexes.
+        task_instances = context.get("task_instances")
+        if task_instances is None and context.get("dag_run") is not None:
+            task_instances = context["dag_run"].get_task_instances()
+        if task_instances is None:
+            # A standalone summary has no task states. Keep pushed reports that
+            # are absent from the return values (including a lone failed report).
+            pushed = _validation_xcoms(ti, key="bronze_dq")
+            dq_reports += [report for report in pushed if report not in dq_reports]
+        else:
+            failed_indexes = [
+                task.map_index for task in task_instances
+                if task.task_id == "validate_refresh_scope" and _task_state(task) == "failed"
+            ]
+            if failed_indexes:
+                dq_reports.extend(_validation_xcoms(ti, key="bronze_dq", map_indexes=failed_indexes))
         try:
             refill = ti.xcom_pull(task_ids="refill_refresh_window")
         except Exception as exc:

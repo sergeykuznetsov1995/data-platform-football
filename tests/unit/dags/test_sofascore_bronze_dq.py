@@ -1,6 +1,7 @@
 """DQ must survive DAG validation, failure XComs, and window summaries."""
 
 import json
+from collections import UserList
 from types import SimpleNamespace
 
 import pytest
@@ -42,13 +43,17 @@ class FakeTI:
     def xcom_pull(self, task_ids=None, key="return_value", **kwargs):
         if isinstance(task_ids, (list, tuple)):
             return [self.xcom_pull(task_ids=task_id, key=key, **kwargs) for task_id in task_ids]
-        return self.pulls.get((task_ids, key), self.pulls.get(key))
+        rows = self.pulls.get((task_ids, key), self.pulls.get(key))
+        if kwargs.get("map_indexes") is not None and isinstance(rows, list):
+            return [rows[i] for i in kwargs["map_indexes"] if rows[i] is not None]
+        return rows
 
 
-def _dag_run(validation_state="success"):
+def _dag_run(*validation_states):
     tasks = [
         SimpleNamespace(task_id="run_refresh_scope", state="success", map_index=0),
-        SimpleNamespace(task_id="validate_refresh_scope", state=validation_state, map_index=0),
+        *(SimpleNamespace(task_id="validate_refresh_scope", state=state, map_index=i)
+          for i, state in enumerate(validation_states or ("success",))),
         SimpleNamespace(task_id="window_summary", state="success", map_index=-1),
     ]
     return SimpleNamespace(
@@ -143,8 +148,58 @@ def test_refresh_window_summary_includes_failed_validation_dq_xcom():
         # Successful validators may also push DQ. Do not count that report twice.
         ("validate_refresh_scope", "bronze_dq"): [successful, failed],
     })
-    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("failed"))
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("success", "failed"))
     _assert_totals(summary["bronze_dq"])
+
+
+def test_refresh_counts_lazy_mapped_outcomes_and_refill_once():
+    initial = UserList([
+        {"status": "partial", "elapsed_s": 20, "bronze_dq": _report(checks=4)},
+        {"status": "transient_failure", "elapsed_s": 3},
+    ])
+    refill = {"status": "refreshed", "elapsed_s": 7, "bronze_dq": _report(checks=5)}
+    ti = FakeTI({
+        ("validate_refresh_scope", "return_value"): initial,
+        ("refill_refresh_window", "return_value"): {"outcomes": [refill]},
+    })
+
+    summary = refresh._propagate_status(ti=ti, dag_run=_dag_run())
+
+    assert summary["scopes"] == 3
+    assert summary["partial"] == 1
+    assert summary["initial_transient_failures"] == 1
+    assert summary["window_used_s"] == 30
+    assert summary["bronze_dq"]["checks"] == 9
+    assert summary["bronze_dq"]["scopes"] == 2
+
+
+def test_sparse_mapped_xcom_keeps_failed_report_between_successes(capsys):
+    reports = [_report(checks=2), _report("failed", checks=3), _report(checks=5)]
+    by_key = {
+        "return_value": {i: {"status": "refreshed", "bronze_dq": reports[i]} for i in (0, 2)},
+        "bronze_dq": {0: reports[0], 1: reports[1]},
+    }
+
+    def pull(task_ids, key="return_value", map_indexes=None):
+        if task_ids != "validate_refresh_scope":
+            return None
+        rows = by_key[key]
+        if isinstance(map_indexes, int):
+            return rows.get(map_indexes)
+        return UserList([rows[i] for i in (rows if map_indexes is None else map_indexes) if i in rows])
+
+    dag_run = _dag_run("success", "failed", "success")
+    with pytest.raises(refresh.AirflowException, match="validate_refresh_scope"):
+        refresh._propagate_status(ti=SimpleNamespace(xcom_pull=pull), dag_run=dag_run)
+
+    prefix = "SofaScore refresh window: "
+    line = next(line for line in capsys.readouterr().out.splitlines() if line.startswith(prefix))
+    summary = json.loads(line.removeprefix(prefix))
+    assert summary["scopes"] == 2
+    assert summary["bronze_dq"]["scopes"] == 3
+    assert summary["bronze_dq"]["checks"] == 10
+    assert summary["bronze_dq"]["failed"] == 1
+    assert summary["bronze_dq"]["violations"] == ["child-season mismatch"]
 
 
 def test_refresh_propagates_validation_failure_even_if_scope_process_succeeded():
