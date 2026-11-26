@@ -1,6 +1,7 @@
 """A retained source stub is unavailable, never an empty accepted calendar."""
 import copy
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -10,11 +11,11 @@ import pytest
 
 from scrapers.fotmob.catalog import classify_competition, competition_from_league_payload
 from scrapers.fotmob.planner import RunMode, ScopeAttemptState
-from scrapers.fotmob.repository import ManifestStatus
+from scrapers.fotmob.repository import ManifestStatus, TargetCommit, deterministic_target_batch_id
 from scrapers.fotmob.service import _is_calendar_unavailable_stub
 from scrapers.fotmob.transport import FetchOutcome, canonicalize_target
 from tests.unit.scrapers.test_fotmob_calendar_contract import calendar
-from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload, _service
 
 
 def unavailable():
@@ -25,6 +26,185 @@ def unavailable():
 def seasons_only_unavailable():
     path = Path(__file__).parents[2] / "fixtures/fotmob/league_9862_calendar_unavailable.json"
     return json.loads(path.read_text())
+
+
+def stats_links_only_unavailable():
+    path = Path(__file__).parents[2] / "fixtures/fotmob/league_221_2020_calendar_unavailable.json"
+    body = path.read_bytes()
+    # Immutable raw selected by the history run of 2026-11-26 for 221=2020.
+    assert hashlib.sha256(body).hexdigest() == "a049a1afcb0d7889ae830266f62a36aebfcff47bc99d66204c3914fd70f270b2"
+    return json.loads(body)
+
+
+@pytest.mark.parametrize("persist", [True, False])
+def test_retained_stats_index_with_no_calendar_stays_retryable(persist):
+    payload = stats_links_only_unavailable()
+    target = canonicalize_target("leagues", {"id": 221, "season": "2020"})
+    svc, _, repo = _service({target.canonical_url: payload}, mode=RunMode.BACKFILL)
+    method = svc.sync_season if persist else svc.read_season_dependency
+    op, bundle = method(221, "2020")
+    assert bundle is None and op.status == "retryable" and op.succeeded == 0
+    assert op.metadata["calendar_unavailability"]["reason"] == "source_calendar_unavailable"
+    assert [c.status for c in repo.commits] == ([ManifestStatus.RETRYABLE_FAILURE] if persist else [])
+    assert not repo.latest_success(target.target_key)
+    assert not repo.tables.get("fotmob_matches")
+
+
+@pytest.mark.parametrize("variant", [
+    "player_stats", "team_stats", "overview_players", "shot_map", "table",
+    "malformed_link", "malformed_names", "fixture_data", "known_matches", "replay",
+])
+def test_stats_index_does_not_hide_data_or_invalid_calendars(variant):
+    payload = stats_links_only_unavailable()
+    if variant == "player_stats":
+        payload["stats"]["players"] = [{"name": "goals"}]
+    elif variant == "team_stats":
+        payload["stats"]["teams"] = [{"name": "goals"}]
+    elif variant == "overview_players":
+        payload["overview"]["topPlayers"]["byRating"]["players"] = [{"id": 17}]
+    elif variant == "shot_map":
+        payload["overview"]["shotMap"] = {"shots": [{"id": 1}]}
+    elif variant == "table":
+        payload["overview"]["table"] = [{"id": 1}]
+    elif variant == "malformed_link":
+        payload["stats"]["seasonStatLinks"][0]["RelativePath"] = {"rows": [1]}
+    elif variant == "malformed_names":
+        payload["stats"]["seasonsWithLinks"] = "2020"
+    elif variant == "fixture_data":
+        payload["fixtures"]["allMatches"] = {"matchId": 1}
+    url = canonicalize_target("leagues", {"id": 221, "season": "2020"}).canonical_url
+    mode = RunMode.REPLAY if variant == "replay" else RunMode.BACKFILL
+    svc, transport, repo = _service({url: payload}, mode=mode)
+    if variant == "known_matches":
+        repo.has_committed_matches = Mock(return_value=True)
+    op, bundle = svc.sync_season(221, "2020")
+    assert bundle is None and op.errors
+    assert repo.commits[-1].status == ManifestStatus.SCHEMA_DRIFT
+    assert "calendar_unavailability" not in op.metadata
+    if variant == "replay":
+        assert transport.calls == [(url, True)] and svc.ledger.requests == 0
+
+
+def history_with_legacy_calendar():
+    target = canonicalize_target("leagues", {"id": 221, "season": "2020"})
+    archive = stats_links_only_unavailable()
+    recovered = _league_payload("2020")
+    recovered["details"].update(id=221, latestSeason="2025")
+    recovered["allAvailableSeasons"] = ["2025", "2020"]
+    recovered["stats"] = {}
+    old = StubTransport({target.canonical_url: archive}).replay_json(target.canonical_url)
+    svc, transport, repo = _service({}, mode=RunMode.BACKFILL)
+    repo.commit(TargetCommit(
+        run_id="legacy", target_type="league_season", target_key=target.target_key,
+        competition_id="221", source_season_key="2020", status=ManifestStatus.SUCCESS,
+        content_hash=old.content_hash, raw_uri=old.raw_uri,
+        fetched_at=datetime(2025, 9, 20), capabilities={"canonical_url": target.canonical_url},
+        expected_counts={"matches": 0},
+    ))
+    return svc, transport, repo, target, old, recovered
+
+
+@pytest.mark.parametrize("variant", [
+    "still_missing_304", "recovered", "stale", "offline", "replay", "not_due",
+    "healthy_archive", "known_matches", "wrong_archived_season",
+])
+def test_only_due_archived_calendar_is_revalidated_with_source_evidence(variant):
+    svc, transport, repo, target, old, recovered = history_with_legacy_calendar()
+    url = target.canonical_url
+    fresh = StubTransport({url: recovered}).fetch_json(url)
+    archived = old
+    if variant == "still_missing_304":
+        fresh = replace(old, outcome=FetchOutcome.NOT_MODIFIED, http_status=304, attempts=1)
+    elif variant == "stale":
+        fresh = replace(fresh, outcome=FetchOutcome.STALE_REPLAY, http_status=503, stale=True)
+    elif variant == "offline":
+        fresh = replace(old, outcome=FetchOutcome.RETRYABLE_FAILURE, http_status=503, attempts=1)
+    elif variant == "replay":
+        svc.mode = RunMode.REPLAY
+    elif variant == "known_matches":
+        repo.has_committed_matches = Mock(return_value=True)
+    elif variant == "healthy_archive":
+        archived = recovered
+    elif variant == "wrong_archived_season":
+        archived = copy.deepcopy(old.data)
+        archived["details"]["selectedSeason"] = "2021"
+        fresh = StubTransport({url: old.data}).fetch_json(url)
+    transport.responses[url] = [archived, fresh]
+    op, bundle = svc.read_season_dependency(221, "2020", revalidate_unavailable=variant != "not_due")
+    online = variant in {"still_missing_304", "recovered", "stale", "offline", "wrong_archived_season"}
+    assert transport.calls == ([(url, True), (url, False)] if online else [(url, True)])
+    assert svc.ledger.requests == int(online)
+    if variant == "recovered":
+        assert bundle and op.succeeded == 1 and op.metadata["persisted"]
+        assert [str(row["match_id"]) for row in repo.tables["fotmob_matches"]] == ["100"]
+        assert repo.commits[-1].batch_id == deterministic_target_batch_id(target.target_key, fresh.content_hash)
+    elif variant == "healthy_archive":
+        assert bundle and op.succeeded == 1 and not op.metadata["persisted"]
+        assert len(repo.commits) == 1
+    else:
+        assert bundle is None and op.succeeded == 0
+        if variant in {"replay", "known_matches"}:
+            assert op.errors
+        else:
+            assert op.retryable
+        if variant == "still_missing_304":
+            assert op.metadata["calendar_unavailability"]["http_status"] == 304
+        if variant == "stale":
+            assert op.metadata["calendar_revalidation"]["stale"] is True
+        if variant in {"stale", "offline"}:
+            assert op.metadata["calendar_unavailability"]["content_hash"] == old.content_hash
+            assert op.metadata["calendar_revalidation"]["http_status"] == 503
+        assert not repo.tables.get("fotmob_matches")
+
+
+def test_history_finishes_recovered_calendar_only_after_its_match_is_collected(monkeypatch):
+    from tests.unit.scrapers.test_run_fotmob_scraper import TestFotmobNativeRunner, _run_native_admitted
+    mod = TestFotmobNativeRunner._module()
+    monkeypatch.setenv(mod.WRITER_LOCK_ENV, "0")
+    svc, transport, repo, target, old, recovered = history_with_legacy_calendar()
+    campaign = "fmplan1-15baa7dff09f3aae879da775d8684bc4c4b4d6803e821f40c79f36a7cae7054b"
+    svc.record_scope_completion(221, "2020", plan_signature=campaign, counts={"matches": 0},
+                                coverage={"match_identity_hash": hashlib.sha256(b"").hexdigest()})
+    profile = copy.deepcopy(recovered)
+    profile["details"]["selectedSeason"] = "2025"
+    profile["allAvailableSeasons"].append("2019")
+    older = copy.deepcopy(recovered)
+    older["details"]["selectedSeason"] = "2019"
+    older["fixtures"]["allMatches"] = []
+    match = canonicalize_target("matchDetails", {"matchId": 100}).canonical_url
+    outage = replace(old, outcome=FetchOutcome.RETRYABLE_FAILURE, attempts=1, http_status=503, stale=False)
+    transport.responses.update({
+        canonicalize_target("allLeagues").canonical_url: {"countries": [{"leagues": [{"id": 221, "name": profile["details"]["name"]}]}]},
+        canonicalize_target("leagues", {"id": 221}).canonical_url: profile,
+        canonicalize_target("leagues", {"id": 221, "season": "2019"}).canonical_url: older,
+        target.canonical_url: [old, recovered, recovered],
+        match: [outage, {"general": {"matchId": "100"}, "content": {"matchFacts": {"events": []}}}],
+    })
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    previous = ScopeAttemptState(221, "2020", "history-test", 2, now-timedelta(days=2),
+                                 now-timedelta(days=1), "retryable", "source_calendar_unavailable")
+    repo.scope_attempt_states = lambda *args, **kwargs: {(221, "2020"): previous}
+    args = mod._argument_parser().parse_args(["--mode", "backfill", "--catalog-contract", "fotmob-catalog-v1",
+                                              "--entities", "season,matches,leaderboards", "--season-limit", "1"])
+    rc, limited = _run_native_admitted(mod, args, service=svc)
+    assert rc == 0 and limited["selection"]["completed_scopes"] == ["221=2019"]
+    deferred = next(a for a in limited["selection"]["scope_attempts"] if a["source_season_key"] == "2020")
+    assert deferred["outcome"] == "deferred" and deferred["reason"] == "source_calendar_unavailable"
+    assert not any(url == target.canonical_url for url, _ in transport.calls)
+    previous = replace(previous, outcome=deferred["outcome"], reason=deferred["reason"])
+    args.season_limit = 0
+    rc, first = _run_native_admitted(mod, args, service=svc)
+    assert rc and not first["selection"]["completed_scopes"]
+    assert repo.tables["fotmob_matches"] and not repo.tables.get("fotmob_match_payloads")
+    # The next attempt's reason concerns the match now. It reads the recovered
+    # season from raw and must still collect that match before taking credit.
+    previous = replace(previous, reason="match incomplete")
+    rc, final = _run_native_admitted(mod, args, service=svc)
+    assert rc == 0, final["errors"]
+    assert final["selection"]["completed_scopes"] == ["221=2020"]
+    assert [str(row["match_id"]) for row in repo.tables["fotmob_match_payloads"]] == ["100"]
+    assert transport.calls.count((target.canonical_url, False)) == 1
+    assert len([c for c in repo.commits if c.target_type == "scope_completion" and c.entity_id == campaign]) == 1
 
 
 def test_seasons_only_fixture_matches_retained_copy_hash_and_scope():

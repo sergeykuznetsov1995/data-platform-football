@@ -210,6 +210,40 @@ def test_explicit_history_scopes_are_not_reduced_to_one_cycle():
     ]
 
 
+@pytest.mark.parametrize(
+    "hours_until_retry,older_already_complete,expected",
+    [
+        (-1, False, [(49, "2019/2020"), (47, "2021")]),
+        (1, False, [(49, "2019/2020")]),
+        (-1, True, [(47, "2021")]),
+    ],
+)
+def test_history_calendar_retry_shares_wave_with_the_next_ready_cycle(
+    hours_until_retry, older_already_complete, expected,
+):
+    now = datetime(2026, 11, 26, 10)
+    seasons = [
+        SeasonRef(47, "2021"), SeasonRef(49, "2019/2020"), SeasonRef(50, "2018"),
+    ]
+    attempts = {
+        season.identity: ScopeAttemptState(
+            competition_id=season.competition_id, source_season_key=season.source_season_key,
+            plan_signature="fmplan1-test", attempt_count=2,
+            last_attempt_at=now - timedelta(days=1),
+            next_retry_at=now + timedelta(hours=hours_until_retry),
+            outcome="retryable", reason="source_calendar_unavailable",
+        )
+        for season in (seasons[0], seasons[2])
+    }
+    plan = plan_seasons(
+        [_classified(s.competition_id) for s in seasons], seasons,
+        mode=RunMode.BACKFILL, lane=ScopeLane.HISTORY, now=now,
+        attempt_states=attempts,
+        previously_successful={(49, "2019/2020")} if older_already_complete else (),
+    )
+    assert [item.identity for item in plan] == expected
+
+
 def test_retryable_scope_not_due_does_not_starve_later_ready_scopes():
     now = datetime(2026, 8, 8, 10)
     attempts = {

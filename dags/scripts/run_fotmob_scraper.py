@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
-from scrapers.fotmob.match_refresh import MATCH_SETTLE_MARGIN, match_refresh, source_observed_at
+from scrapers.fotmob.match_refresh import MATCH_SETTLE_MARGIN, match_refresh, match_time, source_observed_at
 from scrapers.fotmob.domain import ScopeRef, SeasonBundle
 from scrapers.fotmob.interruption import FotMobTerminated
 from scrapers.fotmob.shared_rate_limiter import (
@@ -1804,35 +1804,24 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
     ]
     if automatic_catalog:
-        discovery_times: dict[int, datetime] = {}
-        latest_entity_attempt = getattr(
-            service.repository, "latest_entity_attempt", None
-        )
-        for item in candidates:
-            previous = (
-                latest_entity_attempt(
-                    "competition_seasons", item.competition.competition_id
-                )
-                if latest_entity_attempt is not None
-                else None
-            )
-            raw_completed_at = previous.get("completed_at") if previous else None
-            try:
-                completed_at = (
-                    raw_completed_at
-                    if isinstance(raw_completed_at, datetime)
-                    else datetime.fromisoformat(str(raw_completed_at))
-                )
-                if completed_at.tzinfo is not None:
-                    completed_at = completed_at.astimezone(timezone.utc).replace(
-                        tzinfo=None
-                    )
-            except (TypeError, ValueError):
-                completed_at = datetime.min
-            discovery_times[item.competition.competition_id] = completed_at
+        candidate_ids = [item.competition.competition_id for item in candidates]
+        bulk_lookup = getattr(service.repository, "competition_discovery_times", None)
+        if bulk_lookup is not None:
+            discovery_times = bulk_lookup(candidate_ids)
+        else:
+            # Older injected repositories expose only the single-entity reader.
+            discovery_times = {}
+            latest_attempt = getattr(service.repository, "latest_entity_attempt", None)
+            if latest_attempt is not None:
+                for competition_id in candidate_ids:
+                    previous = latest_attempt("competition_seasons", competition_id)
+                    if previous:
+                        timestamp = match_time(previous.get("completed_at"))
+                        if timestamp is not None:
+                            discovery_times[competition_id] = timestamp
         candidates.sort(
             key=lambda item: (
-                discovery_times[item.competition.competition_id],
+                discovery_times.get(item.competition.competition_id, datetime.min),
                 item.competition.competition_id,
             )
         )
@@ -2340,6 +2329,12 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     ) -> None:
         if not automatic_catalog or automatic_contract is None:
             return
+        previous = attempt_states.get(item.identity)
+        if outcome == "deferred" and mode == RunMode.BACKFILL and previous and previous.awaiting_source_calendar:
+            # The work plan records the budget/deadline deferral. No source
+            # call superseded the calendar evidence that the next retry needs.
+            reason = previous.reason
+            attempt_identities = previous.attempt_identities
         attempt_operation.attempted += 1
         try:
             state = service.record_scope_attempt(
@@ -2791,11 +2786,30 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             if campaign_scope_complete
             else service.sync_season
         )
+        previous_attempt = attempt_states.get(item.identity)
+        revalidate_unavailable = (
+            automatic_catalog and mode == RunMode.BACKFILL
+            and previous_attempt is not None and previous_attempt.awaiting_source_calendar
+        )
         operation, bundle = season_method(
             item.competition_id,
             item.source_season_key,
             prefetched=selected_fetches.get(item.identity),
+            **({"revalidate_unavailable": True} if revalidate_unavailable else {}),
         )
+        if campaign_scope_complete and operation.metadata.get("calendar_recovered_from"):
+            # The old campaign marker predates this recovered calendar. Its
+            # match family must complete under the normal history rules.
+            campaign_scope_complete = False
+            bridge = work_plan.metadata["campaign_completion_bridge"]
+            bridge["replanned_family_scopes"]["matches"] += 1
+            bridge["replanned_family_scope_tokens"]["matches"].append(scope_key)
+            bridge["credited_family_scopes"]["matches"] -= 1
+            if operation.metadata.get("persisted"):
+                bridge["replanned_family_scopes"]["season"] += 1
+                bridge["replanned_family_scope_tokens"]["season"].append(scope_key)
+                bridge["credited_family_scopes"]["season"] -= 1
+                bridge["season_dependency_scopes"] -= 1
         operations.append(operation)
         scope_operations.append(operation)
         calendar_unavailable = (

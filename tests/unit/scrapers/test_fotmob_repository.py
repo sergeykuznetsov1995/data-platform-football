@@ -1,8 +1,9 @@
 import json
+import sqlite3
 import threading
 import time
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -1008,6 +1009,44 @@ def test_iceberg_latest_entity_attempt_includes_failure_statuses():
     assert "entity_id = '47'" in sql
     assert "retryable_failure" in sql
     assert "schema_drift" in sql
+
+
+def test_competition_discovery_times_reads_one_batch_and_merges_buffered_attempts(monkeypatch):
+    writer = EntityAttemptWriter()
+    repository = FotMobRepository(writer=writer, batch_size=50)
+    database = sqlite3.connect(":memory:")
+    database.execute("CREATE TABLE manifest (entity_id, completed_at, target_type, parser_version, status)")
+    database.executemany(
+        "INSERT INTO manifest VALUES (?, ?, ?, ?, ?)",
+        [
+            ("47", "2026-08-01", "competition_seasons", PARSER_VERSION, "success"),
+            ("47", "2026-08-04", "competition_seasons", PARSER_VERSION, "schema_drift"),
+            ("47", "2026-08-05", "competition_seasons", LEGACY_PARSER_VERSION, "success"),
+            ("47", "2026-08-06", "competition_seasons", PARSER_VERSION, "unknown_status"),
+            ("48", "2026-08-01", "competition_seasons", PARSER_VERSION, "success"),
+            ("49", "2026-08-07", "competition_profile", PARSER_VERSION, "success"),
+            ("999", "2026-08-01", "competition_seasons", PARSER_VERSION, "success"),
+        ],
+    )
+    queries = []
+
+    def select(sql):
+        queries.append(sql)
+        return database.execute(sql.replace("iceberg.bronze.fotmob_ingest_manifest", "manifest")).fetchall()
+
+    monkeypatch.setattr(writer.trino, "execute_query", select)
+    for entity_id in ("47", "48"):
+        repository.record(_commit(
+            target_type="competition_seasons", entity_id=entity_id, target_key=entity_id,
+            status=ManifestStatus.RETRYABLE_FAILURE,
+            completed_at=datetime(2026, 8, 3, 3, tzinfo=timezone(timedelta(hours=3))),
+        ))
+    assert repository.competition_discovery_times([]) == {}
+    assert repository.competition_discovery_times(range(1, 453)) == {
+        47: datetime(2026, 8, 4), 48: datetime(2026, 8, 3),
+    }
+    assert len(queries) == 1
+    database.close()
 
 
 def test_memory_latest_success_can_be_scoped_to_current_writer_run():
@@ -2564,6 +2603,102 @@ def test_inventory_preload_normalizes_float_string_spellings():
         call for call in writer.calls if call[1]["table"] == "fotmob_field_inventory"
     ]
     assert inventory == [], "preloaded key must drop the live int-keyed row"
+
+
+class SqliteInventory(SeedTrino):
+    def __init__(self):
+        super().__init__([])
+        self.db = sqlite3.connect(":memory:")
+        self.db.executescript("""
+            CREATE TABLE fotmob_field_inventory (
+                target_type, competition_id, source_season_key, json_path, disposition, _target_batch_id
+            );
+            CREATE TABLE fotmob_ingest_manifest (batch_id, parser_version, status);
+        """)
+
+    def execute_query(self, sql):
+        self.queries.append(sql)
+        return self.db.execute(sql.replace("iceberg.bronze.", "")).fetchall()
+
+
+def test_discovery_inventory_shares_positive_keys_and_rechecks_a_miss():
+    from scrapers.fotmob.load_meter import parse_sql
+    from scrapers.fotmob.repository import DISCOVERY_INVENTORY_SCOPES
+
+    trino = SqliteInventory()
+    db = trino.db
+    scopes = [(i, "2026" if i % 2 else "Cup '26")
+              for i in range(1, DISCOVERY_INVENTORY_SCOPES + 1)]
+    db.executemany("INSERT INTO fotmob_field_inventory VALUES ('league_season', ?, ?, ?, ?, ?)", [
+        (f"{i}.0", "2026.0" if season == "2026" else season, "path", "typed", "good")
+        for i, season in scopes
+    ] + [
+        ("1", "2026", "pending", "typed", "other-writer"),
+        ("1", "2026", "old", "typed", "legacy"),
+        ("1", "2026", "failed", "typed", "failed"),
+        ("2", "2026", "other-scope", "typed", "good"),
+    ])
+    db.executemany("INSERT INTO fotmob_ingest_manifest VALUES (?, ?, ?)", [
+        ("good", PARSER_VERSION, "not_modified"), ("legacy", LEGACY_PARSER_VERSION, "success"),
+        ("failed", PARSER_VERSION, "schema_drift"),
+    ])
+
+    repo = FotMobRepository(writer=SeedWriter(trino), batch_size=100)
+    with repo.discovery_inventory(scopes):
+        for i, season in scopes:
+            row = {**_inventory_row("path"), "target_type": "league_season",
+                   "competition_id": i, "source_season_key": season}
+            _inventory_commit(repo, i, [row])
+        assert len(trino.queries) == 1
+        tables = ["iceberg.bronze.fotmob_field_inventory", "iceberg.bronze.fotmob_ingest_manifest"]
+        parsed = parse_sql(trino.queries[0], tables)
+        assert not parsed.unparsed_fotmob
+        assert set(parsed.operations) == {(table, "scan_read") for table in tables}
+        assert repo._pending_rows == 0
+        db.execute("INSERT INTO fotmob_ingest_manifest VALUES ('other-writer', ?, 'success')",
+                   (PARSER_VERSION,))
+        row = {**row, "competition_id": 1, "source_season_key": "2026"}
+        incoming = [{**row, "json_path": path} for path in ("pending", "old", "failed", "other-scope")]
+        incoming.append({**row, "disposition": "raw_only"})
+        _inventory_commit(repo, 20, incoming)
+        _inventory_commit(repo, 21, incoming)
+    assert len(trino.queries) == 2
+    assert {(r["json_path"], r["disposition"]) for rows in repo._pending.values() for r in rows} == {
+        ("path", "raw_only"), ("old", "typed"), ("failed", "typed"), ("other-scope", "typed")
+    }
+    assert json.loads(repo._pending_manifest[-1]["actual_counts_json"]) == {"field_inventory": 5}
+    db.close()
+
+
+@pytest.mark.parametrize("preload_fails", [False, True])
+def test_partial_or_failed_discovery_inventory_uses_authoritative_scoped_read(preload_fails, monkeypatch):
+    trino = SqliteInventory()
+    original = trino.execute_query
+
+    def execute(sql):
+        rows = original(sql)
+        if "SELECT DISTINCT i.competition_id" in sql:
+            if preload_fails:
+                raise RuntimeError("grouped read unavailable")
+            return rows[:1]
+        return rows
+
+    monkeypatch.setattr(trino, "execute_query", execute)
+    trino.db.execute("INSERT INTO fotmob_ingest_manifest VALUES ('batch', ?, 'success')", (PARSER_VERSION,))
+    scopes = [(1, "2026"), (2, "2026")]
+    repo = FotMobRepository(writer=SeedWriter(trino), batch_size=100)
+    for cid, season in scopes:
+        trino.db.execute("INSERT INTO fotmob_field_inventory VALUES ('league_season', ?, ?, 'path', 'typed', 'batch')",
+                         (str(cid), season))
+    with repo.discovery_inventory(scopes):
+        for cid, season in scopes:
+            row = {**_inventory_row("path"), "target_type": "league_season",
+                   "competition_id": cid, "source_season_key": season}
+            _inventory_commit(repo, cid, [row])
+    assert len(trino.queries) == (3 if preload_fails else 2)
+    assert repo._pending_rows == 0
+    assert not repo._discovery_inventory
+    trino.db.close()
 
 
 def test_inventory_preload_skips_player_scope():

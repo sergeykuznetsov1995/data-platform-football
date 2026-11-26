@@ -62,6 +62,8 @@ class FanoutManager:
 
     def execute_query(self, sql):
         self.queries.append(sql)
+        if '$snapshots"' in sql:
+            return []  # No append proof: exercise the general comparison.
         normalized = re.sub(r"\s+", " ", sql).strip()
         sources = SOURCE.findall(normalized)
         assert len(sources) == 2, "both pinned bucket sources are required"
@@ -117,7 +119,7 @@ def test_manifest_query_count_independent_of_pair_cardinality(pair_count, rewrit
     # Both the small and thousand-pair cases have the SAME fixed upper bound,
     # even for an unchanged snapshot rewrite: no content_hash shortcut allowed.
     assert len(manager.comparisons) == 512
-    assert len(manager.queries) == 516
+    assert len(manager.queries) == 517
     assert set(manager.comparisons) == {
         (target, bucket, left, right)
         for target in TYPES for bucket in range(64)

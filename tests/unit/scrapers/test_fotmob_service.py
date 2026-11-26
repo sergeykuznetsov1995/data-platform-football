@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from scrapers.fotmob import service as service_module
-from scrapers.fotmob.domain import ProbeStatus, ScopeDecision, ScopeRef
-from scrapers.fotmob.parsers import parse_season_bundle
+from scrapers.fotmob.domain import CompetitionRef, ProbeStatus, ScopeClassification, ScopeDecision, ScopeRef
+from scrapers.fotmob.parsers import inventory_json_paths, parse_season_bundle
 from scrapers.fotmob.planner import RunMode, TransportBudget
 from scrapers.fotmob.repository import (
     PARSER_VERSION,
@@ -26,7 +26,7 @@ from scrapers.fotmob.service import (
     OperationResult,
     profile_probe_delay,
 )
-from tests.unit.scrapers.test_fotmob_repository import ReconcileTrino, ReconcileWriter
+from tests.unit.scrapers.test_fotmob_repository import ReconcileTrino, ReconcileWriter, SeedWriter, SqliteInventory
 from scrapers.fotmob.transport import (
     FetchOutcome,
     FetchResult,
@@ -446,6 +446,36 @@ def test_first_seen_male_profile_is_included_and_reused_for_season_discovery():
     assert sum(url == profile_url for url, _ in transport.calls) == 1
     assert repository.commits[0].target_type == "competition_profile"
     assert repository.commits[-1].target_type == "competition_seasons"
+
+
+def test_catalog_discovery_reads_published_inventory_in_small_groups(monkeypatch):
+    classifications = []
+    responses = {}
+    for cid in range(1, 35):
+        name = f"League {cid}"
+        ref = CompetitionRef(cid, name)
+        classifications.append(ScopeClassification(ref, ScopeDecision.INCLUDED, "included", "test"))
+        responses[canonicalize_target("leagues", {"id": cid}).canonical_url] = _competition_payload(cid, name)
+    service, _, _ = _service(responses)
+    trino = SqliteInventory()
+    repo = FotMobRepository(writer=SeedWriter(trino), batch_size=1000)
+    # Every root needs its datasets processed, as after its profile was refreshed.
+    monkeypatch.setattr(repo, "latest_success", lambda target_key: None)
+    service.repository = repo
+    trino.db.execute("INSERT INTO fotmob_ingest_manifest VALUES ('published', ?, 'success')", (PARSER_VERSION,))
+    paths = inventory_json_paths(next(iter(responses.values())))
+    inventory, _ = service._inventory_rows("league_season", paths)
+    trino.db.executemany("INSERT INTO fotmob_field_inventory VALUES ('league_season', ?, '2025/2026', ?, ?, 'published')", [
+        (str(item.competition.competition_id), row["json_path"], row["disposition"])
+        for item in classifications for row in inventory
+    ])
+
+    results = service.discover_competitions(classifications)
+    assert all(result.operation.ok and result.seasons for result in results)
+    assert [result.competition for result in results] == [item.competition for item in classifications]
+    assert len(trino.queries) == 6
+    assert not any(key[0] == "fotmob_field_inventory" for key in repo._pending)
+    trino.db.close()
 
 
 def test_fresh_profile_revalidates_cached_male_before_season_fanout():
