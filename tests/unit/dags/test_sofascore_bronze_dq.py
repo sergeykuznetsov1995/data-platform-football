@@ -231,6 +231,54 @@ def test_partial_attempt_archive_preserves_retries_and_missing_validations(inclu
     assert summary["bronze_dq"]["violations"] == ["child-season mismatch"]
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("archived_latest", [False, True])
+def test_partial_archive_counts_each_attempt_of_same_scope(tmp_path, legacy, archived_latest):
+    report = _report(checks=5)
+    result = dict(_partial_result(report), started_at="2026-11-26T01:00:00Z", elapsed_s=11)
+    env = _env(tmp_path, result)
+    validated = refresh._validate_refresh_scope(env, ti=FakeTI())
+    if legacy:
+        validated.pop("started_at", None)
+    older = dict(result, status="failed", started_at="2026-11-26T00:00:00Z", elapsed_s=7)
+    archive = [dict(older, scope_key=env["SOFASCORE_SCOPE_KEY"])]
+    if archived_latest:
+        archive.append(dict(result, scope_key=env["SOFASCORE_SCOPE_KEY"]))
+    ti = FakeTI({
+        ("validate_refresh_scope", "return_value"): [validated],
+        ("refill_refresh_window", "return_value"): {"initial_outcomes": archive},
+    })
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run())
+    assert (summary["scopes"], summary["partial"], summary["window_used_s"]) == (2, 1, 18)
+    assert summary["bronze_dq"]["checks"] == 10
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("keep_latest", [False, True])
+def test_distinguishes_identical_retry_reports_by_start_time(tmp_path, failed, keep_latest):
+    report = _report("failed" if failed else "success", checks=5)
+    result = dict(_result(report), started_at="2026-11-26T01:00:00Z", elapsed_s=7)
+    env = _env(tmp_path, result)
+    ti = FakeTI()
+    if failed:
+        with pytest.raises(refresh.AirflowException):
+            refresh._validate_refresh_scope(env, ti=ti)
+    else:
+        ti.pulls["return_value"] = [refresh._validate_refresh_scope(env, ti=ti)]
+    ti.pulls.update(ti.pushed)
+    scope = dict(result, scope_key=env["SOFASCORE_SCOPE_KEY"])
+    archive = [dict(scope, started_at="2026-11-26T00:00:00Z")]
+    if keep_latest:
+        archive.append(scope)
+    ti.pulls[("refill_refresh_window", "return_value")] = {
+        "initial_outcomes": archive, "expected_scope_run_ids": ["scope"],
+    }
+    summary = refresh._window_summary(ti=ti, dag_run=_dag_run("failed" if failed else "success"))
+    assert (summary["scopes"], summary["window_used_s"]) == (2, 14)
+    assert summary["bronze_dq"]["checks"] == 10
+    assert summary["bronze_dq"]["failed"] == (2 if failed else 0)
+
+
 @pytest.mark.parametrize("mismatch", [None, "run_id", "source_season_id", "stale", "missing"])
 def test_failed_refill_preserves_only_its_own_dq_report(tmp_path, monkeypatch, mismatch):
     from datetime import datetime, timedelta, timezone

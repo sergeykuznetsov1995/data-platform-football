@@ -17,6 +17,7 @@ getting ready seasons without a serialized metadata wave of its own.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
@@ -818,17 +819,28 @@ def _validate_refresh_scope(
         raise AirflowException(f"scope result is unreadable: {exc}") from exc
     status = result.get("status")
     dq_report = result.get("bronze_dq")
+    started_at = result.get("started_at")
+    attempt_time = {"started_at": started_at} if isinstance(started_at, str) and started_at else {}
 
     def _retain_bronze_dq() -> None:
         # #1371: a red validation still leaves its DQ evidence behind for the
         # window summary instead of dying with the task.
         if ti is not None and isinstance(dq_report, dict):
             ti.xcom_push(key="bronze_dq", value=dq_report)
+            scope = ":".join(str(result.get(k)) for k in ("campaign_id", "tournament_id", "source_season_id"))
+            if (attempt_time and scope == env.get("SOFASCORE_SCOPE_KEY") and result.get("run_id")
+                    and result["run_id"] == env.get("SOFASCORE_SCOPE_RUN_ID")):
+                elapsed = result.get("elapsed_s")
+                if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
+                    elapsed = None
+                ti.xcom_push(key="bronze_dq_attempt", value={
+                    **attempt_time, "scope_key": scope, "status": status, "elapsed_s": elapsed,
+                })
 
     # #1751: the scope command lets a transport-only loss through on its last
     # try; it is not refreshed, the next run re-plans it.
     if status == "failed" and _transient_scope_failure(environment):
-        return {"status": "transient_failure", "scope_key": environment["SOFASCORE_SCOPE_KEY"],
+        return {**attempt_time, "status": "transient_failure", "scope_key": environment["SOFASCORE_SCOPE_KEY"],
                 "elapsed_s": result.get("elapsed_s"), "errors": result.get("errors")}
     # #1358: ``partial`` is a scope that stopped at its own time/byte/match
     # ceiling with the rest left for the next run — a finished task, not red.
@@ -865,6 +877,7 @@ def _validate_refresh_scope(
     # A refreshed scope is never "completed": the next DagRun re-plans it
     # from Bronze evidence as new games finish.
     outcome: dict[str, Any] = {
+        **attempt_time,
         "status": "partial" if status == "partial" else "refreshed",
         "scope_key": environment["SOFASCORE_SCOPE_KEY"],
         "elapsed_s": result.get("elapsed_s"),
@@ -970,7 +983,6 @@ def _refill_report_path(run_id: str) -> Path:
 
 def _failed_initial_report(context: dict[str, Any]) -> dict[str, Any]:
     """Retain paid attempts on a failed path without another census or refill."""
-    import math
     from dags.scripts.run_sofascore_scope_cycle import _atomic_json
 
     run_id = str(context.get("run_id") or "manual")
@@ -1203,55 +1215,73 @@ def _validation_xcoms(ti: Any, **filters: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _archived_validation_attempt(item: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    status = item.get("status")
+    raw_status = {"refreshed": "success", "transient_failure": "failed"}.get(status, status)
+    for attempt in reversed(attempts):
+        if item.get("started_at") and attempt.get("started_at"):
+            if item["started_at"] == attempt["started_at"]:
+                return attempt
+            continue
+        # Older validator returns carried elapsed time and status, without the start time.
+        if (item.get("elapsed_s") == attempt.get("elapsed_s")
+                and (not raw_status or not attempt.get("status") or raw_status == attempt["status"])
+                and (not attempt.get("bronze_dq") or not item.get("bronze_dq")
+                     or item["bronze_dq"] == attempt["bronze_dq"])):
+            return attempt
+    return None
+
+
 def _initial_window_evidence(
     context: dict[str, Any], mapped: list[dict[str, Any]], refill: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     # Physical receipts include retries that have no separate Airflow return.
     # Their absence must not erase a validator's independently saved result.
-    attempts = list(refill.get("initial_outcomes") or [])
-    outcomes = attempts.copy()
-    dq_reports = []
+    outcomes = [dict(attempt) for attempt in refill.get("initial_outcomes") or []]
     archive_by_scope = defaultdict(list)
     scope_by_run = {}
-    for attempt in attempts:
+    for attempt in outcomes:
         scope = attempt.get("scope_key")
-        report = attempt.get("bronze_dq")
         if scope:
             scope_by_run[attempt.get("run_id")] = scope
-            archive_by_scope[scope].append(report)
-        if isinstance(report, dict):
-            dq_reports.append(report)
+            archive_by_scope[scope].append(attempt)
+
+    def merge_validation(item: dict[str, Any]) -> None:
+        attempt = _archived_validation_attempt(item, archive_by_scope[item.get("scope_key")])
+        if attempt is None:
+            outcomes.append(item)
+        elif isinstance(item.get("bronze_dq"), dict) and (
+            not isinstance(attempt.get("bronze_dq"), dict) or not _bronze_dq_report_passed(item["bronze_dq"])
+        ):
+            attempt["bronze_dq"] = item["bronze_dq"]
 
     for item in mapped:
-        scope = item.get("scope_key")
-        if scope not in archive_by_scope:
-            outcomes.append(item)
-        report = item.get("bronze_dq")
-        if isinstance(report, dict) and report not in archive_by_scope.get(scope, ()):
-            dq_reports.append(report)
+        merge_validation(item)
 
     ti = context.get("ti")
-    if ti is None:
-        return outcomes, dq_reports
     task_instances = context.get("task_instances")
-    if task_instances is None and context.get("dag_run") is not None:
+    if ti is not None and task_instances is None and context.get("dag_run") is not None:
         task_instances = context["dag_run"].get_task_instances()
-    if task_instances is None:
-        pushed = _validation_xcoms(ti, key="bronze_dq")
-        dq_reports += [report for report in pushed if report not in dq_reports]
-        return outcomes, dq_reports
 
     # Failed validators push before raising. Each key's bulk pull independently
     # skips missing XComs. Use the real index, also used by the archived plan.
     run_ids = refill.get("expected_scope_run_ids") or []
-    for task in task_instances:
-        if task.task_id != "validate_refresh_scope" or _task_state(task) != "failed":
+    extra_reports = []
+    for task in task_instances or ():
+        if ti is None or task.task_id != "validate_refresh_scope" or _task_state(task) != "failed":
             continue
         index = task.map_index
         scope = scope_by_run.get(run_ids[index]) if 0 <= index < len(run_ids) else None
         for report in _validation_xcoms(ti, key="bronze_dq", map_indexes=index):
-            if report not in archive_by_scope.get(scope, ()):
-                dq_reports.append(report)
+            identity = _validation_xcoms(ti, key="bronze_dq_attempt", map_indexes=index)
+            if identity:
+                merge_validation({**identity[0], "bronze_dq": report})
+            elif not any(a.get("bronze_dq") == report for a in archive_by_scope[scope]):
+                extra_reports.append(report)
+    dq_reports = [item["bronze_dq"] for item in outcomes if isinstance(item.get("bronze_dq"), dict)]
+    if ti is not None and task_instances is None:
+        extra_reports.extend(r for r in _validation_xcoms(ti, key="bronze_dq") if r not in dq_reports)
+    dq_reports.extend(extra_reports)
     return outcomes, dq_reports
 
 
