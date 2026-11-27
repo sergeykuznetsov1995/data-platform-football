@@ -255,7 +255,7 @@ class SnapshotHarness:
         def execute(sql):
             if f'"{c1.MANIFEST}$snapshots"' in sql:
                 # capture() replaces the whole table for every synthetic snapshot.
-                return [(v, v - 1 or None, "overwrite", None)
+                return [(v, v - 1 or None, "overwrite", None, None, None, None)
                         for v in range(self.version, 0, -1)]
             for table in c1.SOURCES:
                 sql = re.sub(rf"{table} FOR VERSION AS OF (\d+)",
