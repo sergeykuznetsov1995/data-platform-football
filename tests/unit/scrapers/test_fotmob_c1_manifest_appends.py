@@ -1,7 +1,11 @@
 """The append shortcut must produce the exact old/new row-bag difference."""
 from collections import Counter
+from contextlib import nullcontext
+import json
+from types import SimpleNamespace
 
 import pytest
+import requests
 
 from scrapers.fotmob import c1_inputs as c1
 
@@ -18,6 +22,7 @@ class AppendManager:
         self.snapshots = [snapshot(7, 10, "append", 1), snapshot(10, 902, "append", 1),
                           snapshot(902, 4, "overwrite", None)]
         self.schema_rows = []
+        self.metadata_files = []
         self.files = [(7, "s3://fixture/a'b", 1), (10, "s3://fixture/c", 2)]
         self.rows = [("s3://fixture/a'b", "1", "2025", "ignored", "a"),
                      ("s3://fixture/c", None, None, "match", "b"),
@@ -31,6 +36,8 @@ class AppendManager:
                 assert f"'{field}'" in sql
             return iter(self.snapshots)
         if '$metadata_log_entries"' in sql:
+            if sql.startswith("SELECT file "):
+                return [(path,) for path in self.metadata_files]
             assert "latest_schema_id" in sql
             return iter(self.schema_rows)
         if '$files"' in sql:
@@ -81,12 +88,104 @@ def test_only_proven_compactions_have_an_empty_logical_difference():
     assert len(manager.calls) == 2
 
 
+@pytest.fixture
+def rotated_log(monkeypatch):
+    manager = compaction_followed_by_appends()
+    manager.schema_rows = [(7, 1)]
+    manager.metadata_files = ["s3://fixture/metadata/v101.json", "s3://fixture/metadata/v100.json"]
+    packed = {"metadata-location": manager.metadata_files[1], "metadata": {
+        "schemas": [{"schema-id": 1}],
+        "snapshots": [{"snapshot-id": sid, "schema-id": 1} for sid in (902, 33, 81, 7)],
+    }}
+    monkeypatch.setattr(c1, "_retained_manifest_metadata", lambda: packed)
+    return manager, packed
+
+
+def test_recent_metadata_log_can_omit_still_valid_snapshot_schemas(monkeypatch, rotated_log):
+    manager, _ = rotated_log
+    monkeypatch.setattr(c1, "_compare_manifest_buckets",
+                        lambda *_: pytest.fail("proved compactions should skip wide comparison"))
+    assert Counter(c1.manifest_changes(manager, 902, 7)) == Counter({(None, None, "match", "b"): 2})
+    assert sum('$metadata_log_entries"' in sql for sql in manager.calls) == 2
+
+
+@pytest.mark.parametrize("case", [
+    "missing_snapshot", "different_rewrite_schema", "duplicate_snapshot", "missing_id",
+    "unknown_schema", "different_table", "contradictory_sql", "absent_metadata",
+])
+def test_unbound_or_incomplete_catalog_schema_uses_exact_comparison(monkeypatch, rotated_log, case):
+    manager, doc = rotated_log
+    records = doc["metadata"]["snapshots"]
+    if case == "missing_snapshot":
+        records.pop()
+    elif case == "different_rewrite_schema":
+        records[1]["schema-id"] = 8
+    elif case == "duplicate_snapshot":
+        records.append(dict(records[0]))
+    elif case == "missing_id":
+        del records[0]["schema-id"]
+    elif case == "unknown_schema":
+        doc["metadata"]["schemas"] = []
+    elif case == "different_table":
+        doc["metadata-location"] = "s3://other/metadata/v100.json"
+    elif case == "contradictory_sql":
+        manager.schema_rows = [(7, 2)]
+    else:
+        doc.clear()
+    sentinel = ("1", "2025", "match", "exact")
+    monkeypatch.setattr(c1, "_compare_manifest_buckets", lambda *_: iter([sentinel]))
+    assert list(c1.manifest_changes(manager, 902, 7)) == [sentinel]
+    assert not any('$files"' in sql for sql in manager.calls)
+
+
+def test_catalog_reads_only_manifest_with_bounded_requests(monkeypatch):
+    calls = []
+    docs = iter([{"defaults": {"prefix": "old"}, "overrides": {"prefix": "new prefix"}},
+                 {"metadata-location": "s3://fixture/metadata/v100.json"}])
+
+    def get(url, *, params, timeout, stream, allow_redirects):
+        assert timeout == (3, 8) and stream and not allow_redirects
+        calls.append((url, params))
+        reply = json.dumps(next(docs)).encode()
+        return nullcontext(SimpleNamespace(status_code=200, iter_content=lambda _: [reply]))
+
+    monkeypatch.setenv("ICEBERG_REST_URI", "http://catalog.test/iceberg/")
+    monkeypatch.setenv("ICEBERG_REST_WAREHOUSE", "fixture")
+    monkeypatch.setattr(requests, "Session", lambda: nullcontext(SimpleNamespace(get=get)))
+    assert c1._retained_manifest_metadata() == {"metadata-location": "s3://fixture/metadata/v100.json"}
+    assert calls == [
+        ("http://catalog.test/iceberg/v1/config", {"warehouse": "fixture"}),
+        ("http://catalog.test/iceberg/v1/new%20prefix/namespaces/bronze/tables/fotmob_ingest_manifest",
+         {"snapshots": "all"}),
+    ]
+
+
+@pytest.mark.parametrize("case", ["timeout", "redirect", "invalid_json", "large_config", "path_traversal"])
+def test_unavailable_catalog_proof_is_bounded_and_read_only(monkeypatch, case):
+    calls = []
+
+    def get(url, **options):
+        calls.append(url)
+        if case == "timeout":
+            raise requests.Timeout("fixture")
+        status = 302 if case == "redirect" else 200
+        bodies = {"invalid_json": b"{", "large_config": b"x" * 65_537,
+                  "path_traversal": b'{"overrides":{"prefix":"../other"}}'}
+        return nullcontext(SimpleNamespace(status_code=status,
+                                           iter_content=lambda _: [bodies.get(case, b"{}")]))
+
+    monkeypatch.setattr(requests, "Session", lambda: nullcontext(SimpleNamespace(get=get)))
+    assert c1._retained_manifest_metadata() is None
+    assert len(calls) == 1 and calls[0].endswith("/v1/config")
+
+
 @pytest.mark.parametrize("case", [
     "missing_schema", "schema_change", "conflicting_schema", "missing_schema_id",
     "missing_rows", "unequal_rows", "missing_removed_files", "wrong_operation",
     "append_before_replace", "cycle",
 ])
 def test_incomplete_compaction_proof_uses_the_existing_exact_comparison(monkeypatch, case):
+    monkeypatch.setattr(c1, "_retained_manifest_metadata", lambda: None)
     manager = compaction_followed_by_appends()
     if case == "missing_schema":
         manager.schema_rows.pop(1)

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 from uuid import uuid4
 
 from scrapers.fotmob.repository import LEGACY_PARSER_VERSION, PARSER_VERSION
@@ -81,6 +83,8 @@ def pairs_sql(pairs, *, physical=False):
 
 CLOSURE_PREDICATE_BYTES = 200_000
 REVERSE_QUERY_BYTES = 900_000
+REVERSE_TARGET_MIN_BATCHES = 8
+REVERSE_TARGET_MAX_ROWS = 50_000
 
 
 def _pair_predicates(pairs, *, physical=False):
@@ -139,6 +143,24 @@ def _reverse_matches_plan(all_pairs, ids, snapshots):
             raise RuntimeError("C1 closure reverse MATCHES query exceeds query limit")
         queries.append(sql)
     return queries
+
+
+def _reverse_target_pairs(manager, ids, predicates, first_day):
+    source = f"FROM {TABLE} WHERE kind='input' AND deadline_day >= DATE '{first_day}'"
+    if len(predicates) >= REVERSE_TARGET_MIN_BATCHES:
+        # A busy wave can contain hundreds of thousands of IDs while the
+        # published date window fits in one read. Discard a truncated window.
+        rows = list(manager.execute_query(
+            f"SELECT DISTINCT competition_id, source_season_key, CAST(match_id AS varchar) "
+            f"{source} AND match_id IS NOT NULL LIMIT {REVERSE_TARGET_MAX_ROWS + 1}"
+        ))
+        if len(rows) <= REVERSE_TARGET_MAX_ROWS:
+            return {(str(cid), str(season)) for cid, season, mid in rows if mid in ids}
+    pairs = set()
+    for predicate in predicates:
+        rows = manager.execute_query(f"SELECT DISTINCT competition_id, source_season_key {source} AND {predicate}")
+        pairs.update((str(cid), str(season)) for cid, season in rows)
+    return pairs
 
 
 def current_sql(table, snapshots, predicate="true"):
@@ -395,6 +417,78 @@ def _compare_manifest_buckets(manager, old, new):
                 )
 
 
+def _catalog_json(session, url, params, byte_limit, deadline):
+    with session.get(url, params=params, timeout=(3, 8), stream=True, allow_redirects=False) as response:
+        if response.status_code != 200:
+            return None
+        body = bytearray()
+        for block in response.iter_content(65536):
+            if len(body) + len(block) > byte_limit or time.monotonic() >= deadline:
+                return None
+            body.extend(block)
+    doc = json.loads(body)
+    return doc if isinstance(doc, dict) else None
+
+
+def _retained_manifest_metadata():
+    """Load this table's retained snapshots when Trino's recent metadata log rotated."""
+    import requests
+
+    uri = os.environ.get("ICEBERG_REST_URI", "http://lakekeeper:8181/catalog").rstrip("/") + "/v1"
+    warehouse = os.environ.get("ICEBERG_REST_WAREHOUSE", "football")
+    deadline = time.monotonic() + 15
+    try:
+        with requests.Session() as session:
+            config = _catalog_json(session, uri + "/config", {"warehouse": warehouse}, 65_536, deadline)
+            if config is None:
+                return None
+            defaults, overrides = config.get("defaults", {}), config.get("overrides", {})
+            if not isinstance(defaults, dict) or not isinstance(overrides, dict):
+                return None
+            prefix = overrides.get("prefix", defaults.get("prefix", ""))
+            if not isinstance(prefix, str) or any(p in (".", "..") for p in prefix.split("/")):
+                return None
+            prefix = quote(prefix.strip("/"), safe="/")
+            table_url = "/".join(p for p in (uri, prefix, "namespaces/bronze/tables", MANIFEST) if p)
+            return _catalog_json(session, table_url, {"snapshots": "all"}, 32 * 1024 * 1024, deadline)
+    except (requests.RequestException, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _retained_manifest_schema_matches(manager, required, known_schema_ids):
+    doc = _retained_manifest_metadata()
+    if not doc:
+        return False
+    location, meta = doc.get("metadata-location"), doc.get("metadata")
+    if not isinstance(location, str) or not location or not isinstance(meta, dict):
+        return False
+    snapshots, schemas = meta.get("snapshots"), meta.get("schemas")
+    if not isinstance(snapshots, list) or not isinstance(schemas, list):
+        return False
+    selected = {}
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict):
+            return False
+        sid = snapshot.get("snapshot-id")
+        if type(sid) is int and sid in required:
+            schema = snapshot.get("schema-id")
+            if sid in selected or type(schema) is not int or schema < 0:
+                return False
+            selected[sid] = schema
+    ids = set(selected.values()) | known_schema_ids
+    if selected.keys() != required or len(ids) != 1:
+        return False
+    if sum(isinstance(s, dict) and type(s.get("schema-id")) is int and s["schema-id"] in ids
+           for s in schemas) != 1:
+        return False
+    # Bind the REST document to the table actually selected by src_fotmob in
+    # Trino, including when a newer metadata file was committed during the GET.
+    recent = manager.execute_query(
+        f'SELECT file FROM {PREFIX}"{MANIFEST}$metadata_log_entries" ORDER BY "timestamp" DESC LIMIT 32'
+    )
+    return any(path == location for (path,) in recent)
+
+
 def _appended_manifest_rows(manager, old, new):
     """Return exact additions after any leading file compactions, or None to compare.
 
@@ -445,7 +539,11 @@ def _appended_manifest_rows(manager, old, new):
             f"WHERE latest_snapshot_id IN ({versions}) GROUP BY 1, 2"
         ))
         schema_ids = {schema_id for _, schema_id in schemas}
-        if {sid for sid, _ in schemas} != required or len(schema_ids) != 1 or None in schema_ids:
+        observed_ids = {sid for sid, _ in schemas}
+        if (not observed_ids <= required or len(schema_ids) > 1
+                or any(type(schema) is not int or schema < 0 for schema in schema_ids)):
+            return None
+        if observed_ids != required and not _retained_manifest_schema_matches(manager, required, schema_ids):
             return None
     if not file_count:
         return []
@@ -819,12 +917,7 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
                         if pair in all_pairs:
                             affected.add(pair)
                 reverse_searched_ids.update(new_ids)
-                for id_predicate in id_predicates:
-                    affected |= {(str(row[0]), str(row[1])) for row in manager.execute_query(
-                        f"SELECT DISTINCT competition_id, source_season_key FROM {TABLE} "
-                        f"WHERE kind='input' AND deadline_day >= DATE '{first_day}' "
-                        f"AND {id_predicate}"
-                    )}
+                affected |= _reverse_target_pairs(manager, ids, id_predicates, first_day)
             if affected == known:
                 break
     else:

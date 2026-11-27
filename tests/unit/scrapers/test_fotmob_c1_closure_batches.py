@@ -460,6 +460,36 @@ def test_refresh_reverse_source_keeps_only_canonical_pairs_in_domain(monkeypatch
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
 
 
+@pytest.mark.parametrize("ceiling,fallback", [(4, False), (3, True)])
+def test_large_reverse_id_set_matches_exact_target_queries(monkeypatch, ceiling, fallback):
+    import duckdb
+
+    monkeypatch.setattr(c1, "TABLE", "published")
+    monkeypatch.setattr(c1, "REVERSE_TARGET_MIN_BATCHES", 2)
+    monkeypatch.setattr(c1, "REVERSE_TARGET_MAX_ROWS", ceiling)
+    ids = {"same", "odd'雪", "None"}
+    predicates = [ID_PREFIX + c1.literal(mid) + ")" for mid in sorted(ids)]
+    seen = []
+    with duckdb.connect() as db:
+        db.execute("""CREATE TABLE published (
+            competition_id VARCHAR, source_season_key VARCHAR, match_id VARCHAR,
+            kind VARCHAR, deadline_day DATE)""")
+        rows = [("10", "2025", "same"), ("10", "2025", "same"), ("20", "2025", "same"),
+                ("90", "old", "odd'雪"), ("2", "2026", "other"), ("3", "2026", None)]
+        db.executemany("INSERT INTO published VALUES (?, ?, ?, 'input', ?)", [(*row, DAY) for row in rows])
+        db.execute("INSERT INTO published VALUES ('4', '2026', 'same', 'day', ?)", [DAY])
+        db.execute("INSERT INTO published VALUES ('5', '2025', 'same', 'input', DATE '2020-01-01')")
+
+        def execute(sql):
+            seen.append(sql)
+            return db.execute(sql).fetchall()
+
+        result = c1._reverse_target_pairs(SimpleNamespace(execute_query=execute), ids, predicates, DAY)
+    assert result == {("10", "2025"), ("20", "2025"), ("90", "old")}
+    assert len(seen) == 1 + (len(predicates) if fallback else 0)
+    assert seen[0].endswith(f"LIMIT {ceiling + 1}")
+
+
 @pytest.mark.parametrize("unchanged_table", [c1.MATCHES, c1.PAYLOADS])
 def test_closure_reads_each_distinct_source_snapshot_once(monkeypatch, unchanged_table):
     pair = ("10", "2026/27")
