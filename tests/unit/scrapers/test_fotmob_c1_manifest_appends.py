@@ -62,8 +62,11 @@ def compaction_followed_by_appends():
     return manager
 
 
-def test_compaction_prefix_keeps_only_exact_append_rows():
+@pytest.mark.parametrize("other_kind", ["transfers_page", None])
+def test_compaction_prefix_keeps_only_exact_append_rows(other_kind):
     manager = compaction_followed_by_appends()
+    path, competition, season, _, entity = manager.rows[0]
+    manager.rows[0] = (path, competition, season, other_kind, entity)
     changes = list(c1.manifest_changes(manager, 902, 7))
     assert Counter(changes) == Counter({(None, None, "match", "b"): 2})
     assert len(manager.calls) == 4
