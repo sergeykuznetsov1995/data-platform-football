@@ -59,14 +59,14 @@ encoded = observation.canonical_json().encode('utf-8')
 | `location.latitude` | `latitude` | Finite number in [−90, 90]. |
 | `location.longitude` | `longitude` | Finite number in [−180, 180]. |
 | `buildingDetails.buildYear` | `build_year` | Nonnegative integer. |
-| `buildingDetails.renovationYear` | `renovation_year` | Nonnegative integer. |
+| `buildingDetails.renovationYear` | `renovation_year` | Nonnegative integer or JSON null for an unknown year. |
 | `buildingDetails.fieldLength` | `field_length` | Nonnegative integer. |
 | `buildingDetails.fieldWidth` | `field_width` | Nonnegative integer. |
 | `buildingDetails.fieldSurface` | `field_surface` | Source string. |
 | `images[].url` | `images` | Array of objects with nonblank URL strings. Keep the first occurrence of each exact URL in source order. An optional `source` must be a string. |
 | `isHistorical` | `source_is_historical` | Preserve the source boolean. |
 
-IDs accept positive integers and canonical ASCII decimal strings without leading zeros. Booleans are invalid in all numeric and ID fields. An optional field that is absent maps to NULL. An explicitly present JSON null or other incorrect type raises `ClubStadiumError`, a `ValueError` with machine-readable `reason` and `field` attributes. For example, a different source club raises `club_mismatch` at `data.clubId`. A supplied country map accepts integer or decimal-string keys and nonblank string names. Two entries for the requested country must agree.
+IDs accept positive integers and canonical ASCII decimal strings without leading zeros. Booleans are invalid in all numeric and ID fields. An optional field that is absent maps to NULL. Only `buildingDetails.renovationYear` also accepts an explicit JSON null. Invalid field values raise `ClubStadiumError`, a `ValueError` with machine-readable `reason` and `field` attributes. For example, a different source club raises `club_mismatch` at `data.clubId`. A supplied country map accepts integer or decimal-string keys and nonblank string names. Two entries for the requested country must agree.
 
 ## Status, grain and completeness
 

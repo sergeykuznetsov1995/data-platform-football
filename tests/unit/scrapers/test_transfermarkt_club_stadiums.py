@@ -79,6 +79,16 @@ def test_full_observation(envelope):
         result.stadium.capacity = 10
 
 
+def test_null_renovation_year_preserves_the_stadium(envelope):
+    envelope['data']['buildingDetails']['renovationYear'] = None
+    result = parse_club_stadium(envelope, club_id=131, observed_at=CAPTURE)
+
+    assert result.status == 'observed_present'
+    assert result.stadium.renovation_year is None
+    assert (result.stadium.build_year, result.stadium.capacity) == (1957, 62657)
+    assert result.relation == ClubStadiumRelation('131', '56', CAPTURE)
+
+
 def test_confirmed_empty():
     result = confirmed_empty_club_stadium(
         club_id=131, observed_at=CAPTURE, completeness_proof='capture/report-17',
@@ -133,6 +143,11 @@ def test_broken_envelope_raises(payload, reason):
     ({'location': {'latitude': False}}, 'invalid_coordinate', 'data.location.latitude'),
     ({'location': {'longitude': -181}}, 'invalid_coordinate', 'data.location.longitude'),
     ({'buildingDetails': None}, 'invalid_object', 'data.buildingDetails'),
+    ({'buildingDetails': {'buildYear': None}}, 'invalid_integer', 'data.buildingDetails.buildYear'),
+    ({'buildingDetails': {'renovationYear': False}}, 'invalid_integer', 'data.buildingDetails.renovationYear'),
+    ({'buildingDetails': {'renovationYear': -1}}, 'invalid_integer', 'data.buildingDetails.renovationYear'),
+    ({'buildingDetails': {'renovationYear': 1994.5}}, 'invalid_integer', 'data.buildingDetails.renovationYear'),
+    ({'buildingDetails': {'renovationYear': '1994'}}, 'invalid_integer', 'data.buildingDetails.renovationYear'),
     ({'buildingDetails': {'fieldLength': 3.5}}, 'invalid_integer', 'data.buildingDetails.fieldLength'),
     ({'images': {}}, 'invalid_images', 'data.images'),
     ({'images': [IMAGE_1]}, 'invalid_object', 'data.images[0]'),
