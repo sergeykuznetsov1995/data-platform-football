@@ -460,6 +460,24 @@ def test_refresh_reverse_source_keeps_only_canonical_pairs_in_domain(monkeypatch
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.writes) == 1
 
 
+@pytest.mark.parametrize("unchanged_table", [c1.MATCHES, c1.PAYLOADS])
+def test_closure_reads_each_distinct_source_snapshot_once(monkeypatch, unchanged_table):
+    pair = ("10", "2026/27")
+    manager = ClosureManager({pair})
+    manager.scope_decisions["10"] = "excluded"
+    manager.current[unchanged_table] = OLD
+    setup_refresh(monkeypatch, manager)
+
+    result = c1.refresh(manager)
+
+    assert result["seasons"] == 1
+    assert manager.existing_pairs == {pair}
+    for table in (c1.MATCHES, c1.PAYLOADS):
+        versions = [version for forward, source, version, _, _ in manager.scans
+                    if forward and source == table]
+        assert versions == ([OLD] if table == unchanged_table else [OLD, NEW])
+
+
 @pytest.mark.parametrize("mode", ["unchanged", "pairs_without_ids", "ids_without_pairs"])
 def test_refresh_empty_sets_do_not_issue_empty_closure_queries(monkeypatch, mode):
     pair = ("10", "2026/27")

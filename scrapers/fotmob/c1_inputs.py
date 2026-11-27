@@ -396,34 +396,59 @@ def _compare_manifest_buckets(manager, old, new):
 
 
 def _appended_manifest_rows(manager, old, new):
-    """Return exact additions on a short append-only ancestry, or None to compare.
+    """Return exact additions after any leading file compactions, or None to compare.
 
-    Snapshot IDs are opaque. Walk parent links, then corroborate the per-snapshot
-    file inventory and each file's row count before returning any changes.
-    Maintenance can replace files while we read live metadata; a missing file
-    always sends us back to the full comparison of the two pinned snapshots.
+    Iceberg's replace operation preserves logical rows. We accept only a prefix
+    of these rewrites with matching record counts and a common snapshot schema.
+    Appends after it must still have their complete file inventory and row counts.
+    All other histories use the exact comparison of the original pinned snapshots.
     """
     history = manager.execute_query(
         f"SELECT snapshot_id, parent_id, operation, "
-        f"try_cast(element_at(summary, 'added-data-files') AS bigint) "
+        f"try_cast(element_at(summary, 'added-data-files') AS bigint), "
+        f"try_cast(element_at(summary, 'deleted-data-files') AS bigint), "
+        f"try_cast(element_at(summary, 'added-records') AS bigint), "
+        f"try_cast(element_at(summary, 'deleted-records') AS bigint) "
         f'FROM {PREFIX}"{MANIFEST}$snapshots" ORDER BY committed_at DESC LIMIT 1024'
     )
-    ancestry = {sid: (parent, operation, added) for sid, parent, operation, added in history}
+    ancestry = {row[0]: row[1:] for row in history}
     if old not in ancestry:
         return None
     files_per_snapshot = {}
+    rewrites = set()
     snapshot = new
     while snapshot != old:
-        if snapshot not in ancestry or snapshot in files_per_snapshot:
+        if snapshot not in ancestry or snapshot in files_per_snapshot or snapshot in rewrites:
             return None
-        parent, operation, added = ancestry[snapshot]
-        if operation != "append" or added is None or added < 1:
+        parent, operation, added, deleted, added_rows, deleted_rows = ancestry[snapshot]
+        if added is None or added < 1:
             return None
-        files_per_snapshot[snapshot] = added
+        if operation == "append" and not rewrites:
+            files_per_snapshot[snapshot] = added
+        elif (
+            operation == "replace"
+            and deleted is not None and deleted > 0
+            and added_rows is not None and added_rows >= 0 and added_rows == deleted_rows
+        ):
+            rewrites.add(snapshot)
+        else:
+            return None
         snapshot = parent
     file_count = sum(files_per_snapshot.values())
-    if not file_count or file_count > MAX_APPEND_FILES:
+    if file_count > MAX_APPEND_FILES:
         return None
+    if rewrites:
+        required = rewrites | {old, new}
+        versions = ", ".join(str(int(sid)) for sid in sorted(required))
+        schemas = list(manager.execute_query(
+            f'SELECT latest_snapshot_id, latest_schema_id FROM {PREFIX}"{MANIFEST}$metadata_log_entries" '
+            f"WHERE latest_snapshot_id IN ({versions}) GROUP BY 1, 2"
+        ))
+        schema_ids = {schema_id for _, schema_id in schemas}
+        if {sid for sid, _ in schemas} != required or len(schema_ids) != 1 or None in schema_ids:
+            return None
+    if not file_count:
+        return []
 
     versions = ", ".join(str(int(sid)) for sid in sorted(files_per_snapshot))
     files = list(manager.execute_query(
@@ -771,7 +796,9 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
             if affected:
                 for table in (MATCHES, PAYLOADS):
                     predicates = _pair_predicates(affected, physical=table == MATCHES)
-                    for version in (previous["snapshots"], before):
+                    old = previous["snapshots"]
+                    versions = (before,) if old[table] == before[table] else (old, before)
+                    for version in versions:
                         for predicate in predicates:
                             ids |= {str(row[0]) for row in manager.execute_query(
                                 f"SELECT DISTINCT match_id FROM {source_sql(table, version, predicate)}"
