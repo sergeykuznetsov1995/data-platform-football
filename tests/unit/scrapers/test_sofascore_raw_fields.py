@@ -198,6 +198,41 @@ class TestParseRounds:
         with pytest.raises(ValueError, match="duplicate natural key"):
             parse_rounds(payload, source_tournament_id=1, source_season_id=2)
 
+    def test_blank_or_padded_prefix_is_the_same_stage_marker_in_id_and_current(self):
+        payload = {
+            "currentRound": {"round": 2, "prefix": " Apertura "},
+            "rounds": [
+                {"round": 1, "prefix": "Apertura"},
+                {"round": 2, "prefix": " Apertura "},
+                {"round": 2, "prefix": ""},
+            ],
+        }
+        rows = parse_rounds(payload, source_tournament_id=1, source_season_id=2)
+        assert [row["round_id"] for row in rows] == ["Apertura:1", "Apertura:2", "2"]
+        assert [row["is_current"] for row in rows] == [False, True, False]
+
+    def test_current_round_naming_both_stage_and_number_picks_one_stage(self):
+        payload = {
+            "currentRound": {"round": 1, "prefix": "Clausura"},
+            "rounds": [
+                {"round": 1, "prefix": "Apertura"},
+                {"round": 1, "prefix": "Clausura"},
+            ],
+        }
+        rows = parse_rounds(payload, source_tournament_id=1, source_season_id=2)
+        assert [row["is_current"] for row in rows] == [False, True]
+
+    def test_current_round_without_stage_marks_that_number_in_every_stage(self):
+        # Lenient on purpose, like the existing name comparison: nothing consumes
+        # is_current, and the real payloads name the stage of a restarted round.
+        payload = {
+            "currentRound": {"round": 1},
+            "rounds": [{"round": 1, "prefix": "Apertura"}, {"round": 1, "prefix": "Clausura"}],
+        }
+        rows = parse_rounds(payload, source_tournament_id=1, source_season_id=2)
+        assert [row["is_current"] for row in rows] == [True, True]
+
+
 
 class TestParseCupTrees:
     def test_fixture_rows(self):

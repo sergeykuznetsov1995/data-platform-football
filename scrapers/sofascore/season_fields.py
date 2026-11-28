@@ -94,9 +94,11 @@ def _round_is_current(item: Mapping[str, Any], current_round: Mapping[str, Any])
     if current_name is not None and current_name != item.get("name"):
         return False
     # The same round number exists once per stage; a currentRound that names
-    # its stage does not make that number of another stage current.
-    current_prefix = current_round.get("prefix")
-    if current_prefix is not None and current_prefix != item.get("prefix"):
+    # its stage does not make that number of another stage current. A blank
+    # prefix is the absence of one, as in the id.
+    current_prefix = str(current_round.get("prefix") or "").strip()
+    item_prefix = str(item.get("prefix") or "").strip()
+    if current_prefix and current_prefix != item_prefix:
         return False
     return True
 
