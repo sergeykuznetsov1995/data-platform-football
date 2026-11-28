@@ -254,9 +254,12 @@ def classify(event, monitor_user):
             raise ValueError("malformed IO")
         if not own or PROBE.fullmatch(clean_sql):
             return None
-        # Known metadata-only operations have no Bronze data-table I/O.
-        if staged or not (input_data or output_data or broken) and (
-            (inputs and not bad_in) or re.fullmatch(r"show\s+(catalogs|schemas|tables)(\s+(from|in)\s+[\w.]+)?\s*;?", clean_sql)
+        # Known metadata-only operations have no data-table I/O. A staging
+        # table is not one: a statement that also touches another data table
+        # is classified like any other.
+        if not (input_data or output_data or broken) and (
+            staged or (inputs and not bad_in)
+            or re.fullmatch(r"show\s+(catalogs|schemas|tables)(\s+(from|in)\s+[\w.]+)?\s*;?", clean_sql)
             or (re.match(r"select\b", clean_sql) and META_FROM.search(clean_sql)
                 and len(re.findall(r"\b(?:from|join|select|union)\b", clean_sql)) == 2)
         ):

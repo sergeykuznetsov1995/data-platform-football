@@ -487,6 +487,14 @@ def test_staging_lifecycle_and_table_metadata_are_not_table_activity(tmp_path):
     loaded = club.classify(event(reads=(base,), output=stage,
                                  sql=f"CREATE TABLE iceberg.bronze.{stage} AS SELECT * FROM {qualified}"), None)
     assert loaded["reads"] == {base: 1} and loaded["outputs"] == []
+    # A write into the Bronze table is never dropped, whatever else the statement names.
+    into = club.classify(event(reads=(stage,), output=base,
+                               sql=f"INSERT INTO {qualified} SELECT * FROM iceberg.bronze.{stage}"), None)
+    assert into["outputs"] == [base] and into["reads"] == {} and not into["uncertain"]
+    # A statement that names a staging table and reads another data table is not routine.
+    mixed = event(reads=(), sql=f"SELECT * FROM iceberg.bronze.{stage} s JOIN iceberg.other.dim_match d ON s.k = d.k")
+    mixed["ioMetadata"]["inputs"] = [physical(stage), physical("dim_match", schema="other")]
+    assert club.classify(mixed, None)["uncertain"]
     # Dropping a Bronze table is not routine for the source.
     assert club.classify(event(reads=(), sql=f"DROP TABLE {qualified}"), None)["uncertain"]
 
