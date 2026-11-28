@@ -74,6 +74,11 @@ def assert_natural_keys(rows: list[dict[str, Any]], key_fields: tuple[str, ...])
 
 def _round_id(item: Mapping[str, Any], where: str) -> str:
     round_id = _required_id(item, "round", where)
+    # A season split into stages restarts the round numbering in every stage,
+    # so a stage prefix the source provides is part of the identity (#2470).
+    prefix = item.get("prefix")
+    if prefix is not None and str(prefix).strip():
+        round_id = f"{str(prefix).strip()}:{round_id}"
     slug = item.get("slug")
     if slug is None or not str(slug).strip():
         return round_id
@@ -87,6 +92,11 @@ def _round_is_current(item: Mapping[str, Any], current_round: Mapping[str, Any])
         return False
     current_name = current_round.get("name")
     if current_name is not None and current_name != item.get("name"):
+        return False
+    # The same round number exists once per stage; a currentRound that names
+    # its stage does not make that number of another stage current.
+    current_prefix = current_round.get("prefix")
+    if current_prefix is not None and current_prefix != item.get("prefix"):
         return False
     return True
 

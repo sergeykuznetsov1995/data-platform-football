@@ -156,6 +156,48 @@ class TestParseRounds:
         with pytest.raises(ValueError, match="duplicate natural key"):
             parse_rounds(payload, source_tournament_id=1, source_season_id=2)
 
+    def test_stage_prefix_disambiguates_restarted_round_number(self):
+        # Liga AUF Uruguaya 2026: Apertura, Intermedio and Clausura all start at 1.
+        rows = parse_rounds(
+            _load_fixture("sofascore_season_89288_rounds.json"),
+            source_tournament_id=278,
+            source_season_id=89288,
+        )
+        assert [row["round_id"] for row in rows] == [
+            *[f"Apertura:{number}" for number in range(1, 16)],
+            *[f"Intermedio:{number}" for number in range(1, 8)],
+            "Intermedio:29:final",
+            *[f"Clausura:{number}" for number in range(1, 16)],
+            "28:semifinals",
+        ]
+        assert rows[15]["round"] == rows[23]["round"] == 1
+        assert rows[15]["prefix"] == "Intermedio"
+        assert rows[23]["prefix"] == "Clausura"
+        assert [index for index, row in enumerate(rows) if row["is_current"]] == [38]
+
+    def test_stage_prefix_qualifies_only_the_stage_that_carries_it(self):
+        # New Zealand National League 2026: the second stage repeats 1..11 under a prefix.
+        rows = parse_rounds(
+            _load_fixture("sofascore_season_90902_rounds.json"),
+            source_tournament_id=594,
+            source_season_id=90902,
+        )
+        assert [row["round_id"] for row in rows] == [
+            *[str(number) for number in range(1, 23)],
+            *[f"National League:{number}" for number in range(1, 12)],
+        ]
+        assert rows[9]["round"] == rows[31]["round"] == 10
+        # currentRound names its stage, so round 10 of the first stage is not current.
+        assert [index for index, row in enumerate(rows) if row["is_current"]] == [31]
+
+    def test_same_stage_and_number_still_raises(self):
+        payload = {"rounds": [
+            {"round": 1, "prefix": "Apertura"},
+            {"round": 1, "prefix": "Apertura"},
+        ]}
+        with pytest.raises(ValueError, match="duplicate natural key"):
+            parse_rounds(payload, source_tournament_id=1, source_season_id=2)
+
 
 class TestParseCupTrees:
     def test_fixture_rows(self):
