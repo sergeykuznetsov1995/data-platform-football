@@ -153,7 +153,148 @@ class StreamRateState:
         if len({key for key, _ in self.blocks}) >= 2:
             self.source_slow = max(self.source_slow, now + 1800)
             alerts.append('transfermarkt_source_rate_halved')
-        if sum(key == stream_id for key, _ in self.blocks) >= 3:
+        if sum(key == stream_id for key, _ in self.blocks) >= 4:
             self.pause[stream_id] = max(self.pause[stream_id], now + 900)
             alerts.append('transfermarkt_stream_paused')
         return tuple(alerts)
+
+    def hold(self, now, seconds):
+        """Pause every stream until one time; a source stop is such a pause."""
+        until = self._time(now) + self._time(seconds)
+        for key in self.pause:
+            self.pause[key] = max(self.pause[key], until)
+        return until
+
+    def release(self, now):
+        """Lift a source hold; no stream stays paused beyond it."""
+        now = self._time(now)
+        for key in self.pause:
+            self.pause[key] = min(self.pause[key], now)
+
+
+SOURCE_STOP_REASONS = frozenset({'human_verification', 'addresses_exhausted'})
+
+
+class SourceStopState:
+    """Durable record of one Transfermarkt source stop and of its single probe.
+
+    Owner decision of 2026-11-28: a refusal on one address is replaced by
+    another address, but the source is held for hours once it asks for a human
+    or once every address is refused.  When the hold ends, exactly one probe
+    request is admitted.  The hold itself is the streams' ordinary pause, so a
+    gateway without this record still honours it; the record only decides when
+    the probe may run.
+    """
+
+    SCHEMA_VERSION = 1
+    STOP_SECONDS = 3 * 60 * 60
+    PROBE_TIMEOUT_SECONDS = 120
+    MAX_FAILED_PROBES = 3
+    NEEDS_OWNER_SECONDS = 7 * 24 * 60 * 60
+    _FIELDS = {'schema_version', 'reason', 'stopped_at', 'until', 'failed_probes',
+               'probe_permit_id', 'probe_started_at', 'needs_owner'}
+
+    def __init__(self, saved=None):
+        self._clear()
+        if saved is not None:
+            self._restore(saved)
+
+    def _clear(self):
+        self.reason = None
+        self.stopped_at = 0.0
+        self.until = 0.0
+        self.failed_probes = 0
+        self.probe_permit_id = None
+        self.probe_started_at = 0.0
+        self.needs_owner = False
+
+    @property
+    def active(self):
+        return self.reason is not None
+
+    @property
+    def probing(self):
+        return self.probe_permit_id is not None
+
+    def arm(self, now, reason):
+        """Start a stop, or extend one already held; none is ever shortened."""
+        if reason not in SOURCE_STOP_REASONS:
+            raise ValueError('invalid TM source stop reason')
+        now = StreamRateState._time(now)
+        if self.needs_owner:
+            self.until = max(self.until, now + self.NEEDS_OWNER_SECONDS)
+            return self.until
+        until = now + self.STOP_SECONDS * 2 ** min(self.failed_probes, self.MAX_FAILED_PROBES - 1)
+        if not self.active:
+            self.reason, self.stopped_at = reason, now
+        self.until = max(self.until, until)
+        self.probe_permit_id, self.probe_started_at = None, 0.0
+        return self.until
+
+    def probe_due(self, now):
+        return self.active and not self.probing and not self.needs_owner and now >= self.until
+
+    def begin_probe(self, now, permit_id):
+        """The permit about to be granted is the one probe of this stop."""
+        if not self.probe_due(now):
+            raise ValueError('TM source probe is not due')
+        self.probe_permit_id = str(permit_id)
+        self.probe_started_at = StreamRateState._time(now)
+
+    def probe_passed(self):
+        """The probe reached the source and was heard: the stop is over."""
+        if not self.probing:
+            raise ValueError('TM source probe was not started')
+        self._clear()
+
+    def probe_expired(self, now):
+        """A run that never reported its probe is no evidence of a refusal."""
+        return self.probing and now >= self.probe_started_at + self.PROBE_TIMEOUT_SECONDS
+
+    def probe_failed(self, now):
+        """The probe was refused: hold longer, and stop probing after three."""
+        if not self.probing:
+            raise ValueError('TM source probe was not started')
+        now = StreamRateState._time(now)
+        self.failed_probes += 1
+        self.probe_permit_id, self.probe_started_at = None, 0.0
+        if self.failed_probes >= self.MAX_FAILED_PROBES:
+            self.needs_owner = True
+            self.until = now + self.NEEDS_OWNER_SECONDS
+        else:
+            self.until = now + self.STOP_SECONDS * 2 ** self.failed_probes
+        return self.until
+
+    def owner_resume(self):
+        """The owner lifts a stop that exhausted its probes."""
+        self._clear()
+
+    def _restore(self, saved):
+        if not isinstance(saved, dict) or set(saved) != self._FIELDS:
+            raise ValueError('invalid TM source stop state')
+        if type(saved['schema_version']) is not int or saved['schema_version'] != self.SCHEMA_VERSION:
+            raise ValueError('unsupported TM source stop state')
+        reason = saved['reason']
+        permit = saved['probe_permit_id']
+        if reason is not None and reason not in SOURCE_STOP_REASONS:
+            raise ValueError('invalid TM source stop reason')
+        if type(saved['needs_owner']) is not bool or type(saved['failed_probes']) is not int \
+                or not 0 <= saved['failed_probes'] <= self.MAX_FAILED_PROBES:
+            raise ValueError('invalid TM source stop evidence')
+        if permit is not None and (not isinstance(permit, str) or len(permit) != 64
+                                   or any(c not in '0123456789abcdef' for c in permit)):
+            raise ValueError('invalid TM source probe permit')
+        self.reason, self.probe_permit_id = reason, permit
+        self.needs_owner = saved['needs_owner']
+        self.failed_probes = saved['failed_probes']
+        self.stopped_at = StreamRateState._time(saved['stopped_at'])
+        self.until = StreamRateState._time(saved['until'])
+        self.probe_started_at = StreamRateState._time(saved['probe_started_at'])
+        if (self.active and (self.stopped_at == 0 or self.until < self.stopped_at)) \
+                or (not self.active and (self.failed_probes or self.needs_owner or permit)):
+            raise ValueError('inconsistent TM source stop state')
+
+    def dump(self):
+        return dict(schema_version=self.SCHEMA_VERSION, reason=self.reason, stopped_at=self.stopped_at,
+                    until=self.until, failed_probes=self.failed_probes, probe_permit_id=self.probe_permit_id,
+                    probe_started_at=self.probe_started_at, needs_owner=self.needs_owner)

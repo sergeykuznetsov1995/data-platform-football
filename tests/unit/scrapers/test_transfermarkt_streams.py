@@ -39,15 +39,17 @@ def test_two_blocked_streams_halves_source_series_pauses_and_survives_restart():
     rates.site_block('history-0', 5, status=429)
     alerts = rates.site_block('current-0', 10, challenge=True)
     assert 'transfermarkt_source_rate_halved' in alerts
-    rates.site_block('history-0', 15, status=403)
-    assert 'transfermarkt_stream_paused' in rates.site_block('history-0', 20, status=403)
-    assert rates.pause['history-0'] == 920
+    # Three refusals only slow the stream; the fourth pauses it.
+    assert 'transfermarkt_stream_paused' not in rates.site_block('history-0', 15, status=403)
+    assert 'transfermarkt_stream_paused' not in rates.site_block('history-0', 20, status=403)
+    assert 'transfermarkt_stream_paused' in rates.site_block('history-0', 25, status=403)
+    assert rates.pause['history-0'] == 925
     saved = copy.deepcopy(rates.dump())
-    resumed = StreamRateState(rates.streams, 21, saved)
-    assert resumed.ready_at('history-0', 21) == 920
-    assert resumed.source_slow == 1820
+    resumed = StreamRateState(rates.streams, 26, saved)
+    assert resumed.ready_at('history-0', 26) == 925
+    assert resumed.source_slow == 1825
     # No lease/connection identity is part of the rate clock.
-    assert resumed.ready_at('current-0', 21) == 31
+    assert resumed.ready_at('current-0', 26) == 36
 
 
 def test_gateway_wait_does_not_count_as_site_block():
