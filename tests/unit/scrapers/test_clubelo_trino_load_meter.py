@@ -78,10 +78,11 @@ def monitor(tmp_path, counts, *, day=DAY):
     # A one-argument executable with the production CSV contract. Reject
     # writes, incorrect metadata names and inclusive/offset day boundaries.
     # An int stands for that many Trino snapshots of unknown queries; a list
-    # gives the stored rows (operation, engine, trino_user, trino_query_id, dpf.operation).
+    # gives the stored rows (operation, engine, trino_user, trino_query_id,
+    # dpf.operation, dpf.source), missing trailing columns read as empty.
     script = tmp_path / "read-only-client"
-    rows = {key: value if isinstance(value, (list, tuple)) else
-            [("overwrite", "Trino", "src_clubelo", f"unmatched-{n}", "") for n in range(value)]
+    rows = {key: [pad(row) for row in value] if isinstance(value, (list, tuple)) else
+            [("overwrite", "Trino", "src_clubelo", f"unmatched-{n}", "", "") for n in range(value)]
             for key, value in counts.items()}
     script.write_text(
         f"#!{sys.executable}\n"
@@ -94,23 +95,29 @@ def monitor(tmp_path, counts, *, day=DAY):
         "    out.writerows((k,) for k in counts)\n"
         "else:\n"
         "    parts = sql.split(' UNION ALL ')\n"
-        "    assert len(parts) == len(counts) + 1 and parts[-1] == \"SELECT '', '', '', '', '', ''\"\n"
+        "    assert len(parts) == len(counts) + 1 and parts[-1] == \"SELECT '', '', '', '', '', '', ''\"\n"
         "    for part, key in zip(parts, sorted(counts)):\n"
         "        assert part.startswith(f'''SELECT '{key}', operation, element_at(summary, 'engine-name'),"
         "\\nelement_at(summary, 'trino_user'), element_at(summary, 'trino_query_id'), "
-        "element_at(summary, 'dpf.operation')\\nFROM iceberg.bronze.\"{key}$snapshots\"''')\n"
+        "element_at(summary, 'dpf.operation'),\\nelement_at(summary, 'dpf.source')"
+        "\\nFROM iceberg.bronze.\"{key}$snapshots\"''')\n"
         f"        assert \"committed_at >= TIMESTAMP '{day} 00:00:00 UTC'\" in part\n"
         f"        assert \"committed_at < TIMESTAMP '{day + club.DAY} 00:00:00 UTC'\" in part\n"
         "        out.writerows((key, *row) for row in counts[key])\n"
-        "    out.writerow(('',) * 6)\n",
+        "    out.writerow(('',) * 7)\n",
         encoding="utf-8",
     )
     script.chmod(0o700)
     return script
 
 
+def pad(row):
+    # a stored row without its leading table name: six columns
+    return tuple(row) + ("",) * (6 - len(row))
+
+
 def trino_commit(query_id, user="src_clubelo", operation="overwrite"):
-    return (operation, "Trino", user, query_id, "")
+    return (operation, "Trino", user, query_id, "", "")
 
 
 def test_receiver_mixed_primary_equivalence_and_redaction(tmp_path):
@@ -516,17 +523,19 @@ def test_snapshots_are_attributed_by_the_committing_engine(tmp_path):
     assert (report["tables"][TABLE]["snapshots"], report["tables"][TABLE]["trino_snapshots"],
             report["tables"][TABLE]["catalog_snapshots"]) == (2, 0, 2)
     unattributed = {"unattributed_snapshot_or_output"}
-    # The bulk writer's plain append carries no stamp at all (clubelo_raw_page).
-    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("append", "", "", "", "")]}))
+    # ClubElo's plain bulk append carries the source stamp (clubelo_raw_page).
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("append", "", "", "", "bulk-arrow-append", "clubelo")]}))
     assert report["verdict"] == "PASS" and report["tables"][TABLE]["catalog_snapshots"] == 1
-    # A Trino commit whose query was not stored cannot be matched.
-    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [trino_commit("20260301_120000_00009_wm2jf")]}))
-    assert report["verdict"] == "INCOMPLETE" and unattributed <= set(report["incomplete"])
-    # A shape neither Trino nor the bulk writer produces, another engine, another
-    # principal, or a Trino commit without its query id is not the source's output.
-    for rows in ([("overwrite", "", "", "", "")], [("append", "spark-3.5", "bob", "", "")],
-                 [trino_commit("20260301_120000_00009_wm2jf", user="bob")],
-                 [("overwrite", "Trino", "src_clubelo", "", "")]):
+    # Missing evidence, not a verdict: a Trino commit whose query was not stored
+    # and a Trino commit without its query id.
+    for rows in ([trino_commit("20260301_120000_00009_wm2jf")], [("overwrite", "Trino", "src_clubelo", "", "")]):
+        report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: rows}))
+        assert report["verdict"] == "INCOMPLETE" and unattributed <= set(report["incomplete"]), rows
+    # Not the source's output: an append without the source stamp, a shape no known
+    # writer produces, another engine, another principal.
+    for rows in ([("append", "", "", "", "")], [("append", "", "", "", "bulk-arrow-append", "other-source")],
+                 [("overwrite", "", "", "", "")], [("append", "spark-3.5", "bob", "", "")],
+                 [trino_commit("20260301_120000_00009_wm2jf", user="bob")]):
         report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: rows}))
         assert report["verdict"] == "VIOLATION" and "non_source_output" in report["violations"], rows
     # A query id is matched per table: the write to one table cannot stand in for a

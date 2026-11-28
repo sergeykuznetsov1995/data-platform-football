@@ -547,37 +547,39 @@ def discovery(client):
 
 
 def empty_evidence():
-    return {"snapshots": 0, "trino": 0, "catalog": 0, "unmatched": 0, "other_engine": 0,
-            "users": {}, "query_ids": []}
+    return {"snapshots": 0, "trino": 0, "catalog": 0, "unmatched": 0, "unstamped": 0,
+            "other_engine": 0, "users": {}, "query_ids": []}
 
 
 def snapshots(client, day, names):
     """Snapshot rows of one UTC day, tagged by the engine that committed them.
 
     Trino stamps ``trino_user`` and ``trino_query_id``. The platform's bulk
-    writer reaches the catalog directly and leaves no principal: its plain
-    appends carry no stamp at all, and an identity-partition replace is an
-    unstamped delete followed by an append stamped ``dpf.operation``. Any
-    other shape without an engine cannot be attributed.
+    writer reaches the catalog directly and leaves no principal. Its
+    identity-partition replace is an unstamped delete followed by an append
+    stamped ``dpf.operation``; ClubElo stamps its plain bulk appends with
+    ``dpf.source`` (ClubEloIcebergWriter.SNAPSHOT_STAMP). Any other commit
+    without an engine belongs to a writer the source cannot own.
     """
     selects = []
     for name in names:
         if not TABLE.fullmatch(name):
             raise ValueError("table")
         selects.append(f"""SELECT '{name}', operation, element_at(summary, 'engine-name'),
-element_at(summary, 'trino_user'), element_at(summary, 'trino_query_id'), element_at(summary, 'dpf.operation')
+element_at(summary, 'trino_user'), element_at(summary, 'trino_query_id'), element_at(summary, 'dpf.operation'),
+element_at(summary, 'dpf.source')
 FROM iceberg.bronze."{name}$snapshots"
 WHERE committed_at >= TIMESTAMP '{day.isoformat()} 00:00:00 UTC'
 AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 00:00:00 UTC'""")
     # The monitor reports an empty result as a failure; a quiet day still needs evidence.
-    selects.append("SELECT '', '', '', '', '', ''")
+    selects.append("SELECT '', '', '', '', '', '', ''")
     evidence = {name: empty_evidence() for name in names}
     for row in rows(client, " UNION ALL ".join(selects)):
-        if len(row) != 6:
+        if len(row) != 7:
             raise ValueError("snapshot row")
-        if row == [""] * 6:
+        if row == [""] * 7:
             continue
-        name, operation, engine, user, query_id, stamped = row
+        name, operation, engine, user, query_id, stamped, source = row
         info = evidence.get(name)
         if info is None or not re.fullmatch(r"[a-z_]+", operation) or info["snapshots"] >= LIMIT * 64:
             raise ValueError("snapshot row")
@@ -588,20 +590,22 @@ AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 00:00:00 UTC'""")
                 info["users"][user or ""] = info["users"].get(user or "", 0) + 1
                 info["query_ids"].append(query_id)
             else:
-                info["unmatched"] += 1
+                info["unmatched"] += 1   # the query id is missing evidence
         elif not engine:
-            # The bulk writer's shapes: an append (stamped or not) and its delete half.
-            if operation in ("append", "delete"):
+            # A replace batch (unstamped delete, stamped append) or a stamped
+            # ClubElo bulk append. Everything else is not the source's output.
+            if operation == "delete" or (operation == "append" and (
+                    stamped == "replace-identity-partition-batch" or source == "clubelo")):
                 info["catalog"] += 1
             else:
-                info["unmatched"] += 1
+                info["unstamped"] += 1
         else:
             info["other_engine"] += 1
     return evidence
 
 
 def valid_evidence(info):
-    counters = ("snapshots", "trino", "catalog", "unmatched", "other_engine")
+    counters = ("snapshots", "trino", "catalog", "unmatched", "unstamped", "other_engine")
     return (isinstance(info, dict) and set(info) == set(empty_evidence())
             and all(type(info[key]) is int and info[key] >= 0 for key in counters)
             and isinstance(info["users"], dict)
@@ -678,11 +682,12 @@ def summarize(db, day, evidence):
         committed = {digest(value.encode()) for value in info["query_ids"]}
         outputs = written.get(name, [])
         if (not committed <= {key for key, _ in outputs}
-                or any(not procedure and key not in committed for key, procedure in outputs)):
+                or any(not procedure and key not in committed for key, procedure in outputs)
+                or info["unmatched"]):
             reasons.add("unattributed_snapshot_or_output")
-        # A commit of a shape neither Trino nor the bulk writer produces, or by
-        # another engine or principal, is an output the source cannot own.
-        if info["unmatched"] or info["other_engine"] or set(info["users"]) - {"src_clubelo", "airflow"}:
+        # A commit without a known writer's stamp, by another engine or by
+        # another principal, is an output the source cannot own.
+        if info["unstamped"] or info["other_engine"] or set(info["users"]) - {"src_clubelo", "airflow"}:
             violations.add("non_source_output")
         if metrics["input_records_total"] > LIMIT:
             violations.add("input_record_limit")
@@ -694,8 +699,9 @@ def summarize(db, day, evidence):
             "scan_metric": "Trino QueryCompleted physical input records, including repeats and failed queries. "
                            "Iceberg ScanReports, rows and bytes require separate instrumentation.",
             "snapshot_metric": "Iceberg snapshots by committed_at. A Trino commit is matched to its successful "
-                               "output query by trino_query_id. Catalog commits (the bulk writer's appends and "
-                               "delete halves) carry no principal in the snapshot."}
+                               "output query by trino_query_id. Catalog commits carry no principal: ClubElo's "
+                               "bulk appends are recognized by their dpf.source stamp, a replace batch by "
+                               "dpf.operation and its unstamped delete half."}
 
 
 def write_report(root, day, report):

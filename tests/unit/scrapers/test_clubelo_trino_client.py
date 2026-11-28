@@ -119,6 +119,25 @@ def test_injected_writer_needs_no_credentials(store, monkeypatch, dbapi):
     dbapi[0].assert_not_called()
 
 
+def test_bulk_append_names_the_source_in_its_snapshot(monkeypatch, dbapi):
+    """A catalog append never passes Trino: the snapshot summary is the only
+    place that names its writer, and the Trino meter reads it (#2132)."""
+    from scrapers.clubelo import trino_client
+
+    writer = trino_client.ClubEloIcebergWriter()
+    target, aligned = Mock(), ["aligned row"]
+    monkeypatch.setattr(writer, "_load_pyiceberg_table", Mock(return_value=target))
+    monkeypatch.setattr(writer, "_align_pyiceberg_arrow_table", Mock(return_value=aligned))
+    frame = ["row"]
+    rows = writer._append_dataframe_pyiceberg(frame, database="bronze", table="clubelo_raw_page")
+    assert rows == 1
+    writer._load_pyiceberg_table.assert_called_once_with(database="bronze", table="clubelo_raw_page")
+    writer._align_pyiceberg_arrow_table.assert_called_once_with(frame, target=target)
+    target.append.assert_called_once_with(aligned, snapshot_properties={
+        "dpf.source": "clubelo", "dpf.operation": "bulk-arrow-append"})
+    assert trino_client.SNAPSHOT_STAMP == {"dpf.source": "clubelo", "dpf.operation": "bulk-arrow-append"}
+
+
 @pytest.mark.parametrize("password,command", [(None, "verify"), ("source-test-password", "copy")])
 def test_standalone_archive_reaches_auth_check(tmp_path, password, command):
     # An isolated interpreter exercises the direct script import from outside the repo.
