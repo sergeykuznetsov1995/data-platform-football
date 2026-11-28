@@ -2,13 +2,13 @@
 +++ b/morning_report.py
 @@ -226,13 +226,13 @@
      return None
- 
- 
+
+
 -def _trino_row(sql, timeout=240):
 +def _trino_row(sql, timeout=240, client=None):
      """Первая непустая строка ответа Trino — списком полей без кавычек; None, если
      Trino недоступен, запрос упал или не уложился в timeout.
- 
+
      Отличается от run(): та возвращает "" и при падении, и при пустом ответе."""
      try:
 -        r = subprocess.run([TRINO, sql], capture_output=True, text=True, timeout=timeout)
@@ -18,8 +18,8 @@
      if r.returncode != 0:
 @@ -244,12 +244,12 @@
      return None
- 
- 
+
+
 -def _trino_rows(sql, timeout=240):
 +def _trino_rows(sql, timeout=240, client=None):
      """Все непустые строки ответа Trino — списками полей без кавычек; None, если
@@ -41,7 +41,7 @@
    SELECT rating_date, min(fetched_at) AS first_seen FROM iceberg.bronze.clubelo_raw_page
    WHERE page = '/Ranking' AND rating_date IS NOT NULL AND rating_date >= DATE '{lo}'
 @@ -3825,7 +3827,8 @@
- 
+
  def _clubelo_rows(sql, width, sentinel):
      """Строки Trino без строки-заглушки; None — запрос упал / не разобран (как _espn_rows)."""
 -    rows = _trino_rows(f"SELECT * FROM ({sql}) q UNION ALL SELECT '{CLUBELO_SENTINEL}', {sentinel}")
@@ -69,7 +69,7 @@
      line = _clubelo_format(dates, series, history_line, history_bad, wire, frozen, rules)
      if "--dry-run" not in sys.argv:
 @@ -4099,7 +4102,7 @@
- 
+
  class _ClubeloDqTrino:
      def execute_query(self, sql):
 -        rows = _trino_rows(sql)

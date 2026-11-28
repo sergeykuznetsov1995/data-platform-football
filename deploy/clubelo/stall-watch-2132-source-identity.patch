@@ -1,7 +1,7 @@
 --- a/clubelo_stall_watch.py
 +++ b/clubelo_stall_watch.py
 @@ -36,7 +36,8 @@
- 
+
  METADB = "postgres"          # общий стек (morning_report.METADBS)
  DAG_ID = "dag_ingest_clubelo"
 -TRINO = "/root/.claude/bin/trino-ro.sh"

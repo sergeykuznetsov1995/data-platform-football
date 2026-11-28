@@ -7,6 +7,7 @@ resulting calls are exercised without Trino.
 
 from pathlib import Path
 import re
+import shutil
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -30,10 +31,11 @@ def apply(patch_text, before):
         old, new = [], []
         while index < len(lines) and not lines[index].startswith(("@@", "--- ", "+++ ")):
             line = lines[index]
-            if line[:1] in (" ", "-"):
-                old.append(line[1:])
-            if line[:1] in (" ", "+"):
-                new.append(line[1:])
+            empty = "\n" if line == "\n" else None   # a blank context line is stored without its space
+            if line[:1] in (" ", "-") or empty is not None:
+                old.append(line[1:] if empty is None else empty)
+            if line[:1] in (" ", "+") or empty is not None:
+                new.append(line[1:] if empty is None else empty)
             index += 1
         old, new = "".join(old), "".join(new)
         position = after.find(old, cursor)
@@ -103,3 +105,20 @@ def test_patches_carry_no_credentials(name):
     text = (DEPLOY / name).read_text(encoding="utf-8")
     added = [line[1:] for line in text.splitlines() if line.startswith("+") and not line.startswith("+++")]
     assert added and not [line for line in added if "PASSWORD" in line.upper() or "TOKEN" in line.upper()]
+
+
+def test_patches_apply_with_both_tools(tmp_path):
+    """The host uses GNU patch; the first meter installation used git apply."""
+    for name, source in (("morning-report-2132-source-identity.patch", "morning_report.excerpt.py"),
+                         ("stall-watch-2132-source-identity.patch", "clubelo_stall_watch.excerpt.py")):
+        patch = DEPLOY / name
+        assert not [line for line in patch.read_text(encoding="utf-8").splitlines() if line != line.rstrip()]
+        script = "morning_report.py" if source.startswith("morning") else "clubelo_stall_watch.py"
+        for tool in (["patch", "--silent", "-p1", "-i", str(patch), script], ["git", "apply", str(patch)]):
+            work = tmp_path / script.removesuffix(".py") / tool[0]
+            work.mkdir(parents=True)
+            # The excerpt carries the "before" side of every hunk under the real file name.
+            shutil.copyfile(FIXTURES / source, work / script)
+            result = subprocess.run(tool, cwd=work, capture_output=True, text=True)
+            assert result.returncode == 0, (name, tool[0], result.stdout, result.stderr)
+            assert (work / script).read_text(encoding="utf-8") != (FIXTURES / source).read_text(encoding="utf-8")
