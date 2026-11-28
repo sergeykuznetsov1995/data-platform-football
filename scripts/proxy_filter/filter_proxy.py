@@ -1095,8 +1095,12 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
             try:
                 self._persist_stop()
             except RuntimeError:
-                # The caller is told the consume failed and sends nothing.
+                # The caller is told the consume failed and sends nothing. The
+                # permit takes no feedback either: it was never a request.
                 self.stop.probe_sent = False
+                ticket = self._probe_ticket()
+                ticket.consumed_at = None
+                ticket.granted_at = None
                 raise
         # A consumed permit is one request to the source, counted on the day it
         # was consumed: the denominator of the refusal rate.
@@ -1108,6 +1112,8 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         key = self._consumed_ticket(stream_id, permit_id)
         if permit_id in self._durable_feedback:
             return
+        if self.stop.probing and self.stop.probe_permit_id == permit_id and not self.stop.probe_sent:
+            raise TransfermarktPermitError('the probe was not sent')
         now = self._clock()
         if permit_id not in self._feedback:
             self._feedback[permit_id] = self.rate.site_block(
@@ -1137,7 +1143,7 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
             log.error('%s stream=%s', event, stream_id)
 
     def report_probe_passed(self, *, stream_id, permit_id):
-        if self.stop.probe_permit_id != permit_id:
+        if self.stop.probe_permit_id != permit_id or not self.stop.probe_sent:
             raise TransfermarktPermitError('probe feedback requires the probe permit')
         self._consumed_ticket(stream_id, permit_id)
         now = self._clock()

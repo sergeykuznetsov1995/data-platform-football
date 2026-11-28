@@ -7521,11 +7521,14 @@ def test_transfermarkt_nothing_held_reports_no_pause_to_waiting_callers(shared_m
 
 
 def test_transfermarkt_a_probe_whose_send_was_not_recorded_is_not_heard(shared_mod, monkeypatch, tmp_path):
+    from scrapers.transfermarkt.streams import calendar_day
+
     clock = [0.0]
     controller, until = _stopped_controller(shared_mod, tmp_path, clock)
     clock[0] = until
     probe = controller.request(**_current('probe'))
     assert probe.granted and probe.probe and not controller.stop.probe_sent
+    before = {day: dict(entry) for day, entry in controller.refusals.days.items()}
     original = shared_mod._atomic_private_bytes
 
     def no_stop_file(target, *args, **kwargs):
@@ -7538,11 +7541,23 @@ def test_transfermarkt_a_probe_whose_send_was_not_recorded_is_not_heard(shared_m
     with pytest.raises(RuntimeError, match='write failed'):
         controller.consume(**_current('probe'), permit_id=probe.permit_id, permit_token=probe.permit_token)
     assert controller.stop.active and controller.stop.probing and not controller.stop.probe_sent
+    # The permit made no request, so it takes no feedback: neither a pass nor a refusal.
+    with pytest.raises(shared_mod.TransfermarktPermitError):
+        controller.report_probe_passed(stream_id='current-0', permit_id=probe.permit_id)
+    with pytest.raises(shared_mod.TransfermarktPermitError):
+        controller.report_block(stream_id='current-0', permit_id=probe.permit_id,
+                                status=403, challenge=False)
+    assert controller.refusals.days == before and controller.stop.active
     monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
     # The permit is spent and nothing went out: the stop stands, and a new request is the probe.
     clock[0] = until + shared_mod.TransfermarktRequestPermitController.GRANTED_TTL_SECONDS
     second, _context = _live_probe(controller, clock, 'second')
     assert second.permit_id != probe.permit_id and controller.stop.active
+    # Only the request that was sent is counted, on its own day.
+    assert controller.refusals.days == {
+        **before, calendar_day(clock[0]): {
+            'requests': before.get(calendar_day(clock[0]), {}).get('requests', 0) + 1,
+            'refusals': before.get(calendar_day(clock[0]), {}).get('refusals', 0)}}
 
 
 def test_transfermarkt_a_probe_grant_whose_record_failed_leaves_no_trace(shared_mod, monkeypatch, tmp_path):
