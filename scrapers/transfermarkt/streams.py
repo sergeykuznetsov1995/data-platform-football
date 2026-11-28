@@ -197,7 +197,7 @@ class SourceStopState:
     MAX_FAILED_PROBES = 3
     NEEDS_OWNER_SECONDS = 7 * 24 * 60 * 60
     _FIELDS = {'schema_version', 'reason', 'stopped_at', 'until', 'failed_probes',
-               'probe_permit_id', 'probe_started_at', 'needs_owner'}
+               'probe_permit_id', 'probe_started_at', 'probe_sent', 'needs_owner'}
 
     def __init__(self, saved=None):
         self._clear()
@@ -211,6 +211,7 @@ class SourceStopState:
         self.failed_probes = 0
         self.probe_permit_id = None
         self.probe_started_at = 0.0
+        self.probe_sent = False
         self.needs_owner = False
 
     @property
@@ -233,7 +234,7 @@ class SourceStopState:
         if not self.active:
             self.reason, self.stopped_at = reason, now
         self.until = max(self.until, until)
-        self.probe_permit_id, self.probe_started_at = None, 0.0
+        self.probe_permit_id, self.probe_started_at, self.probe_sent = None, 0.0, False
         return self.until
 
     def probe_due(self, now):
@@ -245,6 +246,7 @@ class SourceStopState:
             raise ValueError('TM source probe is not due')
         self.probe_permit_id = str(permit_id)
         self.probe_started_at = StreamRateState._time(now)
+        self.probe_sent = False
 
     def probe_passed(self):
         """The probe reached the source and was heard: the stop is over."""
@@ -252,9 +254,21 @@ class SourceStopState:
             raise ValueError('TM source probe was not started')
         self._clear()
 
+    def mark_sent(self):
+        """The probe's permit was consumed: its request is on its way to the source."""
+        if not self.probing:
+            raise ValueError('TM source probe was not started')
+        self.probe_sent = True
+
+    def abandon_probe(self):
+        """The probe was granted but never sent; the stop stays and a probe is due again."""
+        if not self.probing or self.probe_sent:
+            raise ValueError('TM source probe cannot be abandoned')
+        self.probe_permit_id, self.probe_started_at, self.probe_sent = None, 0.0, False
+
     def probe_expired(self, now):
-        """A run that never reported its probe is no evidence of a refusal."""
-        return self.probing and now >= self.probe_started_at + self.PROBE_TIMEOUT_SECONDS
+        """A sent probe that was never reported is no evidence of a refusal."""
+        return self.probing and self.probe_sent and now >= self.probe_started_at + self.PROBE_TIMEOUT_SECONDS
 
     def probe_failed(self, now):
         """The probe was refused: hold longer, and stop probing after three."""
@@ -262,7 +276,7 @@ class SourceStopState:
             raise ValueError('TM source probe was not started')
         now = StreamRateState._time(now)
         self.failed_probes += 1
-        self.probe_permit_id, self.probe_started_at = None, 0.0
+        self.probe_permit_id, self.probe_started_at, self.probe_sent = None, 0.0, False
         if self.failed_probes >= self.MAX_FAILED_PROBES:
             self.needs_owner = True
             self.until = now + self.NEEDS_OWNER_SECONDS
@@ -281,6 +295,8 @@ class SourceStopState:
             raise ValueError('unsupported TM source stop state')
         reason = saved['reason']
         permit = saved['probe_permit_id']
+        if type(saved['probe_sent']) is not bool:
+            raise ValueError('invalid TM source probe evidence')
         if reason is not None and reason not in SOURCE_STOP_REASONS:
             raise ValueError('invalid TM source stop reason')
         if type(saved['needs_owner']) is not bool or type(saved['failed_probes']) is not int \
@@ -295,14 +311,17 @@ class SourceStopState:
         self.stopped_at = StreamRateState._time(saved['stopped_at'])
         self.until = StreamRateState._time(saved['until'])
         self.probe_started_at = StreamRateState._time(saved['probe_started_at'])
+        self.probe_sent = saved['probe_sent']
         if (self.active and (self.stopped_at == 0 or self.until < self.stopped_at)) \
-                or (not self.active and (self.failed_probes or self.needs_owner or permit)):
+                or (not self.active and (self.failed_probes or self.needs_owner or permit)) \
+                or (self.probe_sent and permit is None):
             raise ValueError('inconsistent TM source stop state')
 
     def dump(self):
         return dict(schema_version=self.SCHEMA_VERSION, reason=self.reason, stopped_at=self.stopped_at,
                     until=self.until, failed_probes=self.failed_probes, probe_permit_id=self.probe_permit_id,
-                    probe_started_at=self.probe_started_at, needs_owner=self.needs_owner)
+                    probe_started_at=self.probe_started_at, probe_sent=self.probe_sent,
+                    needs_owner=self.needs_owner)
 
 
 MOSCOW_OFFSET_SECONDS = 3 * 60 * 60
