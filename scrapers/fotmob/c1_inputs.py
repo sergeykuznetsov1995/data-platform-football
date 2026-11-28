@@ -516,16 +516,20 @@ def _append_only_ancestry(manager, old, new):
             return None
         visited.add(snapshot)
         parent, operation, added, deleted, added_rows, deleted_rows = ancestry[snapshot]
-        if added is None or added < 1:
-            return None
-        if operation == "append" and not deleted:
+        if (
+            operation == "append"
+            and added is not None and added >= 1
+            and not deleted and not deleted_rows
+        ):
             appends[snapshot] = (added, added_rows)
             # Files appended before a rewrite no longer exist in the new snapshot.
             interleaved |= bool(rewrites)
         elif (
             operation == "replace"
             and deleted is not None and deleted > 0
-            and added_rows is not None and added_rows >= 0 and added_rows == deleted_rows
+            and added_rows is not None and added_rows >= 0
+            and added_rows == deleted_rows
+            and (added is None or added >= 1 or added_rows == 0)
         ):
             rewrites.add(snapshot)
         else:
@@ -539,7 +543,8 @@ def _projected_additions(manager, old, new):
 
     Without deletions a row is new exactly when its key has a higher
     multiplicity in new than in old. Four comparisons replace 512 bucket
-    queries; a delta beyond MAX_PROJECTION_ROWS keeps that exact comparison.
+    queries. Each result is capped at the overflow sentinel; a delta beyond
+    MAX_PROJECTION_ROWS keeps that exact comparison before anything is yielded.
     """
     fields = "competition_id, source_season_key, target_type, entity_id"
     changes = []
@@ -550,7 +555,7 @@ def _projected_additions(manager, old, new):
         changes.extend(manager.execute_query(
             f"SELECT {fields} FROM (SELECT {fields} FROM {added} "
             f"EXCEPT ALL SELECT {fields} FROM {removed}) "
-            f"LIMIT {MAX_PROJECTION_ROWS + 1 - len(changes)}"
+            f"LIMIT {MAX_PROJECTION_ROWS + 1}"
         ))
         if len(changes) > MAX_PROJECTION_ROWS:
             return None
@@ -803,7 +808,10 @@ def wait_for_wave():
             remaining = min(remaining, C1_WAVE_WAIT_SECONDS - age)
         if remaining <= 0:
             return
+        # The last slice of the window: no further probe can change the outcome.
         _sleep(min(C1_WAVE_POLL_SECONDS, remaining))
+        if remaining <= C1_WAVE_POLL_SECONDS:
+            return
 
 
 class C1LockHoldOverrun(RuntimeError):

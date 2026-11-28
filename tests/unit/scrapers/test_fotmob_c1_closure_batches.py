@@ -1064,13 +1064,16 @@ def test_wait_for_wave_stops_on_idle_or_deadline(monkeypatch, clock, states, bud
 
 @pytest.mark.parametrize("age,sleeps,probes", [
     (1800.0, [], 1),      # a long backfill wave: no head start at all
-    (570.0, [30.0], 2),   # a young wave: only the rest of its head start
+    (570.0, [30.0], 1),   # a young wave: only the rest of its head start, no re-probe
 ])
 def test_wait_for_wave_head_start_is_measured_from_the_wave_start(monkeypatch, clock, age, sleeps, probes):
     from scrapers.fotmob import maintenance
 
+    probes_seen = []
+
     def probe_wave(**options):
         assert options == {"with_start": True}
+        probes_seen.append(None)
         # Keep the wave's real start fixed while the fake monotonic clock advances.
         elapsed = age + clock.now
         return True, None, datetime.now(timezone.utc) - timedelta(seconds=elapsed)
@@ -1081,7 +1084,7 @@ def test_wait_for_wave_head_start_is_measured_from_the_wave_start(monkeypatch, c
     assert c1.wait_for_wave() is None
     # The real wall clock advances a little while the fake monotonic one sleeps.
     assert clock.sleeps == pytest.approx(sleeps, abs=0.05)
-    assert len(clock.sleeps) + 1 == probes
+    assert len(probes_seen) == probes
 
 
 def test_wait_for_wave_tolerates_probe_failures_then_recovers(monkeypatch, clock):

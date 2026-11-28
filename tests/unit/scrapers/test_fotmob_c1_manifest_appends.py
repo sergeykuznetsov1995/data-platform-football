@@ -89,6 +89,18 @@ def test_only_proven_compactions_have_an_empty_logical_difference():
     assert len(manager.calls) == 2
 
 
+@pytest.mark.parametrize("empty", [False, True])
+def test_rewrite_without_a_file_count_in_its_summary_is_still_a_proven_compaction(empty):
+    manager = compaction_followed_by_appends()
+    # Only appends need their file inventory; a rewrite proves itself by rows.
+    manager.snapshots[2] = snapshot(81, 33, "replace", None, 69, 0 if empty else 39918,
+                                    0 if empty else 39918)
+    manager.schema_rows = [(sid, 1) for sid in (902, 33, 81, 7)]
+
+    assert Counter(c1.manifest_changes(manager, 902, 7)) == Counter({(None, None, "match", "b"): 2})
+    assert len(manager.calls) == 4
+
+
 @pytest.fixture
 def rotated_log(monkeypatch):
     manager = compaction_followed_by_appends()
@@ -352,7 +364,7 @@ def test_interleaved_compactions_read_exact_additions_in_four_comparisons(monkey
     assert len(manager.calls) == 6
 
 
-def test_projection_limit_shrinks_by_rows_already_read():
+def test_projection_caps_every_type_at_the_overflow_sentinel():
     manager, expected = interleaved()
     original = manager.execute_query
     seen = []
@@ -365,11 +377,10 @@ def test_projection_limit_shrinks_by_rows_already_read():
 
     manager.execute_query = execute_query
     assert Counter(c1.manifest_changes(manager, 902, 7)) == expected
-    fetched = 0
-    for count, limit in seen:
-        assert limit == c1.MAX_PROJECTION_ROWS + 1 - fetched
-        fetched += count
-    assert fetched == sum(expected.values())
+    # The cap is a truncation sentinel per type, never a share of the delta:
+    # a smaller LIMIT could silently drop rows of a later type.
+    assert [count for count, _ in seen] == [2, 2, 1, 0]
+    assert {limit for _, limit in seen} == {c1.MAX_PROJECTION_ROWS + 1}
 
 
 def test_projection_overflow_keeps_the_exact_comparison(monkeypatch):
@@ -381,7 +392,8 @@ def test_projection_overflow_keeps_the_exact_comparison(monkeypatch):
     assert list(c1.manifest_changes(manager, 902, 7)) == [sentinel]
 
 
-@pytest.mark.parametrize("case", ["schema_change", "append_with_deletes", "unbalanced_rewrite",
+@pytest.mark.parametrize("case", ["schema_change", "append_with_deletes", "append_with_deleted_rows",
+                                  "rewrite_without_rows_for_its_files", "unbalanced_rewrite",
                                   "delete_between", "overwrite_between", "cycle"])
 def test_unproven_interleaved_history_uses_the_exact_comparison(monkeypatch, case):
     manager, _ = interleaved()
@@ -389,6 +401,10 @@ def test_unproven_interleaved_history_uses_the_exact_comparison(monkeypatch, cas
         manager.schema_rows[1] = (33, 2)
     elif case == "append_with_deletes":
         manager.snapshots[3] = snapshot(33, 20, "append", 1, 2)
+    elif case == "append_with_deleted_rows":
+        manager.snapshots[3] = snapshot(33, 20, "append", 1, None, 5, 1)
+    elif case == "rewrite_without_rows_for_its_files":
+        manager.snapshots[2] = snapshot(81, 33, "replace", 0, 69, 39918, 39918)
     elif case == "unbalanced_rewrite":
         manager.snapshots[2] = snapshot(81, 33, "replace", 4, 69, 39918, 39917)
     elif case == "delete_between":
