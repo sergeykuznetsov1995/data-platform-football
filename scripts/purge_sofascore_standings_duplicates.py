@@ -57,6 +57,9 @@ SNAPSHOTS_TABLE = 'iceberg.bronze."sofascore_league_table$snapshots"'
 REFS_TABLE = 'iceberg.bronze."sofascore_league_table$refs"'
 # Real ids look like 20261124_173750_86204_dyben or 20261121_120820_33877_3qvg9.
 QID = re.compile(r"[0-9]{8}_[0-9]{6}_[0-9]{5,}_[a-z0-9]{4,8}")
+# Iceberg operations that remove rows: Trino writes "delete"; other engines
+# may write a single "overwrite" for the same copy-on-write result.
+REMOVAL_OPERATIONS = frozenset({"delete", "overwrite"})
 
 # The preflight compares every pinned column. The DELETE arm carries all of
 # them but raw_fetched_at, which the preflight has already pinned at the
@@ -472,7 +475,7 @@ def load_owned_snapshots(cursor, query_id: str) -> dict[int, SnapshotNode]:
         f"""
 SELECT snapshot_id, parent_id, operation
 FROM {SNAPSHOTS_TABLE}
-WHERE summary['trino_query_id'] = {_sql_literal(query_id)}
+WHERE element_at(summary, 'trino_query_id') = {_sql_literal(query_id)}
 """.strip(),
     )
     owned: dict[int, SnapshotNode] = {}
@@ -590,17 +593,18 @@ def validate_delete_lineage(
     current: SnapshotMetadata,
     owned: Mapping[int, SnapshotNode],
 ) -> int:
-    """Prove that the current snapshot chain down to ``pre`` is only this DELETE.
+    """Prove that the snapshot chain down to ``pre`` is only this DELETE.
 
-    Trino may commit a copy-on-write DELETE as one snapshot or as a rewritten
-    files snapshot followed by the delete one. Either way every snapshot must
-    carry the query id of this cursor and the current one must be the delete.
-    Returns the number of owned snapshots in the chain.
+    Trino commits a row-level DELETE as the delete snapshot itself, or as the
+    rewritten files of the same query appended before or after it. Every
+    snapshot between ``pre`` and the current one must carry the query id of
+    this cursor, exactly one of them must be the removal, and no other
+    operation may appear. Returns the number of owned snapshots in the chain.
     """
 
     ownership_error: str | None = None
+    operations: list[str] = []
     node_id = current.snapshot_id
-    chain = 0
     while node_id != pre_snapshot_id and ownership_error is None:
         node = owned.get(node_id)
         if node is None:
@@ -608,25 +612,35 @@ def validate_delete_lineage(
                 f"snapshot {node_id} between pre-delete {pre_snapshot_id} and current "
                 f"{current.snapshot_id} was not committed by this DELETE"
             )
-        elif node.parent_id is None or chain >= 8:
+        elif node.parent_id is None or len(operations) >= 8:
             ownership_error = (
                 f"owned snapshot chain does not reach pre-delete {pre_snapshot_id}: "
                 f"stopped at {node_id}"
             )
         else:
-            chain += 1
+            operations.append(node.operation)
             node_id = node.parent_id
-    if ownership_error is None and current.operation != "delete":
+    if ownership_error is None and not operations:
         ownership_error = (
-            "current snapshot operation is not delete "
-            f"(operation={current.operation!r})"
+            "current snapshot is still the pre-delete one: no snapshot was committed "
+            f"({pre_snapshot_id})"
         )
+    elif ownership_error is None and sum(op in REMOVAL_OPERATIONS for op in operations) != 1:
+        ownership_error = (
+            "owned snapshot chain must contain exactly one removal, got "
+            f"{operations}"
+        )
+    elif ownership_error is None and any(
+        op not in REMOVAL_OPERATIONS and op != "append" for op in operations
+    ):
+        ownership_error = f"owned snapshot chain has an unexpected operation: {operations}"
+
     if ownership_error is not None:
         raise PostDeleteVerificationError(
             "DELETE outcome is unknown and ownership is unproven; do not run "
             "a rollback automatically: " + ownership_error
         )
-    return chain
+    return len(operations)
 
 
 def validate_delete_ownership(
@@ -856,8 +870,7 @@ def purge(cursor, *, apply: bool = False) -> PurgeResult:
                 "Iceberg main advanced during final verification; a concurrent "
                 "snapshot exists, so do not run an unconditional rollback "
                 f"(purge={purge_snapshot.snapshot_id}, "
-                f"current={final_snapshot.snapshot_id})",
-                conditional_rollback_instruction=rollback_instruction,
+                f"current={final_snapshot.snapshot_id})"
             )
         validate_delete_lineage(
             pre_snapshot_id=pre_snapshot.snapshot_id,

@@ -103,7 +103,9 @@ class FakeCursor:
         ]
 
     def owned(self, sql):
-        query_id = re.search(r"summary\['trino_query_id'\] = '([^']*)'", sql).group(1)
+        query_id = re.search(
+            r"element_at\(summary, 'trino_query_id'\) = '([^']*)'", sql
+        ).group(1)
         return [
             (snapshot_id, parent_id, operation)
             for snapshot_id, (parent_id, operation, owner) in sorted(
@@ -144,7 +146,7 @@ class FakeCursor:
             self.main.extend(self.after_delete)
         elif "$refs" in compact:
             self.pending = lambda: self.snapshot(self.main[-1])
-        elif "summary['trino_query_id'] =" in compact:
+        elif "element_at(summary, 'trino_query_id') =" in compact:
             self.pending = lambda: self.owned(compact)
         elif "HAVING COUNT(*) > 1" in compact:
             self.pending = lambda: [(*key, 2) for key in sorted(self.duplicates())]
@@ -335,12 +337,39 @@ def test_apply_uses_one_narrow_delete_and_verifies_ownership(mod, cursor):
     assert str(PURGE_SNAPSHOT_ID) in instruction
 
 
-def test_two_snapshot_copy_on_write_outcome_is_owned(mod, cursor):
-    # Trino may commit rewritten files first and the delete second.
+def test_two_snapshot_copy_on_write_outcome_is_owned_in_either_order(mod, cursor):
+    # Trino may commit rewritten files before or after the delete of the same query.
     cursor.nodes[OWNED_APPEND_SNAPSHOT_ID] = (PRE_SNAPSHOT_ID, "append", DELETE_QUERY_ID)
     cursor.nodes[PURGE_SNAPSHOT_ID] = (OWNED_APPEND_SNAPSHOT_ID, "delete", DELETE_QUERY_ID)
-    result = mod.purge(cursor, apply=True)
-    assert result.applied and result.purge_snapshot_id == PURGE_SNAPSHOT_ID
+    assert mod.purge(cursor, apply=True).applied
+
+    cursor = FakeCursor(mod)
+    cursor.partitions_before = _partitions(mod)
+    cursor.nodes[OWNED_APPEND_SNAPSHOT_ID] = (PRE_SNAPSHOT_ID, "delete", DELETE_QUERY_ID)
+    cursor.nodes[PURGE_SNAPSHOT_ID] = (OWNED_APPEND_SNAPSHOT_ID, "append", DELETE_QUERY_ID)
+    assert mod.purge(cursor, apply=True).applied
+
+
+def test_single_overwrite_snapshot_of_the_same_query_is_owned(mod, cursor):
+    cursor.nodes[PURGE_SNAPSHOT_ID] = (PRE_SNAPSHOT_ID, "overwrite", DELETE_QUERY_ID)
+    assert mod.purge(cursor, apply=True).applied
+
+
+def test_owned_chain_without_a_removal_is_unknown(mod, cursor):
+    cursor.nodes[PURGE_SNAPSHOT_ID] = (PRE_SNAPSHOT_ID, "append", DELETE_QUERY_ID)
+    with pytest.raises(mod.PostDeleteVerificationError, match="exactly one removal") as excinfo:
+        mod.purge(cursor, apply=True)
+    assert excinfo.value.conditional_rollback_instruction is None
+
+
+def test_owned_snapshot_query_tolerates_snapshots_without_the_query_id(mod, cursor):
+    # A map subscript raises on snapshots that lack the key; element_at does not.
+    mod.purge(cursor, apply=True)
+    owned_queries = [
+        sql for sql in cursor.executed if "element_at(summary, 'trino_query_id') =" in sql
+    ]
+    assert len(owned_queries) == 1 and f"= '{DELETE_QUERY_ID}'" in owned_queries[0]
+    assert not any("summary['trino_query_id']" in sql for sql in cursor.executed)
 
 
 @pytest.mark.parametrize(
@@ -348,7 +377,7 @@ def test_two_snapshot_copy_on_write_outcome_is_owned(mod, cursor):
     [
         ("rowcount", 6),
         ("rowcount", 8),
-        ("after_delete", [PRE_SNAPSHOT_ID]),
+        ("after_delete", [PRE_SNAPSHOT_ID]),  # nothing committed
         ("after_delete", [CONCURRENT_SNAPSHOT_ID]),
         ("query_id", OTHER_QUERY_ID),
         ("query_id", None),
@@ -451,9 +480,10 @@ def test_refuses_if_main_advances_after_purge_during_final_verification(mod, cur
             cursor.main.append(CONCURRENT_SNAPSHOT_ID)
         execute(sql)
     cursor.execute = execute_with_concurrent_append
+    # Main already moved past the purge snapshot, so the guarded rollback is void.
     with pytest.raises(mod.PostDeleteVerificationError, match="advanced during final") as excinfo:
         mod.purge(cursor, apply=True)
-    assert excinfo.value.conditional_rollback_instruction
+    assert excinfo.value.conditional_rollback_instruction is None
 
 
 def test_already_clean_apply_is_idempotent(mod, cursor):
