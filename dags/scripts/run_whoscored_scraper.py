@@ -2083,15 +2083,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "attempted": None,
                 }
             if not args.profiles_only:
-                _run_service_operations(
-                    service_cls=service_cls,
-                    selected=selected,
-                    catalog=catalog_snapshot,
-                    repository=repository,
-                    report=report,
-                    args=args,
-                    operations=_operations("daily", args.daily_part),
-                )
+                # #2473: the daily lane alone asks the transport to leave a pool
+                # member that did not solve a Cloudflare challenge. History and
+                # replay keep their member.
+                os.environ["WHOSCORED_POOL_CHALLENGE_ROTATION"] = "1"
+                try:
+                    _run_service_operations(
+                        service_cls=service_cls,
+                        selected=selected,
+                        catalog=catalog_snapshot,
+                        repository=repository,
+                        report=report,
+                        args=args,
+                        operations=_operations("daily", args.daily_part),
+                    )
+                finally:
+                    os.environ.pop("WHOSCORED_POOL_CHALLENGE_ROTATION", None)
             if not args.skip_profiles and not report["error_details"]:
                 _run_global_profiles(
                     service_cls=service_cls,

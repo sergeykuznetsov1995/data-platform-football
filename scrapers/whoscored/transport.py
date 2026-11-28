@@ -119,6 +119,14 @@ class FlareSolverrClient(_SharedFlareSolverrClient):
 
 
 DEFAULT_DIRECT_BROWSER_ATTEMPTS = 4
+# #2473: an unsolved Cloudflare challenge belongs to the pool member, not to
+# the page, so the retry moves to another member. A member that failed to
+# solve is skipped by every transport of this process for a short while.
+DEFAULT_CF_ROTATIONS_PER_FETCH = 3
+CF_UNSOLVED_MEMBER_TTL_SECONDS = 600.0
+_UNSOLVED_CHALLENGE_MEMBERS: dict[str, float] = {}
+# The daily runner opts in; history, replay and tooling keep their member.
+POOL_CHALLENGE_ROTATION_ENV = "WHOSCORED_POOL_CHALLENGE_ROTATION"
 DEFAULT_DIRECT_HTTP_RETRY_BACKOFF_SECONDS = 2.0
 DEFAULT_BROWSER_RETRY_BACKOFF_SECONDS = 2.0
 DEFAULT_BROWSER_RETRY_JITTER_SECONDS = 2.0
@@ -587,6 +595,8 @@ class TransportStats:
     # #2473: real application pages that carry Cloudflare's own markup and were
     # accepted because their validator proved the page payload.
     cf_marker_pages_accepted: int = 0
+    # #2473: pool members left after an unsolved Cloudflare challenge.
+    pool_rotations_cloudflare: int = 0
     stage_xhr_token: Counter[str] = field(default_factory=Counter)
 
     def as_dict(self) -> dict[str, Any]:
@@ -601,8 +611,14 @@ class TransportStats:
             "browser_batches": self.browser_batches,
             "browser_batch_items": self.browser_batch_items,
             "cf_marker_pages_accepted": self.cf_marker_pages_accepted,
+            "pool_rotations_cloudflare": self.pool_rotations_cloudflare,
             "stage_xhr_token": dict(self.stage_xhr_token),
         }
+
+
+def reset_unsolved_challenge_members() -> None:
+    """Forget every pool member left after an unsolved challenge (tests, tooling)."""
+    _UNSOLVED_CHALLENGE_MEMBERS.clear()
 
 
 _CF_STRONG_BODY_MARKERS = (
@@ -1085,6 +1101,7 @@ class WhoScoredTransport:
             DEFAULT_DIRECT_HTTP_RETRY_BACKOFF_SECONDS
         ),
         direct_browser_attempts: int = DEFAULT_DIRECT_BROWSER_ATTEMPTS,
+        cf_rotations_per_fetch: int = DEFAULT_CF_ROTATIONS_PER_FETCH,
         browser_retry_backoff_seconds: float = (DEFAULT_BROWSER_RETRY_BACKOFF_SECONDS),
         browser_retry_jitter_seconds: float = DEFAULT_BROWSER_RETRY_JITTER_SECONDS,
         impersonate: str = "chrome142",
@@ -1104,6 +1121,12 @@ class WhoScoredTransport:
             raise ValueError("direct_http_attempts must be >= 1")
         if direct_browser_attempts < 1:
             raise ValueError("direct_browser_attempts must be >= 1")
+        if (
+            isinstance(cf_rotations_per_fetch, bool)
+            or not isinstance(cf_rotations_per_fetch, int)
+            or cf_rotations_per_fetch < 0
+        ):
+            raise ValueError("cf_rotations_per_fetch must be an integer >= 0")
         if (
             isinstance(direct_http_retry_backoff_seconds, bool)
             or not isinstance(direct_http_retry_backoff_seconds, (int, float))
@@ -1179,6 +1202,13 @@ class WhoScoredTransport:
             direct_http_retry_backoff_seconds
         )
         self.direct_browser_attempts = direct_browser_attempts
+        self.cf_rotations_per_fetch = cf_rotations_per_fetch
+        self._pool_challenge_rotation = (
+            os.environ.get(POOL_CHALLENGE_ROTATION_ENV, "").strip() == "1"
+        )
+        self._cf_rotations = 0
+        self._pool_rotation_pending = False
+        self._pool_member_pinned = False
         self.browser_retry_backoff_seconds = float(browser_retry_backoff_seconds)
         self.browser_retry_jitter_seconds = float(browser_retry_jitter_seconds)
         self.impersonate = impersonate
@@ -1431,6 +1461,9 @@ class WhoScoredTransport:
                                 if line % int(count) == int(index)]
         member = os.environ.get("WHOSCORED_PROXY_MEMBER", "").strip()
         if member.isdigit() and manager.total_count:
+            # A history worker keeps this exact start line (#1481): the
+            # challenge rotation below never moves a pinned member.
+            self._pool_member_pinned = True
             proxy_url = manager._proxies[int(member) % manager.total_count].http_url
         else:
             proxy_url = manager.get_http_proxy_url()
@@ -1482,7 +1515,12 @@ class WhoScoredTransport:
                 logger.debug("Could not close TLS session (%s)", type(exc).__name__)
         logger.warning("WhoScored schedule TLS session renewed on the same pool member")
 
-    def _rotate_pool_proxy(self, excluded: Optional[set[str]] = None) -> bool:
+    def _rotate_pool_proxy(
+        self,
+        excluded: Optional[set[str]] = None,
+        *,
+        reason: str = "a proxy failure",
+    ) -> bool:
         """Swap the sticky pool member for a different one (#1476).
 
         Exclusions belong to one recovery operation and never leave memory.
@@ -1514,8 +1552,56 @@ class WhoScoredTransport:
                     "Could not close replaced pool session (%s)",
                     type(exc).__name__,
                 )
-        logger.warning("WhoScored pool member replaced after a proxy failure")
+        logger.warning("WhoScored pool member replaced after %s", reason)
         return True
+
+    def _cf_rotation_allowed(self) -> bool:
+        """Challenge rotation needs the daily opt-in, a free pool member and no pinned line."""
+        return (
+            self._pool_challenge_rotation
+            and self._pool_manager is not None
+            and self._pool_proxy_url is not None
+            and not self._pool_member_pinned
+            and not self._source_probe_active()
+        )
+
+    def _remember_unsolved_member(self) -> None:
+        """Note that the current pool member did not solve a Cloudflare challenge."""
+        if self._cf_rotation_allowed():
+            _UNSOLVED_CHALLENGE_MEMBERS[self._pool_proxy_url] = time.monotonic()
+
+    def _rotate_after_unsolved_challenge(self, *, reason: str) -> bool:
+        """#2473: leave a pool member that did not solve a Cloudflare challenge.
+
+        ``False`` means the budget is spent or no other member is eligible; the
+        caller then keeps its ordinary retry.
+        """
+        if (
+            not self._cf_rotation_allowed()
+            or self._cf_rotations >= self.cf_rotations_per_fetch
+        ):
+            return False
+        now = time.monotonic()
+        for member, seen in list(_UNSOLVED_CHALLENGE_MEMBERS.items()):
+            if now - seen >= CF_UNSOLVED_MEMBER_TTL_SECONDS:
+                del _UNSOLVED_CHALLENGE_MEMBERS[member]
+        if not self._rotate_pool_proxy(
+            set(_UNSOLVED_CHALLENGE_MEMBERS), reason=reason
+        ):
+            return False
+        self._cf_rotations += 1
+        self.stats.pool_rotations_cloudflare += 1
+        self._pool_rotation_pending = True
+        return True
+
+    def _leave_unsolved_member(self) -> None:
+        """Start a page on another member when the current one is remembered."""
+        seen = _UNSOLVED_CHALLENGE_MEMBERS.get(self._pool_proxy_url)
+        if seen is None or time.monotonic() - seen >= CF_UNSOLVED_MEMBER_TTL_SECONDS:
+            return
+        self._rotate_after_unsolved_challenge(
+            reason="an unsolved challenge earlier in this run"
+        )
 
     def probe_egress(self) -> None:
         """Check ipify on at most ten distinct pool members before work.
@@ -1880,7 +1966,21 @@ class WhoScoredTransport:
         if cached is not None:
             return cached
         cache_entry_was_invalid = self.stats.cache_invalid > cache_invalid_before
+        self._cf_rotations = 0
+        self._pool_rotation_pending = False
+        # #2473: only an ordinary page moves to another pool member after an
+        # unsolved challenge. Structured feeds and stage bootstraps keep the
+        # shared source circuit and their own recovery.
+        rotation_candidate = (
+            browser_bootstrap_url is None
+            and not _is_whoscored_structured_feed_url(url)
+            and not _is_whoscored_stage_bootstrap_url(url)
+        )
         self._begin_source_operation()
+        # A member that failed to solve earlier in this run is left before the
+        # first request of this page, not after another lost minute.
+        if rotation_candidate:
+            self._leave_unsolved_member()
         self._admit_structured_source(url)
         if before_network is not None:
             # The gate belongs after cache validation, not before ``has``.
@@ -1894,6 +1994,43 @@ class WhoScoredTransport:
             if browser_bootstrap_url is not None
             else None
         )
+
+        def _store(direct: TransportResponse) -> TransportResponse:
+            if direct_gate_key is not None:
+                self._direct_gate_circuits.discard(direct_gate_key)
+            stored = self._store_and_return(key, direct)
+            self._source_succeeded(url)
+            return stored
+
+        def _direct_phase() -> TransportResponse:
+            """Direct route on the current member; ``CloudflareChallenge`` when gated."""
+            try:
+                direct = _direct_with_retries()
+            except CloudflareChallenge:
+                self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
+                if direct_gate_key is not None:
+                    self._direct_gate_circuits.add(direct_gate_key)
+                raise
+            except WhoScoredTransportError:
+                if direct_gate_key is not None:
+                    self._direct_gate_circuits.discard(direct_gate_key)
+                raise
+            return direct
+
+        def _fresh_member_direct_phase() -> Optional[TransportResponse]:
+            """Direct route for a member reached by a rotation.
+
+            The schedule document needs no solved cookie: on a member that is
+            not blocked its direct route answers at once. Every other page was
+            already challenged on the direct route, and a cookie-less member
+            only repeats that 403, so it goes straight to its browser attempt.
+            """
+            if not _is_schedule_month_url(url):
+                return None
+            try:
+                return _direct_phase()
+            except CloudflareChallenge:
+                return None
 
         def _direct_once() -> TransportResponse:
             response = self._http_fetch(
@@ -1953,27 +2090,31 @@ class WhoScoredTransport:
             and not cache_entry_was_invalid
             and direct_gate_key in self._direct_gate_circuits
         )
-        if not skip_direct:
+        # A member left before this page started is handled like any rotation:
+        # its unvalidated direct route is used for the schedule document only.
+        fresh_member = self._pool_rotation_pending
+        self._pool_rotation_pending = False
+        if fresh_member:
+            fresh = _fresh_member_direct_phase()
+            if fresh is not None:
+                return _store(fresh)
+
+        if not skip_direct and not fresh_member:
             try:
-                direct = _direct_with_retries()
+                direct = _direct_phase()
             except CloudflareChallenge:
-                self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
-                if direct_gate_key is not None:
-                    self._direct_gate_circuits.add(direct_gate_key)
-            except WhoScoredTransportError:
-                if direct_gate_key is not None:
-                    self._direct_gate_circuits.discard(direct_gate_key)
-                raise
+                pass
             else:
-                if direct_gate_key is not None:
-                    self._direct_gate_circuits.discard(direct_gate_key)
-                stored = self._store_and_return(key, direct)
-                self._source_succeeded(url)
-                return stored
+                return _store(direct)
 
         last_cf: Optional[CloudflareChallenge] = None
         last_transient: Optional[WhoScoredTransportError] = None
         for attempt in range(self.direct_browser_attempts):
+            if self._pool_rotation_pending:
+                self._pool_rotation_pending = False
+                fresh = _fresh_member_direct_phase()
+                if fresh is not None:
+                    return _store(fresh)
             try:
                 browser = self._browser_fetch(
                     url,
@@ -1990,6 +2131,20 @@ class WhoScoredTransport:
                 last_cf = exc
                 self.stats.failures[FailureKind.CLOUDFLARE.value] += 1
                 self._source_tripped(exc)
+                if rotation_candidate:
+                    self._remember_unsolved_member()
+                if (
+                    rotation_candidate
+                    and attempt + 1 < self.direct_browser_attempts
+                    and self._rotate_after_unsolved_challenge(
+                        reason="an unsolved challenge in the browser"
+                    )
+                ):
+                    # #2473: another attempt on this member succeeds in 3-4 % of
+                    # cases; the next member starts from its own direct route.
+                    if before_network is not None:
+                        before_network()
+                    continue
                 if not exc.source_wide and self._source_inconclusive(url):
                     raise
                 if (
@@ -2022,6 +2177,10 @@ class WhoScoredTransport:
                     if exc.kind is FailureKind.CONTENT:
                         self._store_response(key, browser)
                     raise
+                if rotation_candidate and exc.retryable and exc.kind is FailureKind.BROWSER:
+                    # An unsolved-challenge timeout and a broken proxy tunnel both
+                    # arrive here; they describe the member, not the page.
+                    self._remember_unsolved_member()
                 if (
                     exc.retryable
                     and exc.kind
@@ -2036,6 +2195,16 @@ class WhoScoredTransport:
                     self._drop_browser_session(
                         self._direct_fs, TransportRoute.DIRECT_FLARESOLVERR
                     )
+                    if (
+                        rotation_candidate
+                        and exc.kind is FailureKind.BROWSER
+                        and self._rotate_after_unsolved_challenge(
+                            reason="a browser failure in the solver"
+                        )
+                    ):
+                        if before_network is not None:
+                            before_network()
+                        continue
                     self._wait_before_browser_retry(attempt)
                     if before_network is not None:
                         before_network()

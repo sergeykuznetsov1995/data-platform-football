@@ -974,6 +974,54 @@ def test_daily_keeps_match_data_when_preview_fails(
     assert rc == expected_rc
 
 
+def _challenge_rotation_when(operation_result, seen):
+    def operation():
+        seen.append(os.environ.get("WHOSCORED_POOL_CHALLENGE_ROTATION"))
+        return operation_result
+
+    return operation
+
+
+@pytest.mark.unit
+def test_daily_runner_opts_the_transport_into_challenge_rotation(monkeypatch, tmp_path):
+    # #2473: only the daily lane asks the transport to leave a pool member that
+    # did not solve a Cloudflare challenge.
+    monkeypatch.delenv("WHOSCORED_POOL_CHALLENGE_ROTATION", raising=False)
+    seen = []
+    schedule = _result(
+        "schedule", counts={"schedule": 1}, tables=["iceberg.bronze.whoscored_schedule"]
+    )
+
+    rc, report, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["daily", "--scope", "ENG-Premier League=2526", "--skip-profiles"],
+        behaviors={"schedule": _challenge_rotation_when(schedule, seen)},
+    )
+
+    assert rc == 0
+    assert seen == ["1"]
+    assert "WHOSCORED_POOL_CHALLENGE_ROTATION" not in os.environ
+
+
+@pytest.mark.unit
+def test_replay_runner_keeps_the_transport_on_its_pool_member(monkeypatch, tmp_path):
+    monkeypatch.delenv("WHOSCORED_POOL_CHALLENGE_ROTATION", raising=False)
+    seen = []
+
+    rc, report, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["replay", "--scope", "ENG-Premier League=2526", "--game-id", "123"],
+        behaviors={
+            "matches": _challenge_rotation_when(DEFAULT_RESULTS["matches"], seen)
+        },
+    )
+
+    assert rc == 0
+    assert seen == [None]
+
+
 @pytest.mark.unit
 def test_retryable_service_result_has_distinct_exit_code(monkeypatch, tmp_path):
     retryable = _result("matches", retryable=["123"])

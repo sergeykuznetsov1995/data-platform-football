@@ -69,6 +69,15 @@ PLAYER_STATS_BOOTSTRAP = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_remembered_members_around_a_test():
+    # #2473: members left after an unsolved challenge are remembered per
+    # process; one test must never change the pool choice of another.
+    transport_module.reset_unsolved_challenge_members()
+    yield
+    transport_module.reset_unsolved_challenge_members()
+
+
 def _batch_solution(url, content=b'{"teamTableStats":[]}'):
     return {
         "ok": True,
@@ -3603,6 +3612,309 @@ def test_non_proxy_curl_failure_keeps_retryable_timeout_without_swap(
     assert caught.value.kind is FailureKind.TIMEOUT
     assert caught.value.retryable is True
     assert len(seen) == 1
+
+
+UNSOLVED_CHALLENGE = FlareSolverrError(
+    "FlareSolverr HTTP 500: Error: Error solving the challenge. "
+    "Timeout after 60.0 seconds."
+)
+BROKEN_TUNNEL = FlareSolverrError(
+    "FlareSolverr HTTP 500: Error: Error solving the challenge. "
+    "Message: unknown error: net::ERR_TUNNEL_CONNECTION_FAILED"
+)
+CF_DIRECT = FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"})
+SCHEDULE_MONTH = "https://www.whoscored.com/tournaments/2/data/?d=202611"
+
+
+def _cf_pool_transport(monkeypatch, tmp_path, sessions, fs, *, pool_size=3, attempts=4, **kwargs):
+    """A pooled transport whose direct sessions come from ``sessions`` in member order."""
+    pool = tmp_path / "pool.txt"
+    pool.write_text(
+        "".join(f"pool.example.io:{10000 + i}:poolu:poolpw\n" for i in range(pool_size))
+    )
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    monkeypatch.setenv(transport_module.POOL_CHALLENGE_ROTATION_ENV, "1")
+    queue = list(sessions)
+    seen = []
+
+    def factory(proxy_url):
+        seen.append(proxy_url)
+        return queue.pop(0)
+
+    transport = WhoScoredTransport(
+        direct_fs_client=fs,
+        http_session_factory=factory,
+        direct_http_attempts=1,
+        direct_http_retry_backoff_seconds=0,
+        direct_browser_attempts=attempts,
+        browser_retry_backoff_seconds=0,
+        browser_retry_jitter_seconds=0,
+        context=TransportContext(transport_policy="direct_only"),
+        **kwargs,
+    )
+    return transport, seen
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("browser_failure", [UNSOLVED_CHALLENGE, BROKEN_TUNNEL])
+def test_pool_unsolved_challenge_moves_to_the_next_member_and_its_direct_route(
+    monkeypatch, tmp_path, browser_failure
+):
+    # #2473: the retry after an unsolved challenge belongs to another member,
+    # and that member starts with its own direct route.
+    fs = FakeFSClient(browser_failure)
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT), FakeHTTPSession(FakeHTTPResponse())],
+        fs,
+    )
+    tokens = []
+
+    result = transport.fetch(
+        SCHEDULE_MONTH, before_network=lambda: tokens.append("token")
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert len(fs.get_calls) == 1
+    assert [proxy for _, proxy in fs.created] == [seen[0]]
+    assert tokens == ["token", "token"]
+    assert transport.stats.pool_rotations_cloudflare == 1
+    assert transport.stats.as_dict()["pool_rotations_cloudflare"] == 1
+
+
+@pytest.mark.unit
+def test_pool_unsolved_challenge_spends_at_most_four_members_per_page(
+    monkeypatch, tmp_path
+):
+    fs = FakeFSClient(*[UNSOLVED_CHALLENGE for _ in range(4)])
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT) for _ in range(4)],
+        fs,
+        pool_size=6,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert caught.value.kind is FailureKind.BROWSER
+    assert caught.value.retryable is True
+    assert len(seen) == 4 and len(set(seen)) == 4
+    assert len(fs.get_calls) == 4
+    assert [proxy for _, proxy in fs.created] == seen
+    assert transport.stats.pool_rotations_cloudflare == 3
+    assert sorted(transport_module._UNSOLVED_CHALLENGE_MEMBERS) == sorted(seen)
+
+
+@pytest.mark.unit
+def test_pool_next_page_skips_the_members_that_failed_to_solve(monkeypatch, tmp_path):
+    fs = FakeFSClient(UNSOLVED_CHALLENGE, UNSOLVED_CHALLENGE)
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT), FakeHTTPSession(CF_DIRECT), FakeHTTPSession(FakeHTTPResponse())],
+        fs,
+        pool_size=3,
+        attempts=2,
+    )
+
+    with pytest.raises(WhoScoredTransportError):
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+    result = transport.fetch(SCHEDULE_MONTH)
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(seen) == 3 and len(set(seen)) == 3
+    assert len(fs.get_calls) == 2  # the second page never reached the browser
+    assert transport.stats.pool_rotations_cloudflare == 2
+
+
+@pytest.mark.unit
+def test_pool_fresh_member_goes_straight_to_its_browser_attempt_for_a_match_page(
+    monkeypatch, tmp_path
+):
+    # A cookie-less member only repeats the direct 403, and its direct route is
+    # not egress-validated: only the browser is asked, once.
+    first = FakeHTTPSession(CF_DIRECT)
+    second = FakeHTTPSession(FakeHTTPResponse())
+    fs = FakeFSClient(UNSOLVED_CHALLENGE, {"html": OK_HTML.decode(), "status": 200})
+    transport, seen = _cf_pool_transport(monkeypatch, tmp_path, [first, second], fs)
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(seen) == 2 and seen[0] != seen[1]
+    assert len(first.calls) == 1 and second.calls == []
+    assert [proxy for _, proxy in fs.created] == seen
+    assert len(fs.get_calls) == 2
+
+
+@pytest.mark.unit
+def test_pool_banned_member_is_left_before_the_scope_gives_up(monkeypatch, tmp_path):
+    # #2473: "Probably your IP is banned" describes the member, not the source.
+    fs = FakeFSClient(
+        FlareSolverrCFChallengeFailed(
+            "FlareSolverr HTTP 500: Error: Error solving the challenge. "
+            "Cloudflare has blocked this request. Probably your IP is banned "
+            "for this site, check in your web browser."
+        )
+    )
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT), FakeHTTPSession(FakeHTTPResponse())],
+        fs,
+        source_circuit=FakeSourceCircuit(),
+        source_circuit_wait=False,
+    )
+
+    result = transport.fetch(SCHEDULE_MONTH)
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert len(seen) == 2
+    assert len(fs.get_calls) == 1
+
+
+@pytest.mark.unit
+def test_pool_challenge_rotation_waits_for_the_daily_runner_opt_in(
+    monkeypatch, tmp_path
+):
+    # #2473: without the daily opt-in (history, replay, tooling) a pooled
+    # transport keeps the same member and its ordinary retries.
+    fs = FakeFSClient(
+        UNSOLVED_CHALLENGE, UNSOLVED_CHALLENGE, {"html": OK_HTML.decode(), "status": 200}
+    )
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT)],
+        fs,
+        pool_size=3,
+        attempts=3,
+    )
+    monkeypatch.setenv(transport_module.POOL_CHALLENGE_ROTATION_ENV, "0")
+    transport._pool_challenge_rotation = False
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(seen) == 1
+    assert len(fs.get_calls) == 3
+    assert transport.stats.pool_rotations_cloudflare == 0
+    assert transport_module._UNSOLVED_CHALLENGE_MEMBERS == {}
+
+
+@pytest.mark.unit
+def test_pool_challenge_rotation_leaves_stage_bootstrap_and_feeds_alone(
+    monkeypatch, tmp_path
+):
+    # The stage lane keeps the shared source circuit: its pages never rotate.
+    fs = FakeFSClient(
+        UNSOLVED_CHALLENGE, UNSOLVED_CHALLENGE, {"html": OK_HTML.decode(), "status": 200}
+    )
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT)],
+        fs,
+        pool_size=3,
+        attempts=3,
+    )
+
+    result = transport.fetch(TEAM_STATS_BOOTSTRAP)
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(seen) == 1
+    assert len(fs.get_calls) == 3
+    assert transport.stats.pool_rotations_cloudflare == 0
+
+
+@pytest.mark.unit
+def test_pool_without_a_spare_member_keeps_its_same_member_retries(
+    monkeypatch, tmp_path
+):
+    fs = FakeFSClient(
+        UNSOLVED_CHALLENGE, UNSOLVED_CHALLENGE, {"html": OK_HTML.decode(), "status": 200}
+    )
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT)],
+        fs,
+        pool_size=1,
+        attempts=3,
+    )
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(seen) == 1
+    assert len(fs.get_calls) == 3
+    assert transport.stats.pool_rotations_cloudflare == 0
+
+
+@pytest.mark.unit
+def test_pinned_history_member_is_never_rotated_for_a_challenge(monkeypatch, tmp_path):
+    fs = FakeFSClient(
+        UNSOLVED_CHALLENGE, UNSOLVED_CHALLENGE, {"html": OK_HTML.decode(), "status": 200}
+    )
+    monkeypatch.setenv("WHOSCORED_PROXY_MEMBER", "1")
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT)],
+        fs,
+        pool_size=3,
+        attempts=3,
+    )
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert transport._pool_member_pinned is True
+    assert len(seen) == 1
+    assert len(fs.get_calls) == 3
+    assert transport.stats.pool_rotations_cloudflare == 0
+    assert transport_module._UNSOLVED_CHALLENGE_MEMBERS == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "browser_failures",
+    [
+        [
+            FlareSolverrTimeout("FlareSolverr unreachable (ReadTimeout): timed out"),
+            FlareSolverrTimeout("FlareSolverr unreachable (ReadTimeout): timed out"),
+        ],
+        [
+            {"html": "<html><title>whoscored.com | 502: Bad gateway</title></html>", "status": 200},
+            {"html": "<html><title>whoscored.com | 502: Bad gateway</title></html>", "status": 200},
+        ],
+    ],
+    ids=["solver-outage", "origin-502"],
+)
+def test_pool_member_is_kept_when_the_failure_is_not_about_the_member(
+    monkeypatch, tmp_path, browser_failures
+):
+    fs = FakeFSClient(*browser_failures, {"html": OK_HTML.decode(), "status": 200})
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT)],
+        fs,
+        pool_size=3,
+        attempts=3,
+    )
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(seen) == 1
+    assert len(fs.get_calls) == 3
+    assert transport.stats.pool_rotations_cloudflare == 0
+    assert transport_module._UNSOLVED_CHALLENGE_MEMBERS == {}
 
 
 @pytest.mark.unit
