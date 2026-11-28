@@ -1173,7 +1173,7 @@ def test_validated_rows_cannot_be_reinitialised():
     with pytest.raises((TypeError, AttributeError)):
         row._values = {'observation_status': 'unknown'}
     assert plan.plan_sha256() == digest
-    assert row['observation_status'] == 'observed_present' and row['parser_revision'] == 'attendance-v1'
+    assert row['observation_status'] == 'observed_present' and row['parser_revision'] == 'attendance-v2'
     db = CoreDB()
     receipt = native_writer.write_core_bundle(
         lambda: db, CoreWriter(db), [plan], run_id='run-14', universe_version='u',
