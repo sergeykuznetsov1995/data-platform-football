@@ -42,7 +42,25 @@ def test_four_waves_a_day_paused_on_creation(dag_module) -> None:
     assert kwargs["max_active_tasks"] == 3
     assert kwargs["catchup"] is False
     assert kwargs["is_paused_upon_creation"] is True
-    assert kwargs["dagrun_timeout"] == timedelta(minutes=55)
+    assert kwargs["dagrun_timeout"] == timedelta(minutes=120)
+
+
+@pytest.mark.unit
+def test_timeouts_wait_out_the_trino_limiter_fence(dag_module) -> None:
+    """#2472: a budget below the limiter fence fails the wave on a recoverable wait."""
+    from scrapers.whoscored.trino_budget import INTERVAL, WRITE_TIMEOUT
+
+    fence = timedelta(seconds=INTERVAL + WRITE_TIMEOUT)
+    assert fence == timedelta(minutes=46)
+    budgets = {
+        task_id: _task(task_id)._init_kwargs["execution_timeout"]
+        for task_id in ("prepare", "plan_wave", "run_tournament", "wave_summary")
+    }
+    assert set(budgets.values()) == {timedelta(minutes=60)}
+    # A crashed holder elsewhere, or one long statement, must not exhaust a task.
+    assert all(budget > fence for budget in budgets.values())
+    # The run absorbs the fence once and still gives the slowest task its budget.
+    assert dag_module.dag._dag_kwargs["dagrun_timeout"] > fence + max(budgets.values())
 
 
 @pytest.mark.unit
@@ -59,7 +77,7 @@ def test_topology_retries_and_three_concurrent_groups(dag_module) -> None:
     assert run._expand_kwargs["op_kwargs"].operator is plan
     assert run._init_kwargs["retry_delay"] == timedelta(minutes=3)
     assert run._init_kwargs["max_active_tis_per_dag"] == 4
-    assert run._init_kwargs["execution_timeout"] == timedelta(minutes=20)
+    assert run._init_kwargs["execution_timeout"] == timedelta(minutes=60)
     assert plan._init_kwargs["pool"] == run._init_kwargs["pool"] == "espn_live"
     assert summary._init_kwargs["trigger_rule"] == "all_done"
     assert summary._init_kwargs["retries"] == 0

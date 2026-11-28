@@ -146,7 +146,8 @@ ctime каталога, который пинует сторож WhoScored (`scr
 «Доставка»; корень релиза — `/opt/airflow`, он же `PYTHONPATH`, чтобы импортировался `scrapers.espn`). DAG создаётся на паузе
 (`is_paused_upon_creation=True`); первый живой прогон — после автодоставки #1507.
 
-Расписание `0 0,6,12,18 * * *` (UTC), `max_active_runs=1`, `catchup=False`, `dagrun_timeout` 55 мин.
+Расписание `0 0,6,12,18 * * *` (UTC), `max_active_runs=1`, `catchup=False`, `dagrun_timeout` 120 мин; `execution_timeout` каждой задачи 60 мин (#2472).
+Лимитер таблиц (`scrapers/espn/trino_budget.py`) держит отношение на время чужого оператора и ещё 46 мин после падения держателя (`INTERVAL + WRITE_TIMEOUT`), поэтому задача ждёт занятую таблицу, а не сжигает попытки внутри ожидания: 22.11.2026 — `plan_wave` в заморозке после смерти writer, 25.11.2026 — три группы 23 мин за одним MERGE перепарсинга.
 Логика — `scrapers/espn/wave.py` (чистые функции), DAG — обвязка.
 
 | Задача | Что делает | Повторы |
