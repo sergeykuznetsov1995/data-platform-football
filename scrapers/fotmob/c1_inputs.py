@@ -363,6 +363,7 @@ MANIFEST_BUCKETS = 64
 MANIFEST_TARGET_TYPES = ("match", "league_season", "competition_profile", "competition_seasons")
 MAX_APPEND_FILES = 256
 MAX_APPEND_ROWS = 50_000
+MAX_PROJECTION_ROWS = 100_000
 # Trino crc32(varbinary) returns an unsigned, nonnegative BIGINT. One VARCHAR
 # key avoids tuple/JSON encodings and delimiter ambiguity. NULL and empty keys
 # deliberately share a bucket; routing collisions never establish equality.
@@ -489,13 +490,12 @@ def _retained_manifest_schema_matches(manager, required, known_schema_ids):
     return any(path == location for (path,) in recent)
 
 
-def _appended_manifest_rows(manager, old, new):
-    """Return exact additions after any leading file compactions, or None to compare.
+def _append_only_ancestry(manager, old, new):
+    """Classify every commit from old to new, or return None to compare.
 
-    Iceberg's replace operation preserves logical rows. We accept only a prefix
-    of these rewrites with matching record counts and a common snapshot schema.
-    Appends after it must still have their complete file inventory and row counts.
-    All other histories use the exact comparison of the original pinned snapshots.
+    Iceberg's replace operation preserves logical rows. We accept only rewrites
+    with matching record counts; appends may lie before or after them. Every
+    other history uses the exact comparison of the original pinned snapshots.
     """
     history = manager.execute_query(
         f"SELECT snapshot_id, parent_id, operation, "
@@ -508,17 +508,20 @@ def _appended_manifest_rows(manager, old, new):
     ancestry = {row[0]: row[1:] for row in history}
     if old not in ancestry:
         return None
-    files_per_snapshot = {}
-    rewrites = set()
+    appends, rewrites, visited = {}, set(), set()
+    interleaved = False
     snapshot = new
     while snapshot != old:
-        if snapshot not in ancestry or snapshot in files_per_snapshot or snapshot in rewrites:
+        if snapshot not in ancestry or snapshot in visited:
             return None
+        visited.add(snapshot)
         parent, operation, added, deleted, added_rows, deleted_rows = ancestry[snapshot]
         if added is None or added < 1:
             return None
-        if operation == "append" and not rewrites:
-            files_per_snapshot[snapshot] = added
+        if operation == "append" and not deleted:
+            appends[snapshot] = (added, added_rows)
+            # Files appended before a rewrite no longer exist in the new snapshot.
+            interleaved |= bool(rewrites)
         elif (
             operation == "replace"
             and deleted is not None and deleted > 0
@@ -528,9 +531,45 @@ def _appended_manifest_rows(manager, old, new):
         else:
             return None
         snapshot = parent
-    file_count = sum(files_per_snapshot.values())
-    if file_count > MAX_APPEND_FILES:
+    return appends, rewrites, interleaved
+
+
+def _projected_additions(manager, old, new):
+    """Exact additions of an additive history as one key-level comparison per type.
+
+    Without deletions a row is new exactly when its key has a higher
+    multiplicity in new than in old. Four comparisons replace 512 bucket
+    queries; a delta beyond MAX_PROJECTION_ROWS keeps that exact comparison.
+    """
+    fields = "competition_id, source_season_key, target_type, entity_id"
+    changes = []
+    for target_type in MANIFEST_TARGET_TYPES:
+        predicate = f"target_type={literal(target_type)}"
+        added = source_sql(MANIFEST, {MANIFEST: new}, predicate)
+        removed = source_sql(MANIFEST, {MANIFEST: old}, predicate)
+        changes.extend(manager.execute_query(
+            f"SELECT {fields} FROM (SELECT {fields} FROM {added} "
+            f"EXCEPT ALL SELECT {fields} FROM {removed}) "
+            f"LIMIT {MAX_PROJECTION_ROWS + 1 - len(changes)}"
+        ))
+        if len(changes) > MAX_PROJECTION_ROWS:
+            return None
+    return changes
+
+
+def _appended_manifest_rows(manager, old, new):
+    """Return exact additions of an append-only history, or None to compare.
+
+    A common snapshot schema is required whenever a rewrite took part. The
+    additions are read from the appended files while every append is newer
+    than every rewrite and their inventory stays within limits; otherwise as
+    the key-level difference of the two pinned snapshots. Both paths keep
+    multiplicity and every C1 target type.
+    """
+    classified = _append_only_ancestry(manager, old, new)
+    if classified is None:
         return None
+    appends, rewrites, interleaved = classified
     if rewrites:
         required = rewrites | {old, new}
         versions = ", ".join(str(int(sid)) for sid in sorted(required))
@@ -545,8 +584,15 @@ def _appended_manifest_rows(manager, old, new):
             return None
         if observed_ids != required and not _retained_manifest_schema_matches(manager, required, schema_ids):
             return None
-    if not file_count:
+    if not appends:
         return []
+    files_per_snapshot = {sid: added for sid, (added, _) in appends.items()}
+    file_count = sum(files_per_snapshot.values())
+    row_counts = [rows for _, rows in appends.values()]
+    if interleaved or file_count > MAX_APPEND_FILES or (
+        None not in row_counts and sum(row_counts) > MAX_APPEND_ROWS
+    ):
+        return _projected_additions(manager, old, new)
 
     versions = ", ".join(str(int(sid)) for sid in sorted(files_per_snapshot))
     files = list(manager.execute_query(
@@ -724,6 +770,10 @@ def build_writer_lock():
 def wait_for_wave():
     """Give a running wave a bounded head start before opening Trino.
 
+    The head start is measured from the wave's own start. A wave that has
+    already run for the whole window gets none: an hourly refresh used to spend
+    a third of its task deadline waiting for backfill waves that run for hours.
+
     The probe is best effort: the writer lock, not this courtesy wait, guards
     correctness, so an infra failure (a live run saw transient docker DNS take
     down name resolution for the isolated metadb) must not fail the refresh.
@@ -736,7 +786,7 @@ def wait_for_wave():
     failures = 0
     while time.monotonic() < deadline:
         try:
-            running, _ = probe_wave()
+            running, _, started = probe_wave(with_start=True)
         except Exception:
             failures += 1
             if failures >= C1_WAVE_PROBE_ATTEMPTS:
@@ -746,8 +796,14 @@ def wait_for_wave():
         if not running:
             return
         remaining = deadline - time.monotonic()
-        if remaining > 0:
-            _sleep(min(C1_WAVE_POLL_SECONDS, remaining))
+        if started is not None:
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - started).total_seconds()
+            remaining = min(remaining, C1_WAVE_WAIT_SECONDS - age)
+        if remaining <= 0:
+            return
+        _sleep(min(C1_WAVE_POLL_SECONDS, remaining))
 
 
 class C1LockHoldOverrun(RuntimeError):
@@ -807,15 +863,33 @@ def _write_lease(manager, writer_lock):
             manager.set_write_authority(None)
 
 
-def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
+def _require_pinned(manager, expected):
+    """Reject work computed from snapshots that a source has since replaced.
+
+    Metadata is read outside time travel, so a mixed inventory must never be
+    published. Checking before the candidate reads and before the lease avoids
+    doing, or holding under the wave, work that is already doomed.
+    """
+    if snapshots(manager) != expected:
+        raise RuntimeError("C1 source snapshots changed during refresh")
+
+
+def refresh(
+    manager, *, first_day=None, last_day=None, writer_lock=None, stage_manager=None,
+):
     """Pin reads first and lease only shared writes; first_day is bootstrap only.
 
     A missing/expired previous snapshot fails closed. Rebootstrap in an approved
     window rather than guessing which commits/partitions were lost. Bootstrap
     keeps one lease for the whole operation; the normal refresh leases only the
     final publication after all reads and candidate staging have completed.
+
+    The private candidate table is staged by ``stage_manager``. It defaults to
+    ``manager`` and must never take a lease: a refresh manager refuses lease-free
+    mutations once it has published, which would doom every retry.
     """
     bootstrap = first_day is not None
+    staging = stage_manager or manager
     if bootstrap and writer_lock is not None:
         with _write_lease(manager, writer_lock):
             return refresh(
@@ -940,8 +1014,10 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
     # Cache future eligible matches too. A new deadline day only needs its
     # completeness marker; its inputs were populated on the last source commit.
     if affected:
+        if not bootstrap:
+            _require_pinned(manager, before)
         candidates_stage = PREFIX + "fotmob_c1_candidates__stg_" + uuid4().hex
-        manager.execute_query(
+        staging.execute_query(
             f"CREATE TABLE {candidates_stage} AS "
             + candidates_sql(affected, before, first_day)
         )
@@ -950,7 +1026,7 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
                 affected, before, first_day, None, candidates_table=candidates_stage
             ))
         finally:
-            manager.execute_query(f"DROP TABLE IF EXISTS {candidates_stage}")
+            staging.execute_query(f"DROP TABLE IF EXISTS {candidates_stage}")
         for record in records:
             day, cid, sk, mid, *inputs = record
             day = date.fromisoformat(str(day))
@@ -982,6 +1058,8 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
         if key not in replacements:
             replacements[key] = (*key, *([None] * 7), generation, False, None)
     stage = PREFIX + "fotmob_c1_inputs__stg_" + uuid4().hex
+    if not bootstrap:
+        _require_pinned(manager, before)
     with _write_lease(manager, writer_lock):
         publisher = manager if bootstrap else _HoldDeadlineManager(manager)
         created = published = False
@@ -991,8 +1069,7 @@ def refresh(manager, *, first_day=None, last_day=None, writer_lock=None):
             _stage_rows(publisher, stage, replacements.values())
             # Metadata was read outside time travel; reject a mixed file inventory.
             # Source commits during a lost lease can never advance our checkpoint.
-            if snapshots(publisher) != before:
-                raise RuntimeError("C1 source snapshots changed during refresh")
+            _require_pinned(publisher, before)
             publisher.execute_query(merge_sql(stage))
             published = True
         finally:
@@ -1016,16 +1093,22 @@ def run_refresh(**context):
     wait_for_wave()
     from scrapers.fotmob.trino_instrumentation import FotMobTrinoTableManager
 
-    # Day/checkpoint rows have nullable MERGE keys matched with IS NOT DISTINCT
-    # FROM; disable dynamic filtering for these C1 joins.
-    manager = FotMobTrinoTableManager(
-        source="fotmob:c1-inputs",
-        session_properties={
-            "query_max_run_time": "300s",
-            "query_max_execution_time": "300s",
-            "enable_dynamic_filtering": "false",
-        },
-    )
+    def build_manager():
+        # Day/checkpoint rows have nullable MERGE keys matched with IS NOT DISTINCT
+        # FROM; disable dynamic filtering for these C1 joins.
+        return FotMobTrinoTableManager(
+            source="fotmob:c1-inputs",
+            session_properties={
+                "query_max_run_time": "300s",
+                "query_max_execution_time": "300s",
+                "enable_dynamic_filtering": "false",
+            },
+        )
+
+    manager = build_manager()
+    # Candidate staging is private to the run and never leases. A refresh
+    # manager refuses lease-free mutations after its first publication.
+    staging = build_manager()
     # Saturated wave lanes can invalidate the pinned source snapshots while
     # this refresh politely waits for the publication lease; the failed attempt
     # publishes nothing, so retry from freshly pinned snapshots instead of
@@ -1034,7 +1117,9 @@ def run_refresh(**context):
     while True:
         attempts -= 1
         try:
-            return refresh(manager, writer_lock=build_writer_lock())
+            return refresh(
+                manager, writer_lock=build_writer_lock(), stage_manager=staging,
+            )
         except RuntimeError as error:
             if attempts <= 0 or "snapshots changed" not in str(error):
                 raise

@@ -200,7 +200,8 @@ def test_refresh_changed_physical_pairs_use_table_types_and_both_snapshots(monke
                for sql in manager.queries)
     assert any(sql.startswith("WITH candidates AS") for sql in manager.queries)
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.queries) == 1
-    assert sum("$history" in sql for sql in manager.queries) == 2 * len(c1.SOURCES)
+    # Pins are read when pinning, before the candidate reads, before the lease and under it.
+    assert sum("$history" in sql for sql in manager.queries) == 4 * len(c1.SOURCES)
 
 
 @pytest.mark.unit
@@ -216,7 +217,8 @@ def test_refresh_unchanged_inputs_skips_physical_closure(monkeypatch):
     assert not any(sql.startswith("WITH candidates AS") for sql in manager.queries)
     assert any(sql.endswith("AND false") for sql in manager.queries)
     assert sum(sql.startswith("MERGE INTO ") for sql in manager.queries) == 1
-    assert sum("$history" in sql for sql in manager.queries) == 2 * len(c1.SOURCES)
+    # Pins are read when pinning, before the lease and under it.
+    assert sum("$history" in sql for sql in manager.queries) == 3 * len(c1.SOURCES)
 
 
 @pytest.mark.unit

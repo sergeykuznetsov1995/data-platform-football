@@ -682,3 +682,46 @@ class TestWrapper:
         assert "dags/scripts/run_fotmob_scrape" not in text
         assert "run-id fotmob-hist-" not in text
         assert "python -m scrapers.fotmob.maintenance" in text
+
+
+@pytest.mark.unit
+class TestWaveProbe:
+    def test_start_of_the_earliest_running_wave_is_reported_only_on_request(self, monkeypatch):
+        from types import ModuleType
+
+        started = datetime(2026, 11, 28, 2, 0, tzinfo=timezone.utc)
+        statements, closed, uris = [], [], []
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params):
+                statements.append((" ".join(sql.split()), params))
+
+            def fetchone(self):
+                return 1, None, started
+
+        driver = ModuleType("psycopg2")
+        driver.connect = lambda uri: uris.append(uri) or SimpleNamespace(
+            cursor=Cursor, close=lambda: closed.append(True))
+        store = ModuleType("scrapers.fbref.control.store")
+        store.resolve_control_db_uri = lambda env: "uri-" + env["CASE"]
+        monkeypatch.setitem(sys.modules, "psycopg2", driver)
+        monkeypatch.setitem(sys.modules, "scrapers.fbref.control.store", store)
+
+        # The compactor's two-field contract stays as it was.
+        assert maintenance.probe_wave({"CASE": "compactor"}) == (True, None)
+        assert maintenance.probe_wave({"CASE": "c1"}, with_start=True) == (True, None, started)
+
+        assert uris == ["uri-compactor", "uri-c1"] and closed == [True, True]
+        assert len(statements) == 2 and statements[0] == statements[1]
+        sql, params = statements[0]
+        assert "count(*) FILTER (WHERE state IN ('running', 'queued'))" in sql
+        assert "max(end_date)" in sql
+        assert "min(start_date) FILTER (WHERE state IN ('running', 'queued'))" in sql
+        assert "FROM dag_run WHERE dag_id = %s" in sql
+        assert params == (maintenance.WAVE_DAG_ID,)
