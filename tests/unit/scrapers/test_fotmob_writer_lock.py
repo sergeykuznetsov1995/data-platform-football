@@ -1,6 +1,7 @@
 """Offline regressions for the bounded FotMob writer lease."""
 import sys
 import threading
+import time
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -26,7 +27,10 @@ def fake_pg(monkeypatch, connection):
         if conn.closed:
             raise OSError("connection closed")
         return (conn.acquired if "pg_try_advisory_lock" in sql else conn.owns,)
+    def owned(conn, sql, params):
+        return query(conn, sql, params, None)
     monkeypatch.setattr(locks, "_query", query)
+    monkeypatch.setattr(locks, "_query_owned", owned)
 
 
 def test_live_check_never_reacquires_and_loss_is_irreversible(monkeypatch):
@@ -85,9 +89,111 @@ def test_failed_probe_loses_authority_forever(monkeypatch):
     conn = Connection()
     fake_pg(monkeypatch, conn)
     with locks.writer_lock({}, key=12, wait_seconds=0, poll_seconds=.01) as lease:
-        monkeypatch.setattr(locks, "_query", lambda *args: (_ for _ in ()).throw(TimeoutError()))
+        monkeypatch.setattr(locks, "_query_owned", lambda *args: (_ for _ in ()).throw(TimeoutError()))
         with pytest.raises(locks.WriterLockLost):
             lease.check()
+
+
+class SlowSession:
+    """Protocol-level session: the acquisition answers at once, ownership polls answer slowly."""
+
+    def __init__(self, slow_polls, owns=True, error=None):
+        self.slow_polls = slow_polls
+        self.owns = owns
+        self.error = error
+        self.sql_text = ""
+        self.acquisition_polls = 0
+        self.ownership_polls = 0
+        self._phase = None
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+    def cursor(self):
+        session = self
+
+        class Cursor:
+            def execute(self, sql, params):
+                session.sql_text = sql
+                session._phase = "acquire" if "pg_try_advisory_lock" in sql else "own"
+
+            def fetchone(self):
+                return (session.owns,)
+
+            def close(self):
+                pass
+
+        return Cursor()
+
+
+def fake_slow_poll(monkeypatch, session):
+    def poll(connection, timeout):
+        assert connection is session and timeout == locks.PROBE_SECONDS
+        if session._phase == "acquire":
+            session.acquisition_polls += 1
+            return
+        session.ownership_polls += 1
+        if session.error is not None:
+            raise session.error
+        if session.ownership_polls <= session.slow_polls:
+            raise TimeoutError("FotMob writer lock IO deadline exceeded")
+    monkeypatch.setattr(locks, "_poll", poll)
+
+
+@pytest.mark.parametrize("slow_polls", [1, 2])
+def test_slow_control_database_answer_keeps_the_lease(monkeypatch, slow_polls):
+    session = SlowSession(slow_polls)
+    monkeypatch.setattr(locks, "_connect", lambda env, timeout: session)
+    fake_slow_poll(monkeypatch, session)
+    with locks.writer_lock({}, key=12, wait_seconds=0, poll_seconds=.01) as lease:
+        lease.check()
+        assert session.ownership_polls == 1 + slow_polls and "pg_backend_pid()" in session.sql_text
+
+
+def test_ownership_probe_that_never_answers_loses_the_lease(monkeypatch):
+    session = SlowSession(slow_polls=locks.PROBE_POLLS)
+    monkeypatch.setattr(locks, "_connect", lambda env, timeout: session)
+    fake_slow_poll(monkeypatch, session)
+    with locks.writer_lock({}, key=12, wait_seconds=0, poll_seconds=.01) as lease:
+        with pytest.raises(locks.WriterLockLost):
+            lease.check()
+        assert session.ownership_polls == locks.PROBE_POLLS
+        with pytest.raises(locks.WriterLockLost):
+            lease.check()
+        assert session.ownership_polls == locks.PROBE_POLLS
+
+
+def test_dead_session_loses_the_lease_without_retrying(monkeypatch):
+    session = SlowSession(slow_polls=0, error=OSError("connection closed"))
+    monkeypatch.setattr(locks, "_connect", lambda env, timeout: session)
+    fake_slow_poll(monkeypatch, session)
+    with locks.writer_lock({}, key=12, wait_seconds=0, poll_seconds=.01) as lease:
+        with pytest.raises(locks.WriterLockLost):
+            lease.check()
+        assert session.ownership_polls == 1
+
+
+def test_statement_waits_for_a_slow_heartbeat_probe_of_the_same_session(monkeypatch):
+    conn = Connection()
+    fake_pg(monkeypatch, conn)
+    monkeypatch.setattr(locks, "PROBE_SECONDS", 0.3)
+    with locks.writer_lock({}, key=12, wait_seconds=0, poll_seconds=.01) as lease:
+        assert lease._probe_lock.acquire(timeout=1)
+        outcome = []
+
+        def statement():
+            try:
+                lease.check()
+            except locks.WriterLockLost as error:
+                outcome.append(error)
+
+        worker = threading.Thread(target=statement)
+        worker.start()
+        time.sleep(0.2)
+        lease._probe_lock.release()
+        worker.join(2)
+        assert outcome == [] and not worker.is_alive()
 
 
 def test_socket_poll_obeys_explicit_deadline(monkeypatch):
