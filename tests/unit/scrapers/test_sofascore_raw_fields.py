@@ -222,15 +222,24 @@ class TestParseRounds:
         rows = parse_rounds(payload, source_tournament_id=1, source_season_id=2)
         assert [row["is_current"] for row in rows] == [False, True]
 
-    def test_current_round_without_stage_marks_that_number_in_every_stage(self):
-        # Lenient on purpose, like the existing name comparison: nothing consumes
-        # is_current, and the real payloads name the stage of a restarted round.
+    def test_current_round_without_stage_matches_only_unprefixed_rounds(self):
+        # A mixed-stage season repeats 1..11 under a prefix; the currentRound of
+        # the unprefixed stage carries no prefix and must not flag the prefixed twin.
+        payload = {
+            "currentRound": {"round": 10},
+            "rounds": [{"round": 10}, {"round": 10, "prefix": "National League"}],
+        }
+        rows = parse_rounds(payload, source_tournament_id=1, source_season_id=2)
+        assert [row["round_id"] for row in rows] == ["10", "National League:10"]
+        assert [row["is_current"] for row in rows] == [True, False]
+
+    def test_current_round_without_stage_flags_nothing_in_an_all_staged_season(self):
         payload = {
             "currentRound": {"round": 1},
             "rounds": [{"round": 1, "prefix": "Apertura"}, {"round": 1, "prefix": "Clausura"}],
         }
         rows = parse_rounds(payload, source_tournament_id=1, source_season_id=2)
-        assert [row["is_current"] for row in rows] == [True, True]
+        assert [row["is_current"] for row in rows] == [False, False]
 
 
 
