@@ -949,6 +949,41 @@ def test_daily_scope_stops_after_schedule_failure(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_daily_scope_is_retryable_after_schedule_transport_failure(
+    monkeypatch, tmp_path
+):
+    # #2473: an unsolved challenge on the schedule page is not a parse failure.
+    from scrapers.whoscored.transport import CloudflareChallenge, TransportRoute
+
+    challenge = CloudflareChallenge(
+        "Cloudflare challenge response",
+        url="https://www.whoscored.com/tournaments/2/data/",
+        route=TransportRoute.DIRECT_FLARESOLVERR,
+    )
+    rc, report, service_cls, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            "daily",
+            "--scope",
+            "ENG-Premier League=2526",
+            "--skip-profiles",
+        ],
+        behaviors={"schedule": challenge},
+    )
+
+    assert rc == 2
+    assert report["status"] == "retryable"
+    scope = report["scopes"][0]
+    assert scope["status"] == "retryable"
+    assert [
+        (error["entity"], error["type"], error["retryable"])
+        for error in scope["errors"]
+    ] == [("schedule", "CloudflareChallenge", True)]
+    assert service_cls.instances[0].calls == [("schedule", None)]
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("preview", "expected_rc", "expected_status"),
     [

@@ -2537,6 +2537,12 @@ class WhoScoredIngestService:
                 break
         except ProxyUnavailable:
             raise
+        except WhoScoredTransportError:
+            # #2473: an unsolved Cloudflare challenge, a timeout or a dead proxy
+            # says nothing about the schedule itself.  Keep the typed failure so
+            # the runner reports the scope by the transport's own retryable flag
+            # instead of a fatal RuntimeError built from a string.
+            raise
         except Exception as exc:
             result.errors.append(f"schedule: {type(exc).__name__}: {exc}")
         return result
