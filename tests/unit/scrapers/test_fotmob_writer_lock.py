@@ -177,7 +177,10 @@ def test_dead_session_loses_the_lease_without_retrying(monkeypatch):
 def test_statement_waits_for_a_slow_heartbeat_probe_of_the_same_session(monkeypatch):
     conn = Connection()
     fake_pg(monkeypatch, conn)
-    monkeypatch.setattr(locks, "PROBE_SECONDS", 0.3)
+    # Held longer than one poll but shorter than the whole probe deadline: a
+    # caller that only waited for a single poll would give up here.
+    monkeypatch.setattr(locks, "PROBE_SECONDS", 0.1)
+    monkeypatch.setattr(locks, "PROBE_POLLS", 10)
     with locks.writer_lock({}, key=12, wait_seconds=0, poll_seconds=.01) as lease:
         assert lease._probe_lock.acquire(timeout=1)
         outcome = []
@@ -190,7 +193,7 @@ def test_statement_waits_for_a_slow_heartbeat_probe_of_the_same_session(monkeypa
 
         worker = threading.Thread(target=statement)
         worker.start()
-        time.sleep(0.2)
+        time.sleep(0.3)
         lease._probe_lock.release()
         worker.join(2)
         assert outcome == [] and not worker.is_alive()
