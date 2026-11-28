@@ -6,6 +6,11 @@ import subprocess
 import sys
 
 TIMEOUT_SECONDS = 870
+# A source watchdog reads with its own account instead of the shared airflow
+# principal, so the source's Trino meter can attribute that traffic (#2132).
+# Only the name of the password variable crosses the host boundary; the value
+# is read inside the scheduler container, exactly like TRINO_PASSWORD.
+IDENTITIES = {"src_clubelo": "TRINO_SRC_CLUBELO_PASSWORD"}
 # Execute outside the mounted application tree and never create bytecode there.
 REMOTE_SCRIPT = r'''
 import csv
@@ -15,8 +20,14 @@ import sys
 import trino
 
 try:
-    password = os.environ.get("TRINO_PASSWORD")
-    user = os.environ.get("TRINO_USER", "airflow")
+    user = os.environ.get("TRINO_MONITOR_IDENTITY")
+    if user:
+        password = os.environ.get(os.environ["TRINO_MONITOR_PASSWORD_ENV"])
+        if not password:
+            raise ValueError("source credential unavailable")
+    else:
+        password = os.environ.get("TRINO_PASSWORD")
+        user = os.environ.get("TRINO_USER", "airflow")
     connection = trino.dbapi.connect(
         host=os.environ.get("TRINO_HOST", "trino"),
         port=int(os.environ.get("TRINO_PORT", 8443 if password else 8080)),
@@ -84,8 +95,14 @@ def validate_sql(sql):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    identity = None
+    if argv[:1] == ["--identity"]:
+        if len(argv) != 3 or argv[1] not in IDENTITIES:
+            print("usage: trino_monitor_ro.py [--identity NAME] SQL", file=sys.stderr)
+            return 2
+        identity, argv = argv[1], argv[2:]
     if len(argv) != 1:
-        print("usage: trino_monitor_ro.py SQL", file=sys.stderr)
+        print("usage: trino_monitor_ro.py [--identity NAME] SQL", file=sys.stderr)
         return 2
     try:
         validate_sql(argv[0])
@@ -93,9 +110,12 @@ def main(argv=None):
         # Never echo SQL, parser exceptions, connection parameters, or credentials.
         print("trino-monitor: SQL rejected or SQL validator unavailable", file=sys.stderr)
         return 2
+    options = ([] if identity is None else
+               ["--env", "TRINO_MONITOR_IDENTITY=" + identity,
+                "--env", "TRINO_MONITOR_PASSWORD_ENV=" + IDENTITIES[identity]])
     try:
         result = subprocess.run(
-            ["docker", "exec", "--workdir", "/tmp", "airflow-scheduler",
+            ["docker", "exec", "--workdir", "/tmp", *options, "airflow-scheduler",
              "python", "-B", "-W", "ignore", "-c", REMOTE_SCRIPT, argv[0]],
             capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False,
         )

@@ -131,6 +131,66 @@ def test_success_uses_bounded_no_bytecode_transport(monkeypatch, capsys):
     assert capsys.readouterr().out == '"1"\n'
 
 
+def test_source_identity_changes_only_the_principal_and_never_the_gate(monkeypatch, capsys):
+    def run(command, **kwargs):
+        assert command[:4] == ["docker", "exec", "--workdir", "/tmp"]
+        assert command[4:8] == ["--env", "TRINO_MONITOR_IDENTITY=src_clubelo",
+                                "--env", "TRINO_MONITOR_PASSWORD_ENV=TRINO_SRC_CLUBELO_PASSWORD"]
+        assert command[8:] == ["airflow-scheduler", "python", "-B", "-W", "ignore", "-c",
+                               client.REMOTE_SCRIPT, "SELECT 1"]
+        return SimpleNamespace(returncode=0, stdout='"1"\n', stderr="")
+
+    monkeypatch.setattr(client.subprocess, "run", run)
+    assert client.main(["--identity", "src_clubelo", "SELECT 1"]) == 0
+    assert capsys.readouterr().out == '"1"\n'
+    # An unknown identity, a missing SQL and a write with a known identity all
+    # stop before the transport.
+    monkeypatch.setattr(client.subprocess, "run", lambda *a, **k: pytest.fail("transport invoked"))
+    for argv in (["--identity", "airflow", "SELECT 1"], ["--identity", "src_clubelo"],
+                 ["--identity", "src_clubelo", "SELECT 1", "SELECT 2"], ["--identity"]):
+        assert client.main(argv) == 2 and capsys.readouterr().out == ""
+    assert client.main(["--identity", "src_clubelo", "DELETE FROM iceberg.bronze.t"]) == 2
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("variables, fails", [
+    ({"TRINO_MONITOR_IDENTITY": "src_clubelo",
+      "TRINO_MONITOR_PASSWORD_ENV": "TRINO_SRC_CLUBELO_PASSWORD",
+      "TRINO_SRC_CLUBELO_PASSWORD": "SOURCE"}, False),
+    ({"TRINO_MONITOR_IDENTITY": "src_clubelo",
+      "TRINO_MONITOR_PASSWORD_ENV": "TRINO_SRC_CLUBELO_PASSWORD",
+      "TRINO_SRC_CLUBELO_PASSWORD": "", "TRINO_PASSWORD": "SHARED"}, True),
+    ({"TRINO_MONITOR_IDENTITY": "src_clubelo"}, True),
+])
+def test_remote_source_identity_reads_only_its_named_variable(monkeypatch, capsys, variables, fails):
+    seen = {}
+
+    def connect(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(cursor=lambda: SimpleNamespace(
+            execute=lambda sql: None, fetchall=lambda: [("(1,)",)], close=lambda: None),            close=lambda: None)
+
+    monkeypatch.setitem(sys.modules, "trino", SimpleNamespace(
+        dbapi=SimpleNamespace(connect=connect),
+        auth=SimpleNamespace(BasicAuthentication=lambda user, password: (user, password))))
+    monkeypatch.delenv("TRINO_PASSWORD", raising=False)
+    monkeypatch.delenv("TRINO_MONITOR_IDENTITY", raising=False)
+    monkeypatch.delenv("TRINO_MONITOR_PASSWORD_ENV", raising=False)
+    monkeypatch.delenv("TRINO_SRC_CLUBELO_PASSWORD", raising=False)
+    for name, value in variables.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(sys, "argv", ["-c", "SELECT 1"])
+    if fails:
+        with pytest.raises(SystemExit) as error:
+            exec(client.REMOTE_SCRIPT, {})
+        assert error.value.code == 1
+        assert seen == {} and "SHARED" not in capsys.readouterr().err
+        return
+    exec(client.REMOTE_SCRIPT, {})
+    assert seen["user"] == "src_clubelo" and seen["auth"] == ("src_clubelo", "SOURCE")
+    assert seen["http_scheme"] == "https" and capsys.readouterr().out == '"(1,)"\n'
+
+
 @pytest.mark.parametrize("rows", [[], RuntimeError("SECRET connection details")])
 def test_remote_failure_is_empty_and_redacted(rows, monkeypatch, capsys):
     class Cursor:
