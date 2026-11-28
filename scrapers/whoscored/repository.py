@@ -260,6 +260,10 @@ def _scope_published_table_sql(table: str) -> str:
 # completeness guard.
 SCOPE_SHRINKABLE_DATASET_TABLES = {"whoscored_match_bets"}
 
+# #2473: scope datasets with one row per game event. When the no-shrink guard
+# rejects their new snapshot, the error names the games whose row count dropped.
+SCOPE_GAME_ROW_TABLES = frozenset({"whoscored_match_incidents"})
+
 DEFAULT_SCOPE_WRITE_CHUNK_ROWS = 20_000
 MAX_SCOPE_WRITE_CHUNK_ROWS = 100_000
 _SPOOL_INSERT_BATCH_ROWS = 256
@@ -4784,6 +4788,65 @@ class WhoScoredRepository:
                 f"scope batch {batch_id}/{table}: cleanup kept={kept}, expected={expected}"
             )
 
+    def _shrunk_games_detail(
+        self,
+        *,
+        table: str,
+        league: str,
+        season: str,
+        previous_filter: str,
+        new_rows: Sequence[Mapping[str, Any]],
+        limit: int = 20,
+    ) -> str:
+        """#2473: name the games whose row count dropped in a rejected snapshot.
+
+        Diagnostics only: the answer never decides whether the guard fires. A
+        failure of either read query leaves the original guard message.
+        """
+        try:
+            published = self.trino.execute_query(
+                f"SELECT batch_id FROM {self._scope_manifest} "
+                f"WHERE league = {_sql_string(league)} "
+                f"AND season = {_sql_string(season)} "
+                f"AND {previous_filter} AND state = 'success' "
+                "ORDER BY completed_at DESC, _ingested_at DESC LIMIT 1"
+            )
+            batch_id = str(published[0][0]) if published and published[0] else ""
+            if not batch_id:
+                return ""
+            counts = self.trino.execute_query(
+                f"SELECT CAST(game_id AS varchar), CAST(COUNT(*) AS varchar) "
+                f"FROM {table} WHERE league = {_sql_string(league)} "
+                f"AND season = {_sql_string(season)} "
+                f"AND _scope_batch_id = {_sql_string(batch_id)} GROUP BY game_id"
+            )
+            old = {str(game): int(number) for game, number in counts}
+        except Exception as exc:
+            logger.warning(
+                "WhoScored completeness guard detail unavailable for %s (%s)",
+                table,
+                type(exc).__name__,
+            )
+            return ""
+        new: dict[str, int] = {}
+        for row in new_rows:
+            if row.get("game_id") is not None:
+                key = str(int(row["game_id"]))
+                new[key] = new.get(key, 0) + 1
+        dropped = sorted(
+            (game, before, new.get(game, 0))
+            for game, before in old.items()
+            if new.get(game, 0) < before
+        )
+        if not dropped:
+            return ""
+        shown = ", ".join(
+            f"{game}:{before}->{after}" for game, before, after in dropped[:limit]
+        )
+        if len(dropped) > limit:
+            shown += f", (+{len(dropped) - limit} more)"
+        return f"; games with fewer rows: [{shown}]"
+
     @_lock_scope_commit
     def commit_scope_bundle(
         self,
@@ -5076,9 +5139,20 @@ class WhoScoredRepository:
             ):
                 if table == "whoscored_schedule":
                     raise ScheduleCompletenessError(new_count=new_count, old_count=old_count)
+                detail = (
+                    self._shrunk_games_detail(
+                        table=table,
+                        league=league,
+                        season=season,
+                        previous_filter=previous_filter,
+                        new_rows=row_sources.get(table, []),
+                    )
+                    if table in SCOPE_GAME_ROW_TABLES
+                    else ""
+                )
                 raise ValueError(
                     f"{table} completeness guard: new={new_count}, old={old_count}, "
-                    "published snapshot cannot shrink"
+                    f"published snapshot cannot shrink{detail}"
                 )
 
         schema_fingerprint = hashlib.sha256(
