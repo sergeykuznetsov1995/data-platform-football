@@ -177,17 +177,30 @@ class IcebergHistoryStore:
         for table in WRITE_ORDER:
             self.writer.create_table_if_not_exists(self.database, table, SCHEMAS[table])
 
+    def _read(self, table: str, columns: List[str]):
+        """Whole columns of one table through Trino in a single query.
+
+        ``IcebergWriter.read_table`` repeats the query to learn the column
+        names and then closes that cursor unread. Trino reports the cancelled
+        repeat as a failed query, and the Trino meter refuses such a day
+        (#2132). The names are known here, so one fetch is enough.
+        """
+        import pandas as pd
+
+        manager = self.writer._get_trino_manager()
+        names = ", ".join(f'"{column}"' for column in columns)
+        rows = manager.execute_query(f"SELECT {names} FROM {self.writer.catalog}.{self.database}.{table}")
+        return pd.DataFrame(rows, columns=columns)
+
     def known_slugs(self) -> Set[str]:
         """Every slug that has any manifest row (done, no_page or failed)."""
 
-        frame = self.writer.read_table(self.database, MANIFEST_TABLE, columns=["slug"])
+        frame = self._read(MANIFEST_TABLE, ["slug"])
         # An empty table comes back as a DataFrame without columns (Sol r1 #2).
         return set(frame["slug"]) if len(frame) else set()
 
     def closed_slugs(self) -> Set[str]:
-        frame = self.writer.read_table(
-            self.database, MANIFEST_TABLE, columns=["slug", "status", "fetched_at", "_ingested_at"]
-        )
+        frame = self._read(MANIFEST_TABLE, ["slug", "status", "fetched_at", "_ingested_at"])
         return closed_from_manifest(frame.to_dict("records"))
 
     def append(self, table: str, rows: List[Dict[str, Any]]) -> None:
