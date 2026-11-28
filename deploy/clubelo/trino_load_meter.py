@@ -48,6 +48,20 @@ PROBE = re.compile(r"select\s+(?:[01]|true|false|current_(?:user|catalog|schema|
 META_TABLE = r"(?:(?:\w+\.)?information_schema\.\w+|(?:(?:iceberg\.)?bronze\.)?clubelo_\w+\$\w+)"
 META_FROM = re.compile(rf"\bfrom\s+{META_TABLE}(?:\s+(?:as\s+)?\w+)?\s*(?=;?$|\b(?:where|group|order|limit)\b)")
 WRITE = re.compile(r"\b(?:insert|merge|update|delete|create|replace|truncate|alter|drop)\b")
+# TrinoTableManager stages a merge in ``<table>__stg_<12 hex>`` and drops it in
+# the same write. A staging table is never a Bronze data table.
+STAGING = re.compile(r"clubelo_[a-z0-9_]+__stg_[0-9a-f]{12}")
+STAGED = r"(?:[a-z_][a-z0-9_]*\s*\.\s*){0,2}clubelo_[a-z0-9_]+__stg_[0-9a-f]{12}(?![a-z0-9_])"
+STAGING_DDL = re.compile(rf"(?:drop\s+table\s+(?:if\s+exists\s+)?|insert\s+into\s+){STAGED}", re.S)
+STAGING_CTAS = re.compile(rf"create\s+table\s+(?:if\s+not\s+exists\s+)?{STAGED}\s+as\s+select\b"
+                          r".*\bwhere\s+false\s*;?\s*$", re.S)
+# DESCRIBE reports table metadata and has no data-table I/O.
+META_DESCRIBE = re.compile(r"(?:describe|show\s+columns\s+from|show\s+create\s+table)\s+"
+                           r"(?:table\s+|from\s+)?[\w.$]+\s*;?")
+# The platform's Iceberg maintenance is DDL by the shared account. It reports
+# an output but expires snapshots and removes orphans without committing data.
+MAINTENANCE = re.compile(r"alter\s+table\s+(?:[a-z_][a-z0-9_]*\s*\.\s*){0,2}clubelo_[a-z0-9_]+"
+                         r"\s+execute\s+(?:optimize|expire_snapshots|remove_orphan_files)\b", re.S)
 
 
 def now_utc():
@@ -166,7 +180,7 @@ def include_losses(report, losses):
 
 def event_violations(facts):
     violations = set()
-    if facts["actor"] == "airflow" and facts["outputs"]:
+    if facts["actor"] == "airflow" and facts["outputs"] and not facts.get("maintenance"):
         violations.add("airflow_table_use")
     if facts["outputs"] and facts["actor"] in ("monitor", "foreign"):
         violations.add("non_source_output")
@@ -177,7 +191,7 @@ def event_violations(facts):
 
 def physical(entry):
     counts = Counter()
-    data = bad = False
+    data = bad = staged = False
     for item in entry:
         if not isinstance(item, dict):
             bad = True
@@ -189,10 +203,13 @@ def physical(entry):
         catalog, schema, table = (s.lower() for s in parts)
         if schema == "information_schema" or "$" in table:
             continue
+        if STAGING.fullmatch(table):
+            staged = True
+            continue
         data = True
         if (catalog, schema) == ("iceberg", "bronze") and TABLE.fullmatch(table):
             counts[table] += 1
-    return counts, data, bad
+    return counts, data, bad, staged
 
 
 def classify(event, monitor_user):
@@ -208,8 +225,8 @@ def classify(event, monitor_user):
     io_meta = io_meta if isinstance(io_meta, dict) else {}
     inputs = io_meta.get("inputs")
     output = io_meta.get("output")
-    reads, input_data, bad_in = physical(inputs if isinstance(inputs, list) else [])
-    writes, output_data, bad_out = physical(output if isinstance(output, list) else [output] if output is not None else [])
+    reads, input_data, bad_in, staged_in = physical(inputs if isinstance(inputs, list) else [])
+    writes, output_data, bad_out, staged_out = physical(output if isinstance(output, list) else [output] if output is not None else [])
     broken = bad_in or bad_out or (inputs is not None and not isinstance(inputs, list))
     if not (own or reads or writes or "clubelo_" in sql):
         if (broken or not meta.get("queryId") or not event.get("endTime")
@@ -218,11 +235,17 @@ def classify(event, monitor_user):
         return None
 
     clean_sql = LITERALS.sub(" ", sql).replace('"', "").strip()
+    if META_DESCRIBE.fullmatch(clean_sql) and not (reads or writes or broken):
+        return None
     hints = set()
     read_hints = set()
+    staged = staged_in or staged_out
     for match in REFERENCE.finditer(clean_sql):
         parts = re.split(r"\s*\.\s*", match[2])
         if parts[:-1] in ([], ["bronze"], ["iceberg", "bronze"]) and TABLE.fullmatch(parts[-1]):
+            if STAGING.fullmatch(parts[-1]):
+                staged = True
+                continue
             hints.add(parts[-1])
             if match[1]:
                 read_hints.add(parts[-1])
@@ -232,12 +255,15 @@ def classify(event, monitor_user):
         if not own or PROBE.fullmatch(clean_sql):
             return None
         # Known metadata-only operations have no Bronze data-table I/O.
-        if not (input_data or output_data or broken) and (
+        if staged or not (input_data or output_data or broken) and (
             (inputs and not bad_in) or re.fullmatch(r"show\s+(catalogs|schemas|tables)(\s+(from|in)\s+[\w.]+)?\s*;?", clean_sql)
             or (re.match(r"select\b", clean_sql) and META_FROM.search(clean_sql)
                 and len(re.findall(r"\b(?:from|join|select|union)\b", clean_sql)) == 2)
         ):
             return None
+    # An empty staging copy reads no split of the table it copies.
+    if staged and not reads and STAGING_CTAS.fullmatch(clean_sql):
+        return None
 
     if own:
         actor = "source"
@@ -257,7 +283,7 @@ def classify(event, monitor_user):
                  or (not writes and bool(WRITE.search(clean_sql)) and bool(hints))
                  or not success)
     return {"actor": actor, "reads": reads, "outputs": sorted(writes), "finished": success,
-            "uncertain": uncertain}
+            "uncertain": uncertain, "maintenance": MAINTENANCE.match(clean_sql) is not None}
 
 
 def initialize(root):
@@ -520,29 +546,73 @@ def discovery(client):
     return sorted(names)
 
 
+def empty_evidence():
+    return {"snapshots": 0, "trino": 0, "catalog": 0, "unmatched": 0, "other_engine": 0,
+            "users": {}, "query_ids": []}
+
+
 def snapshots(client, day, names):
+    """Snapshot rows of one UTC day, tagged by the engine that committed them.
+
+    Trino stamps ``trino_user`` and ``trino_query_id``; the platform's bulk
+    writer reaches the catalog directly and stamps only ``dpf.operation`` on
+    its appends. Its delete half carries no stamp at all.
+    """
     selects = []
     for name in names:
         if not TABLE.fullmatch(name):
             raise ValueError("table")
-        selects.append(f"""SELECT '{name}', count(*) FROM iceberg.bronze."{name}$snapshots"
+        selects.append(f"""SELECT '{name}', operation, element_at(summary, 'engine-name'),
+element_at(summary, 'trino_user'), element_at(summary, 'trino_query_id'), element_at(summary, 'dpf.operation')
+FROM iceberg.bronze."{name}$snapshots"
 WHERE committed_at >= TIMESTAMP '{day.isoformat()} 00:00:00 UTC'
 AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 00:00:00 UTC'""")
-    counts = {}
+    # The monitor reports an empty result as a failure; a quiet day still needs evidence.
+    selects.append("SELECT '', '', '', '', '', ''")
+    evidence = {name: empty_evidence() for name in names}
     for row in rows(client, " UNION ALL ".join(selects)):
-        if len(row) != 2 or row[0] not in names or row[0] in counts or not re.fullmatch(r"[0-9]+", row[1]):
+        if len(row) != 6:
             raise ValueError("snapshot row")
-        counts[row[0]] = int(row[1])
-    if counts.keys() != set(names):
-        raise ValueError("snapshot set")
-    return counts
+        if row == [""] * 6:
+            continue
+        name, operation, engine, user, query_id, stamped = row
+        info = evidence.get(name)
+        if info is None or not re.fullmatch(r"[a-z_]+", operation) or info["snapshots"] >= LIMIT * 64:
+            raise ValueError("snapshot row")
+        info["snapshots"] += 1
+        if engine.lower() == "trino":
+            info["trino"] += 1
+            if QUERY_ID.fullmatch(query_id or ""):
+                info["users"][user or ""] = info["users"].get(user or "", 0) + 1
+                info["query_ids"].append(query_id)
+            else:
+                info["unmatched"] += 1
+        elif not engine:
+            if stamped or operation == "delete":
+                info["catalog"] += 1
+            else:
+                info["unmatched"] += 1
+        else:
+            info["other_engine"] += 1
+    return evidence
+
+
+def valid_evidence(info):
+    counters = ("snapshots", "trino", "catalog", "unmatched", "other_engine")
+    return (isinstance(info, dict) and set(info) == set(empty_evidence())
+            and all(type(info[key]) is int and info[key] >= 0 for key in counters)
+            and isinstance(info["users"], dict)
+            and all(isinstance(key, str) and type(value) is int and value >= 0
+                    for key, value in info["users"].items())
+            and isinstance(info["query_ids"], list)
+            and all(isinstance(value, str) and QUERY_ID.fullmatch(value) for value in info["query_ids"]))
 
 
 def empty_metrics():
     return {"input_records": dict.fromkeys(ACTORS, 0),
             "output_queries": dict.fromkeys(ACTORS, 0),
             "successful_outputs": dict.fromkeys(ACTORS, 0), "input_records_total": 0,
-            "snapshots": None}
+            "snapshots": None, "trino_snapshots": None, "catalog_snapshots": None}
 
 
 def summarize(db, day, evidence):
@@ -557,51 +627,69 @@ def summarize(db, day, evidence):
     if minutes != 1440:
         reasons.add("minute_coverage")
     tables = {name: empty_metrics() for name, in db.execute(
-        "SELECT name FROM inventory WHERE first_day<=? ORDER BY name", (day_text,))}
+        "SELECT name FROM inventory WHERE first_day<=? ORDER BY name", (day_text,)) if not STAGING.fullmatch(name)}
     source_activity = 0
-    for facts_text, in db.execute("SELECT facts FROM events WHERE day=?", (day_text,)):
+    written = {}
+    for key, facts_text in db.execute("SELECT id,facts FROM events WHERE day=?", (day_text,)):
         facts = json.loads(facts_text)
         actor = facts["actor"]
-        reads, outputs = facts["reads"], facts["outputs"]
+        reads, outputs = facts["reads"], [name for name in facts["outputs"] if not STAGING.fullmatch(name)]
         if actor == "source" and (reads or (facts["finished"] and outputs)):
             source_activity += 1
-        violations.update(event_violations(facts))
-        if actor == "airflow" and reads and not outputs:
+        violations.update(event_violations({**facts, "outputs": outputs}))
+        if actor == "airflow" and facts.get("maintenance") is True:
+            pass  # the platform's own DDL maintenance of Bronze tables
+        elif actor == "airflow" and reads and not outputs:
             reasons.add("unattributed_airflow_read")
         elif actor in ("airflow", "foreign", "unknown"):
             reasons.add(actor + "_use")
         if facts["uncertain"]:
             reasons.add("uncertain_event")
         for name, count in reads.items():
+            if STAGING.fullmatch(name):
+                continue
             tables[name]["input_records"][actor] += count
             tables[name]["input_records_total"] += count
         for name in outputs:
             tables[name]["output_queries"][actor] += 1
             if facts["finished"]:
                 tables[name]["successful_outputs"][actor] += 1
+                written.setdefault(name, []).append((key, facts.get("maintenance") is True))
     if not source_activity:
         reasons.add("no_source_activity")
-    counts = evidence["counts"]
-    if not evidence["stable"] or not counts:
+    committed_evidence = evidence["tables"]
+    if not evidence["stable"] or not committed_evidence:
         reasons.add("snapshot_evidence")
     for name, metrics in tables.items():
-        count = counts.get(name)
+        info = committed_evidence.get(name)
+        count = None if info is None else info["snapshots"]
         metrics["snapshots"] = count
-        if count is None:
+        if info is None:
             reasons.add("missing_table_evidence")
-        elif count != sum(metrics["successful_outputs"].values()):
+            continue
+        metrics["trino_snapshots"], metrics["catalog_snapshots"] = info["trino"], info["catalog"]
+        # Every Trino commit needs the stored successful output of the same
+        # query, and every successful data write its committed snapshot.
+        committed = {digest(value.encode()) for value in info["query_ids"]}
+        outputs = written.get(name, [])
+        if (not committed <= {key for key, _ in outputs}
+                or any(not procedure and key not in committed for key, procedure in outputs)
+                or info["unmatched"]):
             reasons.add("unattributed_snapshot_or_output")
+        if info["other_engine"] or set(info["users"]) - {"src_clubelo", "airflow"}:
+            violations.add("non_source_output")
         if metrics["input_records_total"] > LIMIT:
             violations.add("input_record_limit")
-        if count is not None and count > LIMIT:
+        if count > LIMIT:
             violations.add("snapshot_limit")
     return {"day": day_text, "verdict": "VIOLATION" if violations else "INCOMPLETE" if reasons else "PASS",
             "violations": sorted(violations), "incomplete": sorted(reasons),
             "covered_minutes": minutes, "source_queries": source_activity, "tables": tables,
             "scan_metric": "Trino QueryCompleted physical input records, including repeats and failed queries. "
                            "Iceberg ScanReports, rows and bytes require separate instrumentation.",
-            "snapshot_metric": "Iceberg snapshots by committed_at. Agreement with successful output query "
-                               "counts checks consistency. Individual snapshot writers remain unattributed."}
+            "snapshot_metric": "Iceberg snapshots by committed_at. A Trino commit is matched to its successful "
+                               "output query by trino_query_id. Catalog commits are written by the platform bulk "
+                               "writer, which stamps no principal into the snapshot."}
 
 
 def write_report(root, day, report):
@@ -631,10 +719,10 @@ def aggregate(root, day, client):
         # the replacement fails. A concurrent refresh owns its own revision.
         db.execute("INSERT OR REPLACE INTO reports VALUES (?,?)", (day.isoformat(), revision))
     names = []
-    evidence = {"stable": False, "counts": {}}
+    evidence = {"stable": False, "tables": {}}
     try:
         names = discovery(client)
-        evidence["counts"] = snapshots(client, day, names)
+        evidence["tables"] = snapshots(client, day, names)
         evidence["stable"] = discovery(client) == names
     except (OSError, ValueError, csv.Error, subprocess.SubprocessError):
         pass
@@ -667,9 +755,9 @@ def render(root, requested=None):
         if generated.date() != now.date() or generated > now:
             raise ValueError("report time")
         evidence = report["snapshot_evidence"]
-        if (type(evidence["stable"]) is not bool or not isinstance(evidence["counts"], dict)
-                or any(not TABLE.fullmatch(k) or type(v) is not int or v < 0
-                       for k, v in evidence["counts"].items())):
+        if (type(evidence["stable"]) is not bool or not isinstance(evidence["tables"], dict)
+                or any(not TABLE.fullmatch(k) or not valid_evidence(v)
+                       for k, v in evidence["tables"].items())):
             raise ValueError("snapshot evidence")
         with database(root) as db:
             db.execute("BEGIN")
@@ -684,7 +772,7 @@ def render(root, requested=None):
         include_losses(expected, losses)
         include_losses(report, losses)
         if (any(report[k] != v for k, v in expected.items())
-                or evidence["counts"].keys() - expected["tables"].keys()):
+                or evidence["tables"].keys() - expected["tables"].keys()):
             # Even a stale snapshot report cannot invalidate a violation
             # independently established by the listener or its loss markers.
             proven = set(expected["violations"]) - {"snapshot_limit"}
