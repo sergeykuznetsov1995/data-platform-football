@@ -944,6 +944,27 @@ def test_schedule_rejects_source_stage_drift_before_stage_requests(tmp_path):
     assert "source schedule stages differ from the frozen catalog" in result.errors[0]
 
 
+def test_schedule_transport_failure_keeps_its_type_instead_of_a_string(tmp_path):
+    # #2473: the runner classifies a scope by the exception, not by its text.
+    service, _, _ = _service(tmp_path)
+    challenge = CloudflareChallenge(
+        "Cloudflare challenge response",
+        url="https://www.whoscored.com/Regions/252/Tournaments/2/Seasons/1020",
+        route=TransportRoute.DIRECT_FLARESOLVERR,
+    )
+
+    def unsolved_challenge():
+        raise challenge
+
+    service._source_season_id = unsolved_challenge
+
+    with pytest.raises(CloudflareChallenge) as exc:
+        service.sync_schedule()
+
+    assert exc.value is challenge
+    assert exc.value.retryable is True
+
+
 def test_schedule_rejects_empty_source_stage_menu(tmp_path):
     # #1598: an empty stage menu is not "a stage went missing".
     service, _, _ = _service(tmp_path)
