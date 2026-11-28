@@ -584,6 +584,9 @@ class TransportStats:
     browser_sessions: int = 0
     browser_batches: int = 0
     browser_batch_items: int = 0
+    # #2473: real application pages that carry Cloudflare's own markup and were
+    # accepted because their validator proved the page payload.
+    cf_marker_pages_accepted: int = 0
     stage_xhr_token: Counter[str] = field(default_factory=Counter)
 
     def as_dict(self) -> dict[str, Any]:
@@ -597,6 +600,7 @@ class TransportStats:
             "browser_sessions": self.browser_sessions,
             "browser_batches": self.browser_batches,
             "browser_batch_items": self.browser_batch_items,
+            "cf_marker_pages_accepted": self.cf_marker_pages_accepted,
             "stage_xhr_token": dict(self.stage_xhr_token),
         }
 
@@ -955,6 +959,17 @@ def _has_cloudflare_challenge_markup(content: bytes | str) -> bool:
     return any(value in body for value in _CF_STRONG_BODY_MARKERS)
 
 
+def _matched_cf_markers(content: bytes | str) -> list[str]:
+    """Name the strong Cloudflare markers found in the leading part of a body."""
+    body = (
+        content.decode("utf-8", errors="ignore")
+        if isinstance(content, bytes)
+        else content
+    )
+    body = body[:250_000].lower()
+    return [marker for marker in _CF_STRONG_BODY_MARKERS if marker in body]
+
+
 def _cloudflare_origin_error_status(content: bytes | str) -> Optional[int]:
     """Recover an origin 5xx that FlareSolverr reports as HTTP 200.
 
@@ -1004,6 +1019,19 @@ def _is_whoscored_maintenance_page(content: bytes | str) -> bool:
 
 
 Validator = Callable[[TransportResponse], Optional[bool]]
+
+
+def _validator_accepts(response: TransportResponse, validator: Validator) -> bool:
+    """Run one caller validator as a yes/no payload proof.
+
+    Used only to decide whether an HTTP 200 document that carries a Cloudflare
+    marker is a real application page.  A rejection or an error answers "no" and
+    leaves the classification to the caller.
+    """
+    try:
+        return validator(response) is not False
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -3384,9 +3412,30 @@ class WhoScoredTransport:
                 route=response.route,
                 status_code=response.status_code,
             )
-        if browser_challenge or is_cloudflare_response(
+        cf_response = is_cloudflare_response(
             response.status_code, response.headers, response.content
+        )
+        payload_checked = False
+        if (
+            cf_response
+            and not browser_challenge
+            and response.status_code == 200
+            and validator is not None
         ):
+            # #2473: Cloudflare injects its own script into ordinary application
+            # pages, so a body marker alone does not make an HTTP 200 document a
+            # challenge.  The caller's validator proves the page payload; when it
+            # does, the payload wins.  Anything less stays a challenge.
+            payload_checked = _validator_accepts(response, validator)
+            if payload_checked:
+                self.stats.cf_marker_pages_accepted += 1
+                logger.info(
+                    "WhoScored page with Cloudflare markup accepted by its "
+                    "validator (route=%s, markers=%s)",
+                    response.route.value,
+                    _matched_cf_markers(response.content),
+                )
+        if browser_challenge or (cf_response and not payload_checked):
             raise CloudflareChallenge(
                 "Cloudflare challenge response",
                 url=response.url,
@@ -3445,7 +3494,7 @@ class WhoScoredTransport:
                 url=response.url,
                 route=response.route,
             )
-        if validator is None:
+        if validator is None or payload_checked:
             return
         try:
             accepted = validator(response)

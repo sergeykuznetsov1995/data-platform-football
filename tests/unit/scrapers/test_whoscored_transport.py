@@ -3022,6 +3022,111 @@ def test_rendered_browser_challenge_without_source_headers_is_confirmed_cf():
     assert len(direct_fs.created) == 2
 
 
+# #2473: Cloudflare injects its own script into ordinary application pages, so
+# a solved page can carry challenge-platform markup next to its real payload.
+CF_MARKUP_OK_HTML = (
+    b'<html><head><script src="/cdn-cgi/challenge-platform/h/b/scripts/jsd/x.js">'
+    b"</script></head><body><script>var matchCentreData = {}</script></body></html>"
+)
+CF_MARKUP_NO_PAYLOAD_HTML = (
+    b'<html><head><script src="/cdn-cgi/challenge-platform/h/b/scripts/jsd/x.js">'
+    b"</script></head><body><div>Just a moment...</div></body></html>"
+)
+
+
+def _payload_validator(response):
+    if b"matchCentreData" not in response.content:
+        raise ValueError("no matchCentreData")
+    return True
+
+
+@pytest.mark.unit
+def test_solved_page_with_cloudflare_markup_is_kept_when_validator_proves_payload():
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}))
+    fs = FakeFSClient({"html": CF_MARKUP_OK_HTML.decode(), "status": 200})
+    validator_sizes = []
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    def validator(response):
+        validator_sizes.append(len(response.content))
+        return _payload_validator(response)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live", validator=validator
+    )
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert result.content == CF_MARKUP_OK_HTML
+    assert len(fs.get_calls) == 1
+    assert validator_sizes == [len(CF_MARKUP_OK_HTML)]
+    assert transport.stats.cf_marker_pages_accepted == 1
+    assert transport.stats.failures[FailureKind.CLOUDFLARE.value] == 1
+    assert transport.stats.as_dict()["cf_marker_pages_accepted"] == 1
+
+
+@pytest.mark.unit
+def test_page_with_cloudflare_markup_and_no_payload_stays_a_challenge():
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}))
+    fs = FakeFSClient(
+        {"html": CF_MARKUP_NO_PAYLOAD_HTML.decode(), "status": 200},
+        {"html": CF_HTML.decode(), "status": 403},
+    )
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    with pytest.raises(CloudflareChallenge) as exc:
+        transport.fetch(
+            "https://www.whoscored.com/Matches/1/Live", validator=_payload_validator
+        )
+
+    assert exc.value.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(fs.get_calls) == 2
+    assert transport.stats.cf_marker_pages_accepted == 0
+
+
+@pytest.mark.unit
+def test_page_with_cloudflare_markup_without_validator_stays_a_challenge():
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}))
+    fs = FakeFSClient({"html": CF_MARKUP_OK_HTML.decode(), "status": 200})
+    transport, _ = _transport(direct, direct_fs=fs, attempts=1)
+
+    with pytest.raises(CloudflareChallenge):
+        transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert transport.stats.cf_marker_pages_accepted == 0
+
+
+@pytest.mark.unit
+def test_browser_403_with_markup_stays_a_challenge_despite_payload_token():
+    body = CF_HTML.replace(
+        b"</html>", b"<script>var matchCentreData = {}</script></html>"
+    )
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}))
+    fs = FakeFSClient({"html": body.decode(), "status": 403})
+    transport, _ = _transport(direct, direct_fs=fs, attempts=1)
+
+    with pytest.raises(CloudflareChallenge):
+        transport.fetch(
+            "https://www.whoscored.com/Matches/1/Live", validator=_payload_validator
+        )
+
+    assert transport.stats.cf_marker_pages_accepted == 0
+
+
+@pytest.mark.unit
+def test_direct_page_with_cloudflare_markup_and_payload_never_starts_browser():
+    direct = FakeHTTPSession(FakeHTTPResponse(200, CF_MARKUP_OK_HTML))
+    fs = FakeFSClient()
+    transport, _ = _transport(direct, direct_fs=fs)
+
+    result = transport.fetch(
+        "https://www.whoscored.com/Matches/1/Live", validator=_payload_validator
+    )
+
+    assert result.route is TransportRoute.DIRECT_HTTP
+    assert fs.created == []
+    assert transport.stats.cf_marker_pages_accepted == 1
+
+
 @pytest.mark.unit
 def test_validator_rejection_is_not_treated_as_cloudflare():
     direct = FakeHTTPSession(FakeHTTPResponse(content=b"wrong page"))
