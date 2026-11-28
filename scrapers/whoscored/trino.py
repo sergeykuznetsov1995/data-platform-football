@@ -102,11 +102,8 @@ def statement_keys(sql, catalog):
     target = _WRITE.match(statement)
     keys = set()
     if target:
-        # Empty schema DDL and DROP do not commit a data snapshot.
-        if re.match(r"^(alter|drop)\b", statement, re.I) or (
-            re.match(r"^create\b", statement, re.I)
-            and not re.search(r"\bas\s+(?:select|with)\b", statement, re.I)
-        ):
+        # Trino creates an append snapshot even when CREATE TABLE has no rows.
+        if re.match(r"^(alter|drop)\b", statement, re.I):
             return keys
         keys.add("commit:" + ".".join(_relation(target[1], catalog)))
     elif not re.match(r"^(?:select|with|table)\b", statement, re.I):
