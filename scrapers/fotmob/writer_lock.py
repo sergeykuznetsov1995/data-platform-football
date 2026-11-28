@@ -11,9 +11,18 @@ import time
 from typing import Callable, Iterator, Mapping
 
 logger = logging.getLogger(__name__)
-# Both connection establishment and each ownership probe have a hard IO deadline.
+# Both connection establishment and each poll of the ownership probe have a hard
+# IO deadline. A loaded control database can answer the ownership query slowly
+# while the session still owns the lock: the same in-flight query is polled up
+# to PROBE_POLLS times before the lease is lost. A dead session fails at once.
+# 28.11 a single slow poll ended an 8.5-hour backfill wave with nothing published.
 PROBE_SECONDS = 5.0
+PROBE_POLLS = 3
 HEARTBEAT_SECONDS = 1.0
+
+
+def _probe_deadline() -> float:
+    return PROBE_SECONDS * PROBE_POLLS
 
 
 class WriterLockBusy(RuntimeError):
@@ -71,6 +80,27 @@ def _query(connection, sql: str, params: tuple, timeout: float):
         cursor.close()
 
 
+def _poll_owned(connection) -> None:
+    """Only the whole deadline loses the lease, not one slow poll."""
+    for poll in range(1, PROBE_POLLS + 1):
+        try:
+            _poll(connection, PROBE_SECONDS)
+            return
+        except TimeoutError:
+            if poll == PROBE_POLLS:
+                raise
+
+
+def _query_owned(connection, sql: str, params: tuple):
+    cursor = connection.cursor()
+    try:
+        cursor.execute(sql, params)
+        _poll_owned(connection)
+        return cursor.fetchone()
+    finally:
+        cursor.close()
+
+
 class WriterLease:
     """An irrevocable right to write while this exact DB session owns the key."""
 
@@ -89,7 +119,7 @@ class WriterLease:
     def check(self) -> None:
         if self._lost.is_set():
             raise WriterLockLost(self._reason)
-        if not self._probe_lock.acquire(timeout=PROBE_SECONDS):
+        if not self._probe_lock.acquire(timeout=_probe_deadline()):
             self._lose("FotMob writer ownership probe timed out")
             raise WriterLockLost(self._reason)
         try:
@@ -97,7 +127,7 @@ class WriterLease:
                 raise WriterLockLost(self._reason)
             # Advisory bigint keys occupy the high/low 32-bit fields. objsubid=1
             # distinguishes them from the independent two-int advisory namespace.
-            row = _query(
+            row = _query_owned(
                 self._connection,
                 "SELECT EXISTS (SELECT 1 FROM pg_locks "
                 "WHERE locktype = 'advisory' AND pid = pg_backend_pid() "
@@ -106,7 +136,6 @@ class WriterLease:
                 "AND classid = %s::oid AND objid = %s::oid "
                 "AND objsubid = 1 AND mode = 'ExclusiveLock' AND granted)",
                 ((self._key >> 32) & 0xffffffff, self._key & 0xffffffff),
-                PROBE_SECONDS,
             )
             if not row or not row[0]:
                 raise WriterLockLost("FotMob session no longer owns the writer lock")
@@ -143,7 +172,7 @@ class WriterLease:
             stopped.set()
             # A worker can be in a bounded DB probe. Joining it avoids a late
             # cancellation being delivered to a cursor already used by new SQL.
-            worker.join(PROBE_SECONDS * 2 + .1)
+            worker.join(_probe_deadline() * 2 + .1)
             if worker.is_alive():
                 self._lose("FotMob writer heartbeat did not finish in time")
             self.check()
