@@ -351,6 +351,17 @@ def _opens_column_list(tokens, after, matches):
     return after < len(tokens) and tokens[after].kind == "punct" and tokens[after].value == "(" and after in matches
 
 
+def _opens_column_list(tokens, after, matches):
+    """A real '(' token that opens a group; a quoted identifier named '(' is not one."""
+    return after < len(tokens) and tokens[after].kind == "punct" and tokens[after].value == "(" and after in matches
+
+
+def _ctas_query(tokens, after, depths):
+    """A top-level AS before SELECT or WITH: the query that makes CREATE TABLE a write."""
+    words = {t.value for i, t in enumerate(tokens) if i >= after and depths[i] == 0 and t.kind == "word"}
+    return {"as"} <= words and bool({"select", "with"} & words)
+
+
 def _ddl_operations(kind, tokens, after, target, matches):
     """Operations of the DDL the contour emits; other shapes stay unparsed.
 
@@ -382,10 +393,10 @@ def parse_sql(sql: str, tables: Iterable[str]) -> ParsedSQL:
         if kind in {"view_write", "ensure_table", "ctas"}:
             parts, after = _name(tokens, target_index)
             # DDL defines schema only: its column list and view body are never
-            # relations. CTAS may also carry a column alias list, so it stays
-            # on the query path whenever the list is followed by AS.
-            if kind != "ctas" or (_opens_column_list(tokens, after, matches)
-                                  and not _word(tokens, matches[after] + 1, "as")):
+            # relations. A column list alone does not make DDL: CREATE TABLE
+            # stays on the query path whenever a top-level AS introduces a query.
+            if kind != "ctas" or (not _ctas_query(tokens, after, depths)
+                                  and _opens_column_list(tokens, after, matches)):
                 return ParsedSQL("table_ddl" if kind == "ctas" else kind,
                                  _ddl_operations(kind, tokens, after, _resolve(parts, known), matches))
         scopes = _cte_scopes(tokens, matches, depths)

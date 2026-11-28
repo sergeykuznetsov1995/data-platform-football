@@ -97,8 +97,11 @@ def table_row(report, table=MATCHES, attr="src_fotmob"):
     ("ALTER TABLE iceberg.bronze.fotmob_matches EXECUTE optimize", {(MATCHES, "commit")}),
     ('SELECT * FROM "ICEBERG"."BRONZE"."FOTMOB_MATCHES"', {(MATCHES, "scan_read")}),
     ("EXPLAIN ANALYZE SELECT * FROM fotmob_matches", {(MATCHES, "scan_read")}),
-    # A column alias list keeps CTAS on the query path.
+    # A column alias list keeps CTAS on the query path, with or without table
+    # properties or a comment before AS.
     ("CREATE TABLE fotmob_matches (id) AS SELECT id FROM fotmob_ingest_manifest", {(MATCHES, "commit"), (MANIFEST, "scan_write")}),
+    ("CREATE TABLE fotmob_matches (id) WITH (format = 'PARQUET') AS SELECT id FROM fotmob_ingest_manifest", {(MATCHES, "commit"), (MANIFEST, "scan_write")}),
+    ("CREATE TABLE fotmob_matches (id) COMMENT 'c' AS SELECT id FROM fotmob_ingest_manifest", {(MATCHES, "commit"), (MANIFEST, "scan_write")}),
     ("SELECT * FROM fotmob_matches a JOIN fotmob_matches b ON a.id=b.id", {(MATCHES, "scan_read")}),
 ])
 def test_parser_operations(sql, operations):
@@ -165,6 +168,8 @@ PAYLOADS_VIEW = (
     f"CROSS JOIN UNNEST(k.seasons) AS d(season_key) WHERE d.season_key = r.source_season_key"
 )
 STAGE_DDL = f"CREATE TABLE {STAGE} ( deadline_day DATE, match_id VARCHAR ) WITH (partitioning = ARRAY['deadline_day'])"
+# Words that look like a query are opaque inside a column list or a literal.
+NESTED_AS_DDL = f"CREATE TABLE {STAGE} ( as_id BIGINT, b ROW(x BIGINT) ) WITH (partitioning = ARRAY['as select'])"
 ENSURE_MANIFEST = (
     f"CREATE TABLE IF NOT EXISTS {MANIFEST} ( run_id VARCHAR, target_type VARCHAR, _ingested_at TIMESTAMP(6) ) "
     "WITH (partitioning = ARRAY['target_type'])"
@@ -182,6 +187,7 @@ ENSURE_MANIFEST = (
     # Creating a table commits its first snapshot; the sealed writer creates
     # and drops its own staging tables, and dropping a real table commits too.
     (STAGE_DDL, {(STAGE, "commit")}),
+    (NESTED_AS_DDL, {(STAGE, "commit")}),
     (f"CREATE TABLE {MATCHES} (id bigint)", {(MATCHES, "commit")}),
     (f"DROP TABLE IF EXISTS {STAGE}", {(STAGE, "commit")}),
     (f"DROP TABLE {MATCHES}", {(MATCHES, "commit")}),
