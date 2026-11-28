@@ -57,7 +57,7 @@ DEFAULT_ROOT = Path("/root/watchdog/fotmob_meter")
 UTC = timezone.utc
 MINUTE = timedelta(minutes=1)
 ATTRIBUTIONS = (SOURCE_USER, "platform", "unknown")
-WRITE_TYPES = frozenset({"insert", "merge", "update", "delete", "ctas", "alter_write"})
+WRITE_TYPES = frozenset({"insert", "merge", "update", "delete", "ctas", "alter_write", "drop", "table_ddl"})
 TABLE_NAME_RE = re.compile(r"fotmob_[a-z0-9_]+\Z")
 EPHEMERAL_STAGE_RE = re.compile(r"fotmob_[a-z0-9_]+__stg_[0-9a-f]{6,}\Z")
 QUERY_ID_RE = re.compile(r"[A-Za-z0-9_]+\Z")
@@ -81,8 +81,14 @@ S3_SQL = r'''CASE
  WHEN regexp_like(query, '(?i)^\s*MERGE\s+INTO\b') THEN 'merge'
  WHEN regexp_like(query, '(?i)^\s*UPDATE\b') THEN 'update'
  WHEN regexp_like(query, '(?i)^\s*DELETE\s+FROM\b') THEN 'delete'
+ WHEN regexp_like(query, '(?i)^\s*DROP\s+TABLE\b') THEN 'drop'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b') THEN 'view_write'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b')
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'other'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b') THEN 'ensure_table'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b')
-  AND regexp_like(query, '(?i)\bAS\b') THEN 'ctas'
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'ctas'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b') THEN 'table_ddl'
  WHEN regexp_like(query, '(?i)^\s*ALTER\s+TABLE\b') THEN 'alter_write'
  WHEN regexp_like(query, '(?i)^\s*EXPLAIN\s+ANALYZE\b') THEN 'read_exec'
  WHEN regexp_like(query, '(?i)^\s*(SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN)\b')
@@ -93,7 +99,7 @@ S6_SQL = 'SELECT "user", count(*) AS n FROM system.runtime.queries GROUP BY "use
 S7_SQL = '''SELECT count(*) AS snapshots FROM iceberg.bronze."{table}$snapshots"
 WHERE committed_at >= TIMESTAMP '{t_from}' AND committed_at < TIMESTAMP '{t_to}' '''
 P1_PATTERN = r'(?i)\b(?:FROM|JOIN|USING)\s+([\w$"]+(?:\s*\.\s*[\w$"]+){0,2})'
-P2_PATTERN = r'(?i)^\s*(?:INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE)\s+([\w$"]+(?:\s*\.\s*[\w$"]+){0,2})'
+P2_PATTERN = r'(?i)^\s*(?:INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?)\s+([\w$"]+(?:\s*\.\s*[\w$"]+){0,2})'
 P3_PATTERN = r'(?i)(?:\bWITH|,)\s*([\w$"]+)\s+AS\s*\('
 
 
@@ -324,8 +330,12 @@ def _cte_scopes(tokens: Sequence[Token], matches: Mapping[int, int], depths: Seq
 def _classify(tokens: Sequence[Token]) -> tuple[str, int | None]:
     for words, kind in ((('insert', 'into'), 'insert'), (('merge', 'into'), 'merge'),
                         (('update',), 'update'), (('delete', 'from'), 'delete'),
-                        (('create', 'table'), 'ctas'), (('alter', 'table'), 'alter_write')):
+                        (('create', 'table'), 'ctas'), (('alter', 'table'), 'alter_write'),
+                        (('drop', 'table'), 'drop'), (('create', 'view'), 'view_write'),
+                        (('create', 'or', 'replace', 'view'), 'view_write')):
         if all(_word(tokens, i, word) for i, word in enumerate(words)):
+            if kind == "ctas" and all(_word(tokens, 2 + i, word) for i, word in enumerate(("if", "not", "exists"))):
+                return "ensure_table", 5
             return kind, len(words)
     if _word(tokens, 0, "explain") and _word(tokens, 1, "analyze"):
         if not (_word(tokens, 2, "select") or _word(tokens, 2, "with")):
@@ -336,6 +346,43 @@ def _classify(tokens: Sequence[Token]) -> tuple[str, int | None]:
     raise ValueError("statement outside the grammar")
 
 
+def _opens_column_list(tokens, after, matches):
+    """A real '(' token that opens a group; a quoted identifier named '(' is not one."""
+    return after < len(tokens) and tokens[after].kind == "punct" and tokens[after].value == "(" and after in matches
+
+
+def _opens_column_list(tokens, after, matches):
+    """A real '(' token that opens a group; a quoted identifier named '(' is not one."""
+    return after < len(tokens) and tokens[after].kind == "punct" and tokens[after].value == "(" and after in matches
+
+
+def _ctas_query(tokens, after, depths):
+    """A top-level AS before SELECT or WITH: the query that makes CREATE TABLE a write."""
+    words = {t.value for i, t in enumerate(tokens) if i >= after and depths[i] == 0 and t.kind == "word"}
+    return {"as"} <= words and bool({"select", "with"} & words)
+
+
+def _ddl_operations(kind, tokens, after, target, matches):
+    """Operations of the DDL the contour emits; other shapes stay unparsed.
+
+    A view definition and an existing-table no-op are analyzed only, so they
+    neither scan nor commit. Creating a table commits its first snapshot.
+    """
+    if target is None:
+        raise ValueError("DDL must name one known table or view")
+    if kind == "view_write":
+        if not (_word(tokens, after, "as") and (_word(tokens, after + 1, "select") or _word(tokens, after + 1, "with"))):
+            raise ValueError("CREATE VIEW without AS SELECT")
+        return ()
+    if not _opens_column_list(tokens, after, matches):
+        raise ValueError("CREATE TABLE without a column list")
+    options = matches[after] + 1
+    if options < len(tokens):
+        if not (_word(tokens, options, "with") and matches.get(options + 1) == len(tokens) - 1):
+            raise ValueError("unsupported CREATE TABLE options")
+    return () if kind == "ensure_table" else ((target, "commit"),)
+
+
 def parse_sql(sql: str, tables: Iterable[str]) -> ParsedSQL:
     """P0–P4, one scan per distinct source table in a statement; fail closed."""
     known = set(discovered_tables(tables))
@@ -343,9 +390,23 @@ def parse_sql(sql: str, tables: Iterable[str]) -> ParsedSQL:
         tokens = _tokens(sql)
         matches, depths = _parentheses(tokens)
         kind, target_index = _classify(tokens)
+        if kind in {"view_write", "ensure_table", "ctas"}:
+            parts, after = _name(tokens, target_index)
+            # DDL defines schema only: its column list and view body are never
+            # relations. A column list alone does not make DDL: CREATE TABLE
+            # stays on the query path whenever a top-level AS introduces a query.
+            if kind != "ctas" or (not _ctas_query(tokens, after, depths)
+                                  and _opens_column_list(tokens, after, matches)):
+                return ParsedSQL("table_ddl" if kind == "ctas" else kind,
+                                 _ddl_operations(kind, tokens, after, _resolve(parts, known), matches))
         scopes = _cte_scopes(tokens, matches, depths)
         target = None
         if target_index is not None:
+            if kind == "drop" and _word(tokens, target_index, "if"):
+                # Only DROP TABLE [IF EXISTS] name; modifiers stay outside the grammar.
+                if not _word(tokens, target_index + 1, "exists"):
+                    raise ValueError("incomplete DROP")
+                target_index += 2
             parts, after_target = _name(tokens, target_index)
             target = _resolve(parts, known)
             top_words = {t.value for i, t in enumerate(tokens) if i >= after_target and depths[i] == 0 and t.kind == "word"}
@@ -359,6 +420,8 @@ def parse_sql(sql: str, tables: Iterable[str]) -> ParsedSQL:
                 raise ValueError("incomplete MERGE")
             if kind == "alter_write" and after_target >= len(tokens):
                 raise ValueError("incomplete ALTER")
+            if kind == "drop" and (target is None or after_target != len(tokens)):
+                raise ValueError("DROP must name exactly one known table")
         sources = set()
         from_depths: set[int] = set()
         for index, token in enumerate(tokens):

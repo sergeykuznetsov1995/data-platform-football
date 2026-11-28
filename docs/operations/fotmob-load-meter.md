@@ -204,8 +204,14 @@ CASE
  WHEN regexp_like(query, '(?i)^\s*MERGE\s+INTO\b') THEN 'merge'
  WHEN regexp_like(query, '(?i)^\s*UPDATE\b') THEN 'update'
  WHEN regexp_like(query, '(?i)^\s*DELETE\s+FROM\b') THEN 'delete'
+ WHEN regexp_like(query, '(?i)^\s*DROP\s+TABLE\b') THEN 'drop'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b') THEN 'view_write'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b')
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'other'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b') THEN 'ensure_table'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b')
-  AND regexp_like(query, '(?i)\bAS\b') THEN 'ctas'
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'ctas'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b') THEN 'table_ddl'
  WHEN regexp_like(query, '(?i)^\s*ALTER\s+TABLE\b') THEN 'alter_write'
  WHEN regexp_like(query, '(?i)^\s*EXPLAIN\s+ANALYZE\b') THEN 'read_exec'
  WHEN regexp_like(query, '(?i)^\s*(SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN)\b')
@@ -265,7 +271,7 @@ S7 числом разобранных write-SQL: это уничтожило б
 | --- | --- |
 | P0 | Удаление `--` и вложенных `/* */` комментариев, непрозрачные строковые литералы с `''`, отдельные quoted identifiers с `""`; нижний регистр идентификаторов |
 | P1 | Кандидаты после FROM/JOIN/USING: `(?i)\b(?:FROM\|JOIN\|USING)\s+([\w$\"]+(?:\s*\.\s*[\w$\"]+){0,2})` |
-| P2 | Цель после INSERT INTO / MERGE INTO / UPDATE / DELETE FROM / CREATE TABLE / ALTER TABLE получает commit; исходный regexp хранится в `P2_PATTERN` модуля |
+| P2 | Цель после INSERT INTO / MERGE INTO / UPDATE / DELETE FROM / CREATE TABLE / ALTER TABLE / DROP TABLE получает commit; исходный regexp хранится в `P2_PATTERN` модуля |
 | P3 | CTE вида WITH name AS (…) и последующие определения через запятую; односоставные ссылки на alias в его области видимости исключаются |
 | P4 | Три части — только iceberg.bronze.fotmob_*; две — добавить iceberg; одна — точное сопоставление discovery, без совпадения нет операции; неоднозначность — unparsed |
 
@@ -285,6 +291,19 @@ comma joins и неподдержанная грамматика дают `unpar
 Один завершающий `;` допустим. Счётчик `unparsed_queries` увеличивается;
 наличие имени discovered-таблицы в исходном тексте устанавливает
 `unparsed_fotmob=true`, в том числе если имя было внутри литерала.
+
+DDL контура разбирается по форме, без угадывания: `CREATE [OR REPLACE] VIEW
+имя AS SELECT|WITH …`, `CREATE TABLE IF NOT EXISTS имя (колонки) [WITH (…)]`,
+`CREATE TABLE имя (колонки) [WITH (…)]` и `DROP TABLE [IF EXISTS] имя`. Trino
+лишь анализирует определение представления и ensure-table no-op, поэтому они
+не дают ни скана, ни коммита; создание таблицы и DROP дают commit цели.
+Список колонок и тело представления не разбираются как отношения. Любые
+другие формы — `CASCADE`, параметры после `WITH`, `DROP VIEW`, `TRUNCATE`,
+`CREATE OR REPLACE TABLE`, `CREATE TABLE IF NOT EXISTS … AS SELECT` — дают
+`unparsed=true`. Имя в кавычках, совпадающее со скобкой, не открывает список
+колонок. CTAS со списком псевдонимов колонок (`CREATE TABLE имя (колонки) AS
+SELECT …`) разбирается как запрос, как и раньше. Эфемерный стейджинг
+`fotmob_*__stg_<hex>` исключён из норм и для этих команд.
 
 Producer никогда не исполняет SQL, который разбирает. S1/S2/S4 исключаются
 по содержанию: system/information_schema дают ноль source-сканов, независимо

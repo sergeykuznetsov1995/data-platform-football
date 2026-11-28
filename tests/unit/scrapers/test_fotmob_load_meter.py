@@ -97,6 +97,11 @@ def table_row(report, table=MATCHES, attr="src_fotmob"):
     ("ALTER TABLE iceberg.bronze.fotmob_matches EXECUTE optimize", {(MATCHES, "commit")}),
     ('SELECT * FROM "ICEBERG"."BRONZE"."FOTMOB_MATCHES"', {(MATCHES, "scan_read")}),
     ("EXPLAIN ANALYZE SELECT * FROM fotmob_matches", {(MATCHES, "scan_read")}),
+    # A column alias list keeps CTAS on the query path, with or without table
+    # properties or a comment before AS.
+    ("CREATE TABLE fotmob_matches (id) AS SELECT id FROM fotmob_ingest_manifest", {(MATCHES, "commit"), (MANIFEST, "scan_write")}),
+    ("CREATE TABLE fotmob_matches (id) WITH (format = 'PARQUET') AS SELECT id FROM fotmob_ingest_manifest", {(MATCHES, "commit"), (MANIFEST, "scan_write")}),
+    ("CREATE TABLE fotmob_matches (id) COMMENT 'c' AS SELECT id FROM fotmob_ingest_manifest", {(MATCHES, "commit"), (MANIFEST, "scan_write")}),
     ("SELECT * FROM fotmob_matches a JOIN fotmob_matches b ON a.id=b.id", {(MATCHES, "scan_read")}),
 ])
 def test_parser_operations(sql, operations):
@@ -133,7 +138,6 @@ def test_nested_cte_does_not_shadow_outer_real_table():
     "SELECT * FROM fotmob_matches /* unterminated",
     "SELECT * FROM fotmob_matches, fotmob_ingest_manifest",
     "SELECT * FROM UNNEST(fotmob_matches)",
-    "CREATE TABLE fotmob_matches (id bigint)",
     "CREATE TABLE IF NOT EXISTS fotmob_matches AS SELECT 1",
     "WITH RECURSIVE fotmob_matches AS (SELECT 1) SELECT * FROM fotmob_matches",
     "EXPLAIN ANALYZE INSERT INTO fotmob_matches VALUES (1)",
@@ -148,6 +152,104 @@ def test_one_terminator_is_not_multiple_statements():
     parsed = meter.parse_sql("SELECT * FROM fotmob_matches; -- final comment", TABLES)
     assert not parsed.unparsed
     assert parsed.operations == ((MATCHES, "scan_read"),)
+
+
+STAGE = MATCHES + "__stg_c5e98c2341f4"
+VIEW = MATCHES + "_current"
+KNOWN = [*TABLES, MATCHES + "_current", MATCHES + "__stg_c5e98c2341f4"]
+REPLACE_VIEW = (
+    f"CREATE OR REPLACE VIEW {VIEW} AS WITH committed AS (SELECT DISTINCT batch_id FROM {MANIFEST} "
+    f"WHERE status='success') SELECT * FROM {MATCHES} r JOIN committed c ON c.batch_id=r._target_batch_id"
+)
+PAYLOADS_VIEW = (
+    f"CREATE OR REPLACE VIEW iceberg.bronze.fotmob_match_payloads_current AS WITH keys AS ( "
+    f"SELECT CAST(competition_id AS VARCHAR) AS cid, array_agg(source_season_key) AS seasons "
+    f"FROM {VIEW} GROUP BY 1 ) SELECT r.* FROM iceberg.bronze.fotmob_match_payloads r "
+    f"CROSS JOIN UNNEST(k.seasons) AS d(season_key) WHERE d.season_key = r.source_season_key"
+)
+STAGE_DDL = f"CREATE TABLE {STAGE} ( deadline_day DATE, match_id VARCHAR ) WITH (partitioning = ARRAY['deadline_day'])"
+# Words that look like a query are opaque inside a column list or a literal.
+NESTED_AS_DDL = f"CREATE TABLE {STAGE} ( as_id BIGINT, b ROW(x BIGINT) ) WITH (partitioning = ARRAY['as select'])"
+ENSURE_MANIFEST = (
+    f"CREATE TABLE IF NOT EXISTS {MANIFEST} ( run_id VARCHAR, target_type VARCHAR, _ingested_at TIMESTAMP(6) ) "
+    "WITH (partitioning = ARRAY['target_type'])"
+)
+
+
+@pytest.mark.parametrize(("sql", "operations"), [
+    # Every publication republishes the current views. Trino only analyzes a
+    # view definition: it neither scans its sources nor commits anything.
+    (REPLACE_VIEW, set()),
+    (PAYLOADS_VIEW, set()),
+    (f"CREATE VIEW {VIEW} AS SELECT * FROM {MATCHES}", set()),
+    # The writer's ensure-table statement is a no-op once the table exists.
+    (ENSURE_MANIFEST, set()),
+    # Creating a table commits its first snapshot; the sealed writer creates
+    # and drops its own staging tables, and dropping a real table commits too.
+    (STAGE_DDL, {(STAGE, "commit")}),
+    (NESTED_AS_DDL, {(STAGE, "commit")}),
+    (f"CREATE TABLE {MATCHES} (id bigint)", {(MATCHES, "commit")}),
+    (f"DROP TABLE IF EXISTS {STAGE}", {(STAGE, "commit")}),
+    (f"DROP TABLE {MATCHES}", {(MATCHES, "commit")}),
+])
+def test_wave_ddl_is_parsed_without_inventing_work(sql, operations):
+    parsed = meter.parse_sql(sql, KNOWN)
+    assert not parsed.unparsed
+    assert set(parsed.operations) == operations
+
+
+@pytest.mark.parametrize("sql", [
+    "DROP TABLE IF EXISTS fotmob_unknown",
+    f"DROP TABLE IF EXISTS {STAGE} CASCADE",
+    f"DROP TABLE IF {STAGE}",
+    f"DROP VIEW {VIEW}",
+    f"CREATE OR REPLACE VIEW {VIEW} AS INSERT INTO {MATCHES} VALUES (1)",
+    f"CREATE OR REPLACE VIEW {VIEW} SELECT * FROM {MATCHES}",
+    "CREATE OR REPLACE VIEW fotmob_unknown AS SELECT 1",
+    "CREATE OR REPLACE TABLE fotmob_matches AS SELECT 1",
+    f"CREATE TABLE {MATCHES} (id bigint) ENGINE 'x'",
+    f"CREATE TABLE IF {MATCHES} (id bigint)",
+    "CREATE TABLE IF NOT EXISTS fotmob_unknown (id bigint)",
+    # A quoted identifier is one opaque token: it never opens a column list.
+    'CREATE TABLE fotmob_matches "(" ")"',
+    'CREATE TABLE IF NOT EXISTS fotmob_matches "("',
+    "TRUNCATE TABLE fotmob_matches",
+])
+def test_wave_ddl_variants_are_never_guessed(sql):
+    parsed = meter.parse_sql(sql, KNOWN)
+    assert parsed.unparsed and parsed.operations == ()
+    assert parsed.unparsed_fotmob is any(name.split(".")[-1] in sql for name in KNOWN)
+
+
+def test_reference_sql_keeps_ctas_with_aliased_columns_and_rejects_ensure_ctas():
+    clauses = " ".join(meter.S3_SQL.split())
+    ensure_ctas = r"^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b') AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'other'"
+    assert ensure_ctas in clauses
+    assert clauses.index("'other'") < clauses.index("'ensure_table'") < clauses.index("'ctas'") < clauses.index("'table_ddl'")
+
+
+def test_wave_publication_ddl_does_not_fail_an_otherwise_quiet_day():
+    spec = quiet_spec()
+    spec["tables"] = KNOWN
+    spec["queries"][5] = [
+        (REPLACE_VIEW, "src_fotmob"), (ENSURE_MANIFEST, "src_fotmob"),
+        (STAGE_DDL, "src_fotmob"), (f"DROP TABLE IF EXISTS {STAGE}", "src_fotmob"),
+    ]
+    _, report = report_for(spec, {MATCHES: 2})
+
+    assert report["unparsed_queries"] == 0 and not report["unparsed_fotmob"]
+    assert report["pass"] and report["pass_reasons"] == []
+    # A view only names its sources, an ensure-table no-op commits nothing,
+    # and staging work stays outside every norm and the commit reconciliation.
+    view = table_row(report, VIEW)
+    assert (view["commits"], view["scans_total"]) == (0, 0)
+    assert table_row(report, MANIFEST)["scans_total"] == 1
+    manifest = table_row(report, MANIFEST)
+    assert (manifest["commits"], manifest["scans_total"]) == (0, 1)
+    matches = table_row(report, MATCHES)
+    assert (matches["commits"], matches["scan_reads"], matches["scan_writes"]) == (2, 1, 2)
+    assert table_row(report, STAGE)["commits"] == 2
+    assert [(row["table"], row["sql_commits"]) for row in report["commit_checks"]] == [(MATCHES, 2)]
 
 
 def test_name_resolution_and_non_source_sql():
