@@ -299,15 +299,24 @@ def test_api_source_is_not_implemented():
 class _Writer:
     def __init__(self, manifest=None):
         self.created, self.written, self.manifest = [], [], manifest or []
+        self.catalog = "iceberg"
+        self.reads = []
 
     def create_table_if_not_exists(self, database, table, schema):
         self.created.append((database, table, schema))
 
-    def read_table(self, database, table, columns=None):
-        import pandas as pd
+    def _get_trino_manager(self):
+        writer = self
 
-        assert (database, table) == ("bronze", "clubelo_history_manifest")
-        return pd.DataFrame(self.manifest, columns=columns)
+        class Manager:
+            def execute_query(self, sql):
+                assert sql.endswith(" FROM iceberg.bronze.clubelo_history_manifest")
+                columns = [name.strip('"') for name in sql.removeprefix("SELECT ").removesuffix(
+                    " FROM iceberg.bronze.clubelo_history_manifest").split(", ")]
+                writer.reads.append(sql)
+                return [tuple(record[column] for column in columns) for record in writer.manifest]
+
+        return Manager()
 
     def write_dataframe(self, frame, database, table, **kwargs):
         self.written.append((database, table, frame, kwargs))
@@ -320,6 +329,9 @@ def test_iceberg_store_is_append_only_arrow_with_run_metadata():
     assert [(d, t) for d, t, _ in writer.created] == [("bronze", t) for t in history.WRITE_ORDER]
     assert writer.created[0][2].field("body").type == pa.binary()
     assert store.closed_slugs() == set(QUEUE) - set(CLUBS)
+    # One query per read: a repeated query closed unread is a failed query for Trino (#2132).
+    assert writer.reads == ['SELECT "slug", "status", "fetched_at", "_ingested_at"'
+                            " FROM iceberg.bronze.clubelo_history_manifest"]
 
     _, mem, _, _ = _run(_answers(), CLUBS)
     store.append(history.POINT_TABLE, mem.rows(history.POINT_TABLE))
@@ -411,18 +423,17 @@ def test_unexpected_parse_crash_fails_the_page_not_the_queue(monkeypatch):
 
 
 def test_known_slugs_on_an_empty_manifest():
-    """The real ``read_table`` returns ``pd.DataFrame()`` (no columns) for an
-    empty table — the first daily run before #1465 (Sol r1 #2, #1463)."""
+    """An empty table must not break the first daily run (Sol r1 #2, #1463)."""
 
-    import pandas as pd
-
-    writer = MagicMock()
-    writer.read_table.return_value = pd.DataFrame()
+    writer = _Writer()
     assert history.IcebergHistoryStore(writer).known_slugs() == set()
     assert history.IcebergHistoryStore(writer).closed_slugs() == set()
-    writer.read_table.return_value = pd.DataFrame(
-        [["Arsenal"], ["riverplate"], ["Arsenal"]], columns=["slug"])
+    writer.manifest = [{"slug": slug} for slug in ("Arsenal", "riverplate", "Arsenal")]
     assert history.IcebergHistoryStore(writer).known_slugs() == {"Arsenal", "riverplate"}
+    table = " FROM iceberg.bronze.clubelo_history_manifest"
+    assert writer.reads == ['SELECT "slug"' + table,
+                           'SELECT "slug", "status", "fetched_at", "_ingested_at"' + table,
+                           'SELECT "slug"' + table]
 
 
 @pytest.mark.parametrize("interval,expected", [(None, 1.0), ("2", 2.0), ("1.5", 1.5)])

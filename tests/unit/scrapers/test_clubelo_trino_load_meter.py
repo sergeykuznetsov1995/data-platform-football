@@ -74,14 +74,35 @@ def coverage(root, minutes=1440, *, day=DAY):
                        [(club.midnight(day) + n * 60,) for n in range(minutes)])
 
 
-def monitor(tmp_path, counts, *, day=DAY):
+def monitor(tmp_path, counts, *, day=DAY, sentinel=True):
     # A one-argument executable with the production CSV contract. Reject
     # writes, incorrect metadata names and inclusive/offset day boundaries.
+    # An int stands for that many Trino snapshots of unknown queries. A list
+    # gives the stored rows (operation, engine, trino_user, trino_query_id,
+    # dpf.operation, dpf.source) with missing trailing columns read as empty;
+    # a dict {"row": ..., "at": ..., "id": ..., "parent": ...} also fixes the
+    # snapshot identity. Snapshot ids and parents follow the list order.
     script = tmp_path / "read-only-client"
+    rows = {key: [dict(row, row=pad(row["row"])) if isinstance(row, dict) else pad(row) for row in value]
+            if isinstance(value, (list, tuple)) else
+            [("overwrite", "Trino", "src_clubelo", f"unmatched-{n}", "", "") for n in range(value)]
+            for key, value in counts.items()}
     script.write_text(
         f"#!{sys.executable}\n"
         "import csv, sys\n"
-        f"counts = {counts!r}\n"
+        f"counts = {rows!r}\n"
+        f"day = {day.isoformat()!r}\n"
+        f"sentinel = {sentinel!r}\n"
+        "def stored(key, rows):\n"
+        "    out, previous = [], ''\n"
+        "    for n, row in enumerate(rows):\n"
+        "        fixed = row.get('row', ()) if isinstance(row, dict) else row\n"
+        "        out.append((key, *fixed, str(row['id']) if isinstance(row, dict) and 'id' in row else str(n + 1),\n"
+        "                    row['parent'] if isinstance(row, dict) and 'parent' in row else previous,\n"
+        "                    row['at'] if isinstance(row, dict) and 'at' in row\n"
+        "                    else f'{day}T{n // 3600:02d}:{n // 60 % 60:02d}:{n % 60:02d}.000Z'))\n"
+        "        previous = out[-1][7]\n"
+        "    return out\n"
         "assert len(sys.argv) == 2\n"
         "sql = sys.argv[1]\n"
         "out = csv.writer(sys.stdout, quoting=csv.QUOTE_ALL)\n"
@@ -89,16 +110,32 @@ def monitor(tmp_path, counts, *, day=DAY):
         "    out.writerows((k,) for k in counts)\n"
         "else:\n"
         "    parts = sql.split(' UNION ALL ')\n"
-        "    assert len(parts) == len(counts)\n"
-        "    for part, key in zip(parts, sorted(counts)):\n"
-        "        assert part.startswith(f'''SELECT '{key}', count(*) FROM iceberg.bronze.\"{key}$snapshots\"''')\n"
+        f"    queried = [k for k in sorted(counts) if not __import__('re').fullmatch({club.STAGING.pattern!r}, k)]\n"
+        "    assert len(parts) == len(queried) + 1 and parts[-1] == \"SELECT '', '', '', '', '', '', '', '', '', ''\"\n"
+        "    for part, key in zip(parts, queried):\n"
+        "        assert part.startswith(f'''SELECT '{key}', operation, element_at(summary, 'engine-name'),"
+        "\\nelement_at(summary, 'trino_user'), element_at(summary, 'trino_query_id'), "
+        "element_at(summary, 'dpf.operation'),\\nelement_at(summary, 'dpf.source'), "
+        "cast(snapshot_id AS varchar), coalesce(cast(parent_id AS varchar), ''),\\nto_iso8601(committed_at)"
+        "\\nFROM iceberg.bronze.\"{key}$snapshots\"''')\n"
         f"        assert \"committed_at >= TIMESTAMP '{day} 00:00:00 UTC'\" in part\n"
-        f"        assert \"committed_at < TIMESTAMP '{day + club.DAY} 00:00:00 UTC'\" in part\n"
-        "        out.writerow((key, counts[key]))\n",
+        f"        assert \"committed_at < TIMESTAMP '{day + club.DAY} 01:00:00 UTC'\" in part\n"
+        "        out.writerows(stored(key, counts[key]))\n"
+        "    if sentinel:\n"
+        "        out.writerow(('',) * 10)\n",
         encoding="utf-8",
     )
     script.chmod(0o700)
     return script
+
+
+def pad(row):
+    # a stored row without its leading table name: six columns
+    return tuple(row) + ("",) * (6 - len(row))
+
+
+def trino_commit(query_id, user="src_clubelo", operation="overwrite"):
+    return (operation, "Trino", user, query_id, "", "")
 
 
 def test_receiver_mixed_primary_equivalence_and_redaction(tmp_path):
@@ -339,7 +376,7 @@ def test_daily_entrypoints_table_limits_and_attribution(tmp_path, n, capsys):
     sink.capture(event(3, reads=(SECOND,) * 2, sql=f"select * from bronze.{SECOND}"), NOW.isoformat())
     sink.capture(event(4, reads=(), output=TABLE, sql=f"insert into bronze.{TABLE} values (1)"), NOW.isoformat())
     coverage(root)
-    client = monitor(tmp_path, {TABLE: 1, SECOND: 0})
+    client = monitor(tmp_path, {TABLE: [trino_commit("20260301_120000_00004_wm2jf")], SECOND: 0})
     assert club.main(["aggregate", "--monitor", str(client), "--root", str(root), "--date", str(DAY)]) == 0
     report = json.loads((root / "daily" / f"{DAY}.json").read_text())
     verdict = "PASS" if n == 1440 else "VIOLATION"
@@ -350,7 +387,7 @@ def test_daily_entrypoints_table_limits_and_attribution(tmp_path, n, capsys):
     assert table["input_records_total"] == n
     assert table["input_records"]["source"] == n - 1
     assert table["input_records"]["monitor"] == 1
-    assert table["successful_outputs"]["source"] == table["snapshots"] == 1
+    assert table["successful_outputs"]["source"] == table["snapshots"] == table["trino_snapshots"] == 1
     assert report["tables"][SECOND]["input_records_total"] == 2
     assert club.main(["render", "--root", str(root)]) == 0
     assert f"Trino clubelo {DAY} {verdict}" in capsys.readouterr().out
@@ -402,20 +439,23 @@ def test_shared_airflow_never_passes_and_outputs_violate(tmp_path):
     sink.capture(event(), NOW.isoformat())
     sink.capture(event(2, user="airflow"), NOW.isoformat())
     coverage(tmp_path)
+    evidence = {"stable": True, "tables": {TABLE: club.empty_evidence()}}
     with club.database(tmp_path) as db:
-        report = club.summarize(db, DAY, {"stable": True, "counts": {TABLE: 0}})
+        report = club.summarize(db, DAY, evidence)
     assert report["verdict"] == "INCOMPLETE"
     assert report["incomplete"] == ["unattributed_airflow_read"] and report["violations"] == []
     counts = report["tables"][TABLE]["input_records"]
     assert (counts["source"], counts["monitor"], counts["airflow"]) == (1, 0, 1)
     sink.capture(event(3, user="airflow", reads=(TABLE,) * 1438, output=TABLE), NOW.isoformat())
+    evidence["tables"][TABLE] = {**club.empty_evidence(), "snapshots": 1, "trino": 1, "users": {"airflow": 1},
+                                 "query_ids": ["20260301_120000_00003_wm2jf"]}
     with club.database(tmp_path) as db:
-        report = club.summarize(db, DAY, {"stable": True, "counts": {TABLE: 1}})
+        report = club.summarize(db, DAY, evidence)
     assert report["verdict"] == "VIOLATION" and report["violations"] == ["airflow_table_use"]
     assert report["tables"][TABLE]["successful_outputs"]["airflow"] == 1
     sink.capture(event(4, user="airflow"), NOW.isoformat())
     with club.database(tmp_path) as db:
-        report = club.summarize(db, DAY, {"stable": True, "counts": {TABLE: 1}})
+        report = club.summarize(db, DAY, evidence)
     assert report["violations"] == ["airflow_table_use", "input_record_limit"]
 
 
@@ -433,6 +473,289 @@ def test_missing_completion_missing_query_id_and_disappearing_table(tmp_path):
     report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: 0}))
     assert "missing_table_evidence" in report["incomplete"]
     assert report["tables"][SECOND]["snapshots"] is None
+
+
+def test_staging_lifecycle_and_table_metadata_are_not_table_activity(tmp_path):
+    base = "clubelo_result"
+    stage = f"{base}__stg_0123456789ab"
+    qualified = f"iceberg.bronze.{base}"
+    routine = [
+        (f"DESCRIBE {qualified}", None), (f"SHOW COLUMNS FROM {qualified}", None),
+        (f"SHOW CREATE TABLE {qualified}", None),
+        (f"CREATE TABLE iceberg.bronze.{stage} AS SELECT *, CAST(NULL AS VARCHAR) AS \"replace_op\" "
+         f"FROM {qualified} WHERE false", stage),
+        (f"INSERT INTO iceberg.bronze.{stage} (match_date) VALUES (DATE '2026-11-27')", stage),
+        (f"SELECT count(*) FROM iceberg.bronze.{stage}", None),
+        (f"DROP TABLE IF EXISTS iceberg.bronze.{stage}", None),
+    ]
+    for sql, output in routine:
+        reads = (stage,) if sql.startswith("SELECT") else ()
+        assert club.classify(event(reads=reads, output=output, sql=sql), None) is None, sql
+    # The real write: the staging side of the merge is not a Bronze table scan.
+    merge = event(reads=(base, stage), output=base,
+                  sql=f"MERGE INTO {qualified} t USING iceberg.bronze.{stage} s ON t.match_date = s.match_date "
+                      f"WHEN NOT MATCHED THEN INSERT VALUES (1)")
+    facts = club.classify(merge, None)
+    assert facts["actor"] == "source" and facts["reads"] == {base: 1} and facts["outputs"] == [base]
+    assert not facts["uncertain"] and not facts["maintenance"]
+    root = tmp_path / "club"
+    club.Sink(root).capture(merge, NOW.isoformat())
+    assert [name for name, in query(root, "SELECT name FROM inventory")] == [base]
+    # A staging copy that really reads the table is a scan.
+    loaded = club.classify(event(reads=(base,), output=stage,
+                                 sql=f"CREATE TABLE iceberg.bronze.{stage} AS SELECT * FROM {qualified}"), None)
+    assert loaded["reads"] == {base: 1} and loaded["outputs"] == []
+    # A write into the Bronze table is never dropped, whatever else the statement names.
+    into = club.classify(event(reads=(stage,), output=base,
+                               sql=f"INSERT INTO {qualified} SELECT * FROM iceberg.bronze.{stage}"), None)
+    assert into["outputs"] == [base] and into["reads"] == {} and not into["uncertain"]
+    # A statement that names a staging table and reads another data table is not routine.
+    mixed = event(reads=(), sql=f"SELECT * FROM iceberg.bronze.{stage} s JOIN iceberg.other.dim_match d ON s.k = d.k")
+    mixed["ioMetadata"]["inputs"] = [physical(stage), physical("dim_match", schema="other")]
+    assert club.classify(mixed, None)["uncertain"]
+    # Dropping a Bronze table is not routine for the source.
+    assert club.classify(event(reads=(), sql=f"DROP TABLE {qualified}"), None)["uncertain"]
+
+
+def test_platform_maintenance_is_ddl_not_airflow_table_use(tmp_path):
+    root = tmp_path / "club"
+    sink = club.Sink(root)
+    expire = "ALTER TABLE iceberg.bronze.\"clubelo_ratings\" EXECUTE expire_snapshots(retention_threshold => '7d')"
+    facts = club.classify(event(reads=(), output=TABLE, user="airflow", sql=expire), None)
+    assert facts["actor"] == "airflow" and facts["outputs"] == [TABLE] and facts["maintenance"]
+    assert not facts["uncertain"] and not club.event_violations(facts)
+    sink.capture(event(), NOW.isoformat())
+    sink.capture(event(5, reads=(), output=TABLE, user="airflow", sql=expire), NOW.isoformat())
+    coverage(root)
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: []}))
+    assert report["verdict"] == "PASS" and report["incomplete"] == []
+    assert report["tables"][TABLE]["output_queries"]["airflow"] == 1
+    # A data write or another DDL by the shared account is still a violation.
+    for sql in (f"INSERT INTO iceberg.bronze.{TABLE} VALUES (1)",
+                f"ALTER TABLE iceberg.bronze.{TABLE} ADD COLUMN extra varchar"):
+        facts = club.classify(event(reads=(), output=TABLE, user="airflow", sql=sql), None)
+        assert not facts["maintenance"] and club.event_violations(facts) == {"airflow_table_use"}
+
+
+def test_snapshots_are_attributed_by_the_committing_engine(tmp_path):
+    root = tmp_path / "club"
+    sink = club.Sink(root)
+    sink.capture(event(), NOW.isoformat())
+    coverage(root)
+    bulk = [("delete", "", "", "", ""),
+            ("append", "", "", "", "replace-identity-partition-batch")]
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: bulk}))
+    assert report["verdict"] == "PASS"
+    assert (report["tables"][TABLE]["snapshots"], report["tables"][TABLE]["trino_snapshots"],
+            report["tables"][TABLE]["catalog_snapshots"]) == (2, 0, 2)
+    unattributed = {"unattributed_snapshot_or_output"}
+    # ClubElo's plain bulk append carries the source stamp (clubelo_raw_page).
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("append", "", "", "", "bulk-arrow-append", "clubelo")]}))
+    assert report["verdict"] == "PASS" and report["tables"][TABLE]["catalog_snapshots"] == 1
+    # Missing evidence, not a verdict: a Trino commit whose query was not stored
+    # and a Trino commit without its query id.
+    for rows in ([trino_commit("20260301_120000_00009_wm2jf")], [("overwrite", "Trino", "src_clubelo", "", "")]):
+        report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: rows}))
+        assert report["verdict"] == "INCOMPLETE" and unattributed <= set(report["incomplete"]), rows
+    # Not the source's output: an append without the source stamp, a shape no known
+    # writer produces, another engine, another principal.
+    for rows in ([("append", "", "", "", "")], [("append", "", "", "", "bulk-arrow-append", "other-source")],
+                 [("overwrite", "", "", "", "")], [("append", "spark-3.5", "bob", "", "")],
+                 [trino_commit("20260301_120000_00009_wm2jf", user="bob")]):
+        report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: rows}))
+        assert report["verdict"] == "VIOLATION" and "non_source_output" in report["violations"], rows
+    # A query id is matched per table: the write to one table cannot stand in for a
+    # commit to another. (SECOND is now a known table and needs its evidence too.)
+    sink.capture(event(4, reads=(), output=TABLE, sql=f"insert into bronze.{TABLE} values (1)"), NOW.isoformat())
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [], SECOND: [trino_commit("20260301_120000_00004_wm2jf")]}))
+    assert unattributed <= set(report["incomplete"])
+    assert report["tables"][SECOND]["trino_snapshots"] == 1
+    assert not any(report["tables"][SECOND]["successful_outputs"].values())
+    # A successful data write is matched to its committed snapshot by query id.
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: bulk, SECOND: []}))
+    assert unattributed <= set(report["incomplete"])
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [trino_commit("20260301_120000_00004_wm2jf")], SECOND: []}))
+    assert report["verdict"] == "PASS" and report["incomplete"] == []
+
+
+def test_stored_report_without_a_table_in_its_evidence_never_renders_pass(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    club.aggregate(root, DAY, monitor(tmp_path, {TABLE: []}))
+    assert " PASS " in club.render(root)
+    path = root / "daily" / f"{DAY}.json"
+    for tables in ({}, {SECOND: club.empty_evidence()}):
+        report = json.loads(path.read_text())
+        report["snapshot_evidence"]["tables"] = tables
+        path.write_text(json.dumps(report))
+        assert " PASS " not in club.render(root)
+
+
+def test_describe_hides_no_write():
+    assert club.classify(event(reads=(), sql=f"DESCRIBE iceberg.bronze.{TABLE}"), None) is None
+    two = f"DESCRIBE iceberg.bronze.{TABLE}; DROP TABLE iceberg.bronze.{TABLE}"
+    for user in ("src_clubelo", "airflow"):
+        assert club.classify(event(reads=(), sql=two, user=user), None)["uncertain"]
+    dropped = club.classify(event(reads=(), output=TABLE, user="airflow", sql=two), None)
+    assert dropped["outputs"] == [TABLE] and club.event_violations(dropped) == {"airflow_table_use"}
+
+
+def test_legacy_facts_with_staging_tables_do_not_break_the_report(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    stage = f"{TABLE}__stg_0123456789ab"
+    with club.database(root) as db:
+        db.execute("INSERT INTO inventory VALUES (?,?)", (stage, str(DAY)))
+        db.execute("INSERT INTO events VALUES (?,?,?,?)", ("f" * 64, str(DAY), "a" * 64, json.dumps(
+            {"actor": "source", "reads": {stage: 1}, "outputs": [stage], "finished": True, "uncertain": True})))
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: []}))
+    assert stage not in report["tables"] and "missing_table_evidence" not in report["incomplete"]
+    assert report["tables"][TABLE]["input_records_total"] == 1
+
+
+BATCH = ("append", "", "", "", "replace-identity-partition-batch")
+DELETE = ("delete", "", "", "", "")
+
+
+def test_only_the_delete_half_of_a_replace_batch_is_a_catalog_commit(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    non_source = ("VIOLATION", ["non_source_output"])
+    # A delete that no replace batch closes is a writer the source cannot own.
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [DELETE]}))
+    assert (report["verdict"], report["violations"]) == non_source
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [DELETE, ("append", "", "", "", "bulk-arrow-append", "clubelo")]}))
+    assert (report["verdict"], report["violations"]) == non_source
+    # A batch may cross midnight: the delete belongs to the day, its append to the next one.
+    closing = {"row": BATCH, "at": f"{DAY + club.DAY}T00:00:00.500Z"}
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [{"row": DELETE, "at": f"{DAY}T23:59:59.500Z"}, closing]}))
+    assert report["verdict"] == "PASS"
+    assert (report["tables"][TABLE]["snapshots"], report["tables"][TABLE]["catalog_snapshots"]) == (1, 1)
+
+
+def test_a_staging_table_left_in_the_catalog_is_not_a_bronze_table(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    stage = f"{TABLE}__stg_0123456789ab"
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [], stage: []}))
+    assert report["verdict"] == "PASS"
+    assert stage not in report["tables"] and stage not in report["snapshot_evidence"]["tables"]
+    assert " PASS " in club.render(root)
+
+
+def test_the_empty_staging_copy_drops_nothing_else():
+    stage = f"{TABLE}__stg_0123456789ab"
+    ctas = f"CREATE TABLE iceberg.bronze.{stage} AS SELECT * FROM iceberg.bronze.{TABLE} WHERE false"
+    assert club.classify(event(reads=(), sql=ctas), None) is None
+    # a real Bronze output, another data table, a broken input list, another actor
+    assert club.classify(event(reads=(), output=TABLE, sql=ctas), None)["outputs"] == [TABLE]
+    other = event(reads=(), sql=ctas)
+    other["ioMetadata"]["inputs"] = [physical("dim_match", schema="other")]
+    assert club.classify(other, None)["uncertain"]
+    broken = event(reads=(), sql=ctas)
+    broken["ioMetadata"]["inputs"] = "not-a-list"
+    assert club.classify(broken, None)["uncertain"]
+    foreign = club.classify(event(reads=(), sql=ctas, user="airflow"), None)
+    assert foreign["actor"] == "airflow" and foreign["uncertain"]
+
+
+def test_a_trino_commit_without_its_query_id_keeps_its_principal(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("overwrite", "Trino", "bob", "", "")]}))
+    assert report["verdict"] == "VIOLATION" and "non_source_output" in report["violations"]
+    assert "unattributed_snapshot_or_output" in report["incomplete"]
+    # Such a day still renders its verdict; it is not hidden as an unavailable report.
+    assert " VIOLATION non_source_output " in club.render(root)
+    club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("overwrite", "Trino", "src_clubelo", "", "")]}))
+    assert " INCOMPLETE unattributed_snapshot_or_output " in club.render(root)
+
+
+def test_a_delete_is_closed_only_by_a_replace_batch_of_its_own_table(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    delete = {"row": DELETE, "id": "77", "at": f"{DAY}T10:00:00.000Z"}
+    # the same parent id on another table
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [delete], SECOND: [{"row": BATCH, "id": "88", "parent": "77"}]}))
+    assert report["tables"][TABLE]["snapshots"] == 1 and report["verdict"] == "VIOLATION"
+    assert report["violations"] == ["non_source_output"]
+    # a Trino commit that merely carries the stamp
+    other = {"row": ("append", "Trino", "src_clubelo", "20260301_120000_00005_wm2jf", "replace-identity-partition-batch"),
+             "id": "88", "parent": "77"}
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [delete, other]}))
+    assert report["verdict"] == "VIOLATION" and report["violations"] == ["non_source_output"]
+
+
+def test_snapshot_evidence_needs_the_sentinel_row(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: []}, sentinel=False))
+    assert report["verdict"] == "INCOMPLETE" and "snapshot_evidence" in report["incomplete"]
+    assert report["tables"][TABLE]["snapshots"] is None
+
+
+def test_stored_evidence_must_be_internally_consistent(tmp_path):
+    root = tmp_path / "club"
+    sink = club.Sink(root)
+    sink.capture(event(), NOW.isoformat())
+    sink.capture(event(4, reads=(), output=TABLE, sql=f"insert into bronze.{TABLE} values (1)"), NOW.isoformat())
+    coverage(root)
+    club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [trino_commit("20260301_120000_00004_wm2jf")]}))
+    assert " PASS " in club.render(root)
+    path = root / "daily" / f"{DAY}.json"
+    for change in ({"snapshots": 0}, {"trino": 0}, {"users": {"src_clubelo": 0}},
+                   {"users": {"src_clubelo": 2}}, {"users": {"bob": 1}}):
+        report = json.loads(path.read_text())
+        report["snapshot_evidence"]["tables"][TABLE].update(change)
+        path.write_text(json.dumps(report))
+        assert " PASS " not in club.render(root), change
+
+
+def test_show_tables_with_a_pattern_is_metadata():
+    for sql in (f"SHOW TABLES FROM iceberg.bronze LIKE '{TABLE}'",
+                "SHOW TABLES FROM iceberg.bronze LIKE 'clubelo\\_r%' ESCAPE '\\'",
+                "SHOW SCHEMAS FROM iceberg LIKE 'bronze'", "SHOW TABLES FROM iceberg.bronze"):
+        assert club.classify(event(reads=(), sql=sql), None) is None, sql
+    two = f"SHOW TABLES FROM iceberg.bronze LIKE '{TABLE}'; DROP TABLE iceberg.bronze.{TABLE}"
+    assert club.classify(event(reads=(), sql=two), None)["uncertain"]
+
+
+def test_maintenance_exempts_one_procedure_call_only():
+    expire = f"ALTER TABLE iceberg.bronze.{TABLE} EXECUTE expire_snapshots(retention_threshold => '7d')"
+    optimize = (f"ALTER TABLE iceberg.\"bronze\".\"{TABLE}\" EXECUTE optimize(file_size_threshold => '128MB') "
+                f"WHERE \"$path\" IN ('s3://a/b.parquet', 's3://a/c.parquet')")
+    for sql in (expire, expire + ";", optimize):
+        facts = club.classify(event(reads=(), output=TABLE, user="airflow", sql=sql), None)
+        assert facts["maintenance"] and not club.event_violations(facts), sql
+    for tail in (f"; DROP TABLE iceberg.bronze.{TABLE}",
+                 f" WHERE 1=1; INSERT INTO iceberg.bronze.{TABLE} VALUES (1)"):
+        facts = club.classify(event(reads=(), output=TABLE, user="airflow", sql=expire + tail), None)
+        assert not facts["maintenance"] and club.event_violations(facts) == {"airflow_table_use"}
+    for sql in (f"ALTER TABLE iceberg.bronze.{TABLE} EXECUTE drop_table()",
+                f"ALTER TABLE iceberg.bronze.{TABLE} ADD COLUMN extra varchar"):
+        assert not club.classify(event(reads=(), output=TABLE, user="airflow", sql=sql), None)["maintenance"]
+
+
+def test_legacy_facts_that_only_touch_a_staging_table_are_no_activity(tmp_path):
+    root = tmp_path / "club"
+    stage = f"{TABLE}__stg_0123456789ab"
+    club.initialize(root)
+    coverage(root)
+    with club.database(root) as db:
+        db.executemany("INSERT INTO events VALUES (?,?,?,?)", [
+            (letter * 64, str(DAY), "a" * 64, json.dumps({"actor": actor, "reads": {stage: 1}, "outputs": [],
+                                                          "finished": True, "uncertain": False}))
+            for letter, actor in (("a", "source"), ("b", "airflow"))])
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: []}))
+    assert "no_source_activity" in report["incomplete"]
+    assert not {"unattributed_airflow_read", "input_record_limit"} & (set(report["incomplete"]) | set(report["violations"]))
 
 
 @pytest.fixture
@@ -662,7 +985,7 @@ def test_monitor_failure_and_validation(tmp_path):
     report = club.aggregate(root, DAY, tmp_path / "missing-client")
     assert report["verdict"] == "INCOMPLETE" and "snapshot_evidence" in report["incomplete"]
     client = monitor(tmp_path, {'bad";SELECT 2': 10})
-    assert club.aggregate(root, DAY, client)["snapshot_evidence"]["counts"] == {}
+    assert club.aggregate(root, DAY, client)["snapshot_evidence"]["tables"] == {}
     assert club.main(["aggregate", "--root", str(root), "--monitor", str(client), "--date", "';bad"]) == 1
 
 

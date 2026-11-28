@@ -1,0 +1,79 @@
+--- a/morning_report.py
++++ b/morning_report.py
+@@ -226,13 +226,13 @@
+     return None
+
+
+-def _trino_row(sql, timeout=240):
++def _trino_row(sql, timeout=240, client=None):
+     """Первая непустая строка ответа Trino — списком полей без кавычек; None, если
+     Trino недоступен, запрос упал или не уложился в timeout.
+
+     Отличается от run(): та возвращает "" и при падении, и при пустом ответе."""
+     try:
+-        r = subprocess.run([TRINO, sql], capture_output=True, text=True, timeout=timeout)
++        r = subprocess.run([client or TRINO, sql], capture_output=True, text=True, timeout=timeout)
+     except Exception:
+         return None
+     if r.returncode != 0:
+@@ -244,12 +244,12 @@
+     return None
+
+
+-def _trino_rows(sql, timeout=240):
++def _trino_rows(sql, timeout=240, client=None):
+     """Все непустые строки ответа Trino — списками полей без кавычек; None, если
+     Trino недоступен, запрос упал или не уложился в timeout. Пустой ответ обёртка
+     trino-ro.sh считает падением, поэтому запрос обязан вернуть хотя бы одну строку."""
+     try:
+-        r = subprocess.run([TRINO, sql], capture_output=True, text=True, timeout=timeout)
++        r = subprocess.run([client or TRINO, sql], capture_output=True, text=True, timeout=timeout)
+     except Exception:
+         return None
+     if r.returncode != 0:
+@@ -3787,6 +3787,8 @@
+ CLUBELO_LOOKBACK_DAYS = 60
+ CLUBELO_SENTINEL = "__sentinel__"
+ CLUBELO_TABLES = ("clubelo_rank_snapshot", "clubelo_raw_page", "clubelo_history_manifest")
++# Чтения bronze секцией — от src_clubelo (#2132): счётчик Trino относит их к источнику.
++CLUBELO_TRINO = "/root/watchdog/clubelo_trino_ro.sh"
+ CLUBELO_DATES_SQL = """WITH raw AS (
+   SELECT rating_date, min(fetched_at) AS first_seen FROM iceberg.bronze.clubelo_raw_page
+   WHERE page = '/Ranking' AND rating_date IS NOT NULL AND rating_date >= DATE '{lo}'
+@@ -3825,7 +3827,8 @@
+
+ def _clubelo_rows(sql, width, sentinel):
+     """Строки Trino без строки-заглушки; None — запрос упал / не разобран (как _espn_rows)."""
+-    rows = _trino_rows(f"SELECT * FROM ({sql}) q UNION ALL SELECT '{CLUBELO_SENTINEL}', {sentinel}")
++    rows = _trino_rows(f"SELECT * FROM ({sql}) q UNION ALL SELECT '{CLUBELO_SENTINEL}', {sentinel}",
++                       client=CLUBELO_TRINO)
+     if rows is None:
+         return None
+     rows = [r for r in rows if r and r[0] != CLUBELO_SENTINEL]
+@@ -4021,7 +4024,7 @@
+     try:
+         r = subprocess.run(
+             [CLUBELO_COVERAGE_PY, CLUBELO_HISTORY_COVERAGE_MODULE,
+-             "--trino", TRINO, "--today", now.date().isoformat()],
++             "--trino", CLUBELO_TRINO, "--today", now.date().isoformat()],
+             capture_output=True, text=True, timeout=CLUBELO_COVERAGE_TIMEOUT_S)
+         out = r.stdout.strip().splitlines()
+         rep = json.loads(out[-1]) if r.returncode == 0 and len(out) >= 2 else None
+@@ -4070,7 +4073,7 @@
+     series = _clubelo_series(dates, fetches, naive, frozen, first_full, rules)
+     history_line, history_bad = _clubelo_history_coverage(now)
+     cut = (naive - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+-    wire_row = _trino_row(CLUBELO_BYTES_SQL.format(cut=cut))
++    wire_row = _trino_row(CLUBELO_BYTES_SQL.format(cut=cut), client=CLUBELO_TRINO)
+     wire = int(wire_row[0]) if wire_row and wire_row[0].isdigit() else None
+     line = _clubelo_format(dates, series, history_line, history_bad, wire, frozen, rules)
+     if "--dry-run" not in sys.argv:
+@@ -4099,7 +4102,7 @@
+
+ class _ClubeloDqTrino:
+     def execute_query(self, sql):
+-        rows = _trino_rows(sql)
++        rows = _trino_rows(sql, client=CLUBELO_TRINO)
+         if rows is None:
+             raise RuntimeError("trino")
+         out = []

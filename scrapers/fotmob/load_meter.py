@@ -1055,28 +1055,48 @@ def _load_maintenance_registry(path: Path) -> Any:
         return {}  # Present but unusable. Aggregate publishes the diagnostic day.
 
 
+ROTATE_INTERVAL = timedelta(hours=1)
+_rotated_at: dict[str, datetime] = {}
+
+
 def _rotate(root: Path, now: datetime) -> None:
     cutoff = (now - timedelta(days=35)).date()
+    # One raw file is appended per kept event, so "raw" grows by tens of
+    # thousands of entries a day. A long-running receiver sweeps a root at
+    # most once an hour; one-shot cron callers keep their per-run sweep.
+    stamp = (now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+    last = _rotated_at.get(str(root))
+    if last is not None and last <= stamp < last + ROTATE_INTERVAL:
+        return
     for folder in ("raw", "minute", "day", "verdict"):
         directory = root / folder
         if not directory.exists():
             continue
-        for path in directory.iterdir():
-            if path.is_symlink() or not path.is_file():
-                continue
-            raw_match = re.fullmatch(r"(\d{8})-\d{6}-[A-Za-z0-9_]+\.jsonl", path.name) if folder == "raw" else None
-            daily_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.jsonl?", path.name) if folder != "raw" else None
-            try:
-                if raw_match:
-                    file_day = datetime.strptime(raw_match[1], "%Y%m%d").date()
-                elif daily_match:
-                    file_day = date.fromisoformat(daily_match[1])
-                else:
+        # Owned names start with a zero-padded day, so the lexical order of
+        # that prefix is the day order. A newer prefix is skipped before any
+        # stat: a directory of recent files costs one readdir.
+        floor = cutoff.strftime("%Y%m%d") if folder == "raw" else cutoff.isoformat()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name[:len(floor)] > floor:
                     continue
-            except ValueError:
-                continue
-            if file_day < cutoff:
-                path.unlink()
+                path = Path(entry.path)
+                if entry.is_symlink() or not entry.is_file():
+                    continue
+                raw_match = re.fullmatch(r"(\d{8})-\d{6}-[A-Za-z0-9_]+\.jsonl", path.name) if folder == "raw" else None
+                daily_match = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.jsonl?", path.name) if folder != "raw" else None
+                try:
+                    if raw_match:
+                        file_day = datetime.strptime(raw_match[1], "%Y%m%d").date()
+                    elif daily_match:
+                        file_day = date.fromisoformat(daily_match[1])
+                    else:
+                        continue
+                except ValueError:
+                    continue
+                if file_day < cutoff:
+                    path.unlink()
+    _rotated_at[str(root)] = stamp
 
 
 def poll(root: Path = DEFAULT_ROOT, *, poll_interval_s: int = 60, qualification: Mapping[str, Any] | None = None, discover_only: bool = False, snapshot_day: str | None = None, snapshot_tables: Sequence[str] = ()) -> dict[str, Any]:
