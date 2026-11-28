@@ -303,6 +303,11 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--denominator", type=Path)
     parser.add_argument("--samples-json", type=Path)
+    parser.add_argument(
+        "--refusals-state",
+        type=Path,
+        help="gateway refusal counters; adds the day's refusals per 100 requests",
+    )
     args = parser.parse_args(argv)
     day, as_of = report_clock(args.day, args.as_of)
     output = morning_report(
@@ -313,6 +318,17 @@ def main(argv=None) -> int:
         args.denominator,
         args.samples_json,
     )
+    if args.refusals_state is not None:
+        from scrapers.transfermarkt.streams import refusal_rate
+
+        # None for a day the gateway counted no requests: no rate is invented.
+        counted = refusal_rate(args.refusals_state, day.isoformat()) or {}
+        output["source_refusals"] = {
+            "day": day.isoformat(),
+            "requests": counted.get("requests"),
+            "refusals": counted.get("refusals"),
+            "per_100": counted.get("per_100"),
+        }
     print(json.dumps(output, ensure_ascii=False))
     return int(output["report"] is None)
 

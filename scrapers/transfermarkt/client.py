@@ -361,6 +361,7 @@ class ProxyFilterLeaseProvider:
         self._monotonic = monotonic_fn
         self._stream_lease = None
         self._last_permit_request = None
+        self.probe_permit_id = None
 
     def _admission_timeout(self) -> float:
         if self.request_deadline_monotonic is None:
@@ -543,6 +544,8 @@ class ProxyFilterLeaseProvider:
         if consumed.get("consumed") is not True or consumed.get("permit_id") != permit_id:
             raise TrafficMeterError("request permit was not consumed")
         self._last_permit_request = {**payload, 'permit_id': permit_id}
+        # A gateway that held the source admits this request as its one probe.
+        self.probe_permit_id = permit_id if granted.get('probe') is True else None
         return permit_id
 
     def report_site_block(self, *, status: int, challenge: bool):
@@ -557,6 +560,27 @@ class ProxyFilterLeaseProvider:
         body = self._request('POST', '/v1/transfermarkt/request-permits/site-block', payload=proof)
         if body.get('recorded') is not True:
             raise TrafficMeterError('site feedback was not durably recorded')
+
+    def report_probe_passed(self):
+        """Tell the gateway its one probe reached the source and was heard.
+
+        A gateway without source stops answers 404; the probe then counts as
+        heard once that gateway's own wait runs out.
+        """
+        if self._stream_lease is None or not self._stream_lease.stream_id:
+            return
+        if self._last_permit_request is None:
+            raise TrafficMeterError('site feedback has no consumed request permit')
+        proof = dict(self._last_permit_request)
+        proof.update(lease_id=self._stream_lease.lease_id,
+                     lease_token=self._stream_lease.token)
+        status, body = self._exchange(
+            'POST', '/v1/transfermarkt/request-permits/probe-ok', payload=proof)
+        if status == 404:
+            return
+        body = self._accepted('POST', '/v1/transfermarkt/request-permits/probe-ok', status, body)
+        if body.get('recorded') is not True:
+            raise TrafficMeterError('probe feedback was not durably recorded')
 
     def acquire(
         self,
@@ -996,6 +1020,23 @@ class TransfermarktHttpClient:
     # ------------------------------------------------------------------
     # Client/proxy lifecycle
     # ------------------------------------------------------------------
+
+    def _settle_probe(self):
+        """Tell the gateway that its one probe reached the source and was heard.
+
+        A refusal never comes here: the ordinary site feedback reports it and
+        holds the source again.  The gateway's own wait ends the probe anyway,
+        so a failed report costs time, never a request.
+        """
+        provider = self._lease_provider
+        permit_id = getattr(provider, 'probe_permit_id', None)
+        if not permit_id:
+            return
+        provider.probe_permit_id = None
+        try:
+            provider.report_probe_passed()
+        except Exception as exc:  # noqa: BLE001 - control-plane feedback only
+            logger.warning("could not report the source probe: %s", redact_sensitive(exc))
 
     def _report_site_block(self, status: int, *, challenge: bool):
         report = getattr(self._lease_provider, 'report_site_block', None)
@@ -2316,6 +2357,7 @@ class TransfermarktHttpClient:
                                     cache_generation=cache_generation,
                                     outcome=outcome,
                                 )
+                                self._settle_probe()
                                 return outcome
                     else:
                         value = self._decode_body(body, as_json=False)
@@ -2382,6 +2424,7 @@ class TransfermarktHttpClient:
                                 cache_generation=cache_generation,
                                 outcome=outcome,
                             )
+                            self._settle_probe()
                             return outcome
 
                     # Only an actual challenge merits another paid attempt on

@@ -481,6 +481,8 @@ class TransfermarktPermitDecision:
     retry_after_seconds: float
     granted_at: float | None
     expires_at: float | None
+    # True only for the one request a source stop lets through as its probe.
+    probe: bool = False
 
 
 @dataclass
@@ -494,6 +496,7 @@ class _TransfermarktPermitTicket:
     created_at: float
     granted_at: float | None = None
     consumed_at: float | None = None
+    probe: bool = False
 
 
 class TransfermarktRequestPermitController:
@@ -765,6 +768,7 @@ class TransfermarktRequestPermitController:
                 if ticket.granted_at is not None
                 else None
             ),
+            probe=granted and ticket.probe,
         )
 
     def consume(
@@ -815,16 +819,21 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
     """Dedicated TM slots; the shared gateway retains its existing controller."""
 
     def __init__(self, *, streams, state_path=None, clock=time.time, **kwargs):
-        from scrapers.transfermarkt.streams import StreamRateState
+        from scrapers.transfermarkt.streams import RefusalCounters, SourceStopState, StreamRateState
 
         super().__init__(requests_per_minute=streams.requests_per_minute,
                          clock=clock, state_path=None, **kwargs)
         self.streams = streams
         self.state_path = str(state_path or '')
         self.stream_state_path = self.state_path + '.streams-v2' if self.state_path else ''
+        self.stop_path = self.state_path + '.source-stop' if self.state_path else ''
+        self.refusals_path = self.state_path + '.refusals' if self.state_path else ''
         self._active_stream = 'current-0'
         self._feedback = {}
         self._durable_feedback = set()
+        self._applied = set()          # consumed attempts whose effect was applied to memory
+        self._requesting = None        # the ticket asking for a permit right now
+        self._resume_pending = False
         saved = None
         legacy = None
         if self.state_path and os.path.lexists(self.state_path):
@@ -860,7 +869,55 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
                     self.rate.last = {key: max(value, last) for key, value in self.rate.last.items()}
         except ValueError:
             raise RuntimeError('Transfermarkt permit state is corrupt') from None
+        saved_stop = None
+        if self.stop_path and os.path.lexists(self.stop_path):
+            try:
+                saved_stop = json.loads(_require_private_regular_file(
+                    self.stop_path, allow_empty=False, max_bytes=4096))
+            except (ValueError, RuntimeError):
+                raise RuntimeError('Transfermarkt source stop state is corrupt') from None
+        try:
+            # Its own sidecar keeps the record apart from the v2 rate state: an
+            # older gateway ignores it and still honours the hold in the pause.
+            self.stop = SourceStopState(saved_stop)
+        except ValueError:
+            raise RuntimeError('Transfermarkt source stop state is corrupt') from None
+        saved_refusals = None
+        if self.refusals_path and os.path.lexists(self.refusals_path):
+            try:
+                saved_refusals = json.loads(_require_private_regular_file(
+                    self.refusals_path, allow_empty=False, max_bytes=16384))
+            except (ValueError, RuntimeError):
+                raise RuntimeError('Transfermarkt refusal counters are corrupt') from None
+        try:
+            self.refusals = RefusalCounters(saved_refusals)
+        except ValueError:
+            raise RuntimeError('Transfermarkt refusal counters are corrupt') from None
+        if self.stop.active:
+            # Re-state the hold in case its pause was not written before a restart.
+            self.rate.hold(clock(), max(0.0, self.stop.until - clock()))
         self._persist_streams()
+
+    def _persist_refusals(self, *, soft=False):
+        """Write the refusal counters; soft keeps serving when only the metric cannot be written."""
+        if self.state_path:
+            try:
+                _atomic_private_bytes(self.refusals_path,
+                    canonical_json_bytes(self.refusals.dump()) + b'\n',
+                    replace=os.path.isfile(self.refusals_path))
+            except (OSError, RuntimeError) as exc:
+                if not soft:
+                    raise RuntimeError('Transfermarkt refusal counters write failed') from exc
+                log.error('transfermarkt_refusal_counters_write_failed')
+
+    def _persist_stop(self):
+        if self.state_path:
+            try:
+                _atomic_private_bytes(self.stop_path,
+                    canonical_json_bytes(self.stop.dump()) + b'\n',
+                    replace=os.path.isfile(self.stop_path))
+            except (OSError, RuntimeError) as exc:
+                raise RuntimeError('Transfermarkt source stop state write failed') from exc
 
     def _persist_streams(self):
         if self.state_path:
@@ -889,56 +946,228 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         live_ids = {value.permit_id for value in self._tickets.values()}
         self._feedback = {key: value for key, value in self._feedback.items() if key in live_ids}
         self._durable_feedback.intersection_update(live_ids)
+        self._applied.intersection_update(live_ids)
+
+    def _closed_until(self, now):
+        """When a held source may hear a request again; 0.0 when nothing holds it.
+
+        Never a moment already past: a caller that is told a pause in the past
+        spins, and one told the present takes clock skew for a pause.
+
+        A stop left to the owner renews its horizon, so a waiting caller is
+        always told to come back later instead of spinning on an expired pause.
+        """
+        if not self.stop.active or self.stop.probing:
+            return 0.0            # nothing held: the caller waits only for the stream's own pace
+        if self.stop.needs_owner and now >= self.stop.until:
+            return now + 3600
+        return self.stop.until
 
     def _ready_at(self, now):
-        return self.rate.ready_at(self._active_stream, now)
+        return max(self.rate.ready_at(self._active_stream, now), self._closed_until(now))
+
+    def paused_until(self, stream_id):
+        """The moment a waiting caller is told to wait for, the hold of a stop included."""
+        return max(self.rate.pause[stream_id], self._closed_until(self._clock()))
+
+    def _probe_ticket(self):
+        permit_id = self.stop.probe_permit_id
+        return next((value for value in self._tickets.values() if value.permit_id == permit_id), None)
+
+    def _stop_gate(self, now):
+        """Whether a request may be granted, and whether it is the one probe."""
+        if not self.stop.active:
+            return True, False
+        if self.stop.probing:
+            if not self.stop.probe_sent:
+                ticket = self._probe_ticket()
+                if (ticket is not None and ticket.granted_at is not None
+                        and ticket.consumed_at is None
+                        and now < ticket.granted_at + self.GRANTED_TTL_SECONDS):
+                    return False, False   # granted: its caller may still send the probe
+                # Never sent, its caller having left or its grant never completed:
+                # no probe was made. The stop stands, and the next live request is the probe.
+                self.stop.abandon_probe()
+                self.rate.release(now)
+                self._persist_stop()
+                self._persist_streams()
+                return True, True
+            if not self.stop.probe_expired(now):
+                return False, False
+            # Sent but never reported: no evidence of a refusal.
+            self.stop.probe_passed()
+            self.rate.release(now)
+            self._persist_stop()
+            self._persist_streams()
+            return True, False
+        if self.stop.needs_owner or now < self.stop.until:
+            return False, False
+        return True, True
 
     def _grant_one(self, now):
+        admitted, probe = self._stop_gate(now)
+        if not admitted:
+            return
         for stream in self.streams.stream_ids:
             if now < self.rate.ready_at(stream, now):
                 continue
             source = 'transfermarkt' if stream == 'current-0' else 'transfermarkt_backfill'
             queue = self._queues[source]
+            # The probe goes to the caller asking now, never to an abandoned ticket.
             key = next((key for key in queue if key[-1] == stream
                         and key in self._tickets
-                        and self._tickets[key].granted_at is None), None)
+                        and self._tickets[key].granted_at is None
+                        and (not probe or key == self._requesting)), None)
             if key is None:
                 continue
             self.rate.grant(stream, now)
-            self._persist_streams()
+            if probe:
+                # While the probe is out, every stream waits for its answer. Until
+                # the record is durable no ticket carries the probe.
+                self.stop.begin_probe(now, self._tickets[key].permit_id)
+                self.rate.hold(now, self.stop.PROBE_TIMEOUT_SECONDS)
+                try:
+                    self._persist_stop()
+                    self._persist_streams()
+                except RuntimeError:
+                    self.stop.abandon_probe()
+                    self.rate.release(now)
+                    raise
+                self._tickets[key].probe = True
+            else:
+                self._persist_streams()
             self._tickets[key].granted_at = now
             queue.remove(key)
+            if probe:
+                return
 
-    def request(self, *, stream_id, **kwargs):
-        if stream_id not in self.streams.ids(kwargs['traffic_class']):
-            raise ValueError('stream does not match traffic class')
-        self._active_stream = stream_id
-        return super().request(**kwargs)
-
-    def consume(self, *, stream_id, **kwargs):
-        if stream_id not in self.streams.ids(kwargs['traffic_class']):
-            raise TransfermarktPermitError('stream does not match traffic class')
-        self._active_stream = stream_id
-        return super().consume(**kwargs)
-
-    def report_block(self, *, stream_id, permit_id, status, challenge):
+    def _consumed_ticket(self, stream_id, permit_id):
         key = next((key for key, value in self._tickets.items()
                     if value.permit_id == permit_id and key[-1] == stream_id
                     and value.consumed_at is not None), None)
         if key is None:
             raise TransfermarktPermitError('site feedback requires a consumed stream permit')
+        return key
+
+    def _stop(self, now, reason):
+        """Hold every stream; the hold is their ordinary pause. Not persisted here."""
+        until = self.stop.arm(now, reason)
+        self.rate.hold(now, until - now)
+        # A grant made before the source was held buys no request.
+        for key, ticket in self._tickets.items():
+            if ticket.granted_at is not None and ticket.consumed_at is None and not ticket.probe:
+                ticket.granted_at = None
+                self._queues[key[0]].append(key)
+        log.error('transfermarkt_source_stopped:%s until %.0f', reason, until)
+        return until
+
+    def _probe_failed(self, now):
+        """The probe was refused: hold again, for longer. Not persisted here."""
+        until = self.stop.probe_failed(now)
+        self.rate.hold(now, until - now)
+        if self.stop.needs_owner:
+            log.error('transfermarkt_source_needs_owner')
+        else:
+            log.error('transfermarkt_source_probe_failed:%d', self.stop.failed_probes)
+        return until
+
+    def request(self, *, stream_id, **kwargs):
+        if stream_id not in self.streams.ids(kwargs['traffic_class']):
+            raise ValueError('stream does not match traffic class')
+        self._active_stream = stream_id
+        self._requesting = self._binding_key(
+            *[str(kwargs[name] or '').strip() for name in ('traffic_class', 'dag_id', 'run_id', 'request_id')])
+        try:
+            return super().request(**kwargs)
+        finally:
+            self._requesting = None
+
+    def consume(self, *, stream_id, permit_id, **kwargs):
+        if stream_id not in self.streams.ids(kwargs['traffic_class']):
+            raise TransfermarktPermitError('stream does not match traffic class')
+        self._active_stream = stream_id
+        probe = self.stop.probing and self.stop.probe_permit_id == permit_id
+        if self.stop.active and not probe:
+            raise TransfermarktPermitError('the source is held')
+        consumed_at = super().consume(permit_id=permit_id, **kwargs)
+        if probe:
+            self.stop.mark_sent()
+            try:
+                self._persist_stop()
+            except RuntimeError:
+                # The caller is told the consume failed and sends nothing. The
+                # permit takes no feedback either: it was never a request.
+                self.stop.probe_sent = False
+                ticket = self._probe_ticket()
+                ticket.consumed_at = None
+                ticket.granted_at = None
+                raise
+        # A consumed permit is one request to the source, counted on the day it
+        # was consumed: the denominator of the refusal rate.
+        self.refusals.count_request(consumed_at)
+        self._persist_refusals(soft=True)
+        return consumed_at
+
+    def report_block(self, *, stream_id, permit_id, status, challenge):
+        key = self._consumed_ticket(stream_id, permit_id)
         if permit_id in self._durable_feedback:
             return
+        if self.stop.probing and self.stop.probe_permit_id == permit_id and not self.stop.probe_sent:
+            raise TransfermarktPermitError('the probe was not sent')
+        now = self._clock()
         if permit_id not in self._feedback:
-            self._feedback[permit_id] = self.rate.site_block(stream_id, self._clock(), status=status, challenge=challenge)
-        # An uncertain write may be retried, but the same consumed attempt
-        # cannot be applied as another site block. Acknowledge only durability.
+            self._feedback[permit_id] = self.rate.site_block(
+                stream_id, now, status=status, challenge=challenge)
+        if permit_id not in self._applied:
+            # Applied once per consumed attempt. A retry after an uncertain write
+            # repeats the writes below, never this.
+            self._applied.add(permit_id)
+            refused = challenge or status in (403, 429)
+            if refused:
+                # The refusal belongs to the day of the request it refused.
+                self.refusals.count_refusal(self._tickets[key].consumed_at)
+            if self.stop.probe_permit_id == permit_id and refused:
+                self._probe_failed(now)
+            elif challenge:
+                self._stop(now, 'human_verification')
+            elif 'transfermarkt_stream_paused' in self._feedback[permit_id]:
+                self._stop(now, 'addresses_exhausted')
+        # Acknowledge only durability. The stop record goes first: a restart
+        # re-states the hold from it when the pause was not written.
+        self._persist_stop()
+        self._persist_refusals()
         self._persist_streams()
         self._durable_feedback.add(permit_id)
         # Bound feedback retention by the already bounded ticket lifetime.
         for event in self._feedback[permit_id]:
             log.error('%s stream=%s', event, stream_id)
 
+    def report_probe_passed(self, *, stream_id, permit_id):
+        if self.stop.probe_permit_id != permit_id or not self.stop.probe_sent:
+            raise TransfermarktPermitError('probe feedback requires the probe permit')
+        self._consumed_ticket(stream_id, permit_id)
+        now = self._clock()
+        self.stop.probe_passed()
+        self.rate.release(now)
+        # The stop record goes first: should the pause stay, it ends by itself within two minutes.
+        self._persist_stop()
+        self._persist_streams()
+        log.error('transfermarkt_source_resumed')
+
+    def resume_by_owner(self):
+        """The owner lifts a stop that exhausted its probes."""
+        now = self._clock()
+        held = self.stop.active or max(self.rate.pause.values(), default=now) > now
+        if not held and not self._resume_pending:
+            raise TransfermarktPermitError('no source stop is held')
+        self._resume_pending = True
+        self.stop.owner_resume()
+        self.rate.release(now)
+        # The pause goes first: while it stands on disk, a retry can still lift it.
+        self._persist_streams()
+        self._persist_stop()
+        self._resume_pending = False
+        log.error('transfermarkt_source_resumed_by_owner')
 
 TRANSFERMARKT_STREAMS = None
 TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController()
@@ -4611,6 +4840,15 @@ def _exit_pool_health(mgr) -> dict[str, Any]:
     }
 
 
+def _transfermarkt_stop_alerts() -> list[str]:
+    controller = TRANSFERMARKT_REQUEST_PERMITS
+    if not isinstance(controller, TransfermarktStreamPermitController) or not controller.stop.active:
+        return []
+    if controller.stop.needs_owner:
+        return ['transfermarkt_source_needs_owner']
+    return ['transfermarkt_source_probe_out' if controller.stop.probing else 'transfermarkt_source_stopped']
+
+
 def _transfermarkt_permit_health() -> dict[str, Any]:
     return {
         "transfermarkt_requests_per_minute": TRANSFERMARKT_REQUEST_PERMITS.requests_per_minute,
@@ -4624,12 +4862,23 @@ def _transfermarkt_permit_health() -> dict[str, Any]:
             'transfermarkt_stream_pause_until': TRANSFERMARKT_REQUEST_PERMITS.rate.pause,
             'transfermarkt_stream_slow_until': TRANSFERMARKT_REQUEST_PERMITS.rate.slow,
             'transfermarkt_source_slow_until': TRANSFERMARKT_REQUEST_PERMITS.rate.source_slow,
+            'transfermarkt_source_stop': ({
+                'reason': TRANSFERMARKT_REQUEST_PERMITS.stop.reason,
+                'until': TRANSFERMARKT_REQUEST_PERMITS.stop.until,
+                'failed_probes': TRANSFERMARKT_REQUEST_PERMITS.stop.failed_probes,
+                'needs_owner': TRANSFERMARKT_REQUEST_PERMITS.stop.needs_owner,
+                'probing': TRANSFERMARKT_REQUEST_PERMITS.stop.probing,
+            } if TRANSFERMARKT_REQUEST_PERMITS.stop.active else None),
+            'transfermarkt_source_refusals': ({
+                day: TRANSFERMARKT_REQUEST_PERMITS.refusals.rate(day) for day in
+                sorted(TRANSFERMARKT_REQUEST_PERMITS.refusals.days)[-7:]
+            }),
             'transfermarkt_alerts': ([
                 'transfermarkt_source_rate_halved'
             ] if TRANSFERMARKT_REQUEST_PERMITS.rate.source_slow > time.time() else []) + [
                 f'transfermarkt_stream_paused:{stream}' for stream, until in
                 TRANSFERMARKT_REQUEST_PERMITS.rate.pause.items() if until > time.time()
-            ],
+            ] + _transfermarkt_stop_alerts(),
         } if isinstance(TRANSFERMARKT_REQUEST_PERMITS, TransfermarktStreamPermitController) else {}),
         "transfermarkt_request_permit_consume_required": True,
         "transfermarkt_request_permit_pending_ttl_seconds": (
@@ -4758,7 +5007,64 @@ async def _handle_control(
     permit_path = "/v1/transfermarkt/request-permits"
     consume_permit_path = permit_path + "/consume"
     block_feedback_path = permit_path + '/site-block'
-    if path in {permit_path, consume_permit_path, block_feedback_path}:
+    probe_feedback_path = permit_path + '/probe-ok'
+    source_resume_path = '/v1/transfermarkt/source-stop/resume'
+    feedback_paths = {block_feedback_path, probe_feedback_path}
+    if path == source_resume_path:
+        if method != "POST":
+            await _send_json(writer, 404, {"error": "unknown control endpoint"})
+            return True
+        if not _any_control_token_valid(headers):
+            await _send_json(writer, 401, {"error": "invalid control token"})
+            return True
+        if not _control_token_valid(headers, source='transfermarkt'):
+            await _send_json(writer, 401, {"error": "invalid control token"})
+            return True
+        if headers.get("transfer-encoding"):
+            await _send_json(writer, 400, {"error": "invalid request framing"})
+            return True
+        try:
+            raw_length = headers.get("content-length", "")
+            if (
+                not raw_length.isascii()
+                or not raw_length.isdigit()
+                or raw_length != str(int(raw_length or "0"))
+            ):
+                raise ValueError("request permit content length is invalid")
+            length = int(raw_length)
+            if not 0 < length <= MAX_CONTROL_BODY_BYTES:
+                raise ValueError("request permit body size is invalid")
+            if json.loads(await reader.readexactly(length)) != {}:
+                raise ValueError("source resume takes no fields")
+            if not isinstance(TRANSFERMARKT_REQUEST_PERMITS, TransfermarktStreamPermitController):
+                raise ValueError('source resume is only available in the dedicated TM contour')
+            TRANSFERMARKT_REQUEST_PERMITS.resume_by_owner()
+        except TransfermarktPermitError:
+            await _send_json(
+                writer,
+                409,
+                {
+                    "code": "request_permit_rejected",
+                    "error": "request permit rejected",
+                },
+            )
+            return True
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            await _send_json(writer, 400, {"error": str(exc)})
+            return True
+        except (OSError, asyncio.IncompleteReadError, RuntimeError):
+            await _send_json(
+                writer,
+                503,
+                {
+                    "code": "request_permit_unavailable",
+                    "error": "request permit unavailable",
+                },
+            )
+            return True
+        await _send_json(writer, 200, {'resumed': True})
+        return True
+    if path in {permit_path, consume_permit_path, *feedback_paths}:
         if method != "POST":
             await _send_json(writer, 404, {"error": "unknown control endpoint"})
             return True
@@ -4788,10 +5094,13 @@ async def _handle_control(
             streams_enabled = isinstance(TRANSFERMARKT_REQUEST_PERMITS, TransfermarktStreamPermitController)
             if streams_enabled:
                 expected_fields.update({'lease_id', 'lease_token'})
-            if path == block_feedback_path:
+            if path in feedback_paths:
                 if not streams_enabled:
                     raise ValueError('site feedback is only available in the dedicated TM contour')
+            if path == block_feedback_path:
                 expected_fields.update({'permit_id', 'status', 'challenge'})
+            if path == probe_feedback_path:
+                expected_fields.add('permit_id')
             if not isinstance(request, dict) or frozenset(request) != expected_fields:
                 raise ValueError("request permit fields are invalid")
             dag_id = str(request.get("dag_id") or "").strip()
@@ -4814,7 +5123,7 @@ async def _handle_control(
                 if (lease is None or lease.source != traffic_class
                     or lease.dag_id != dag_id or lease.run_id != run_id
                     or not secrets.compare_digest(lease.token, str(request.get('lease_token') or ''))
-                    or (path != block_feedback_path and not lease.usable)):
+                    or (path not in feedback_paths and not lease.usable)):
                     raise TransfermarktPermitError('permit requires its authenticated live lease')
                 stream_options = {'stream_id': lease.stream_id}
             if _transfermarkt_only():
@@ -4841,9 +5150,7 @@ async def _handle_control(
                 raise RuntimeError(
                     "Transfermarkt request permits are unavailable for this source"
                 )
-            if path == block_feedback_path:
-                if type(request['status']) is not int or type(request['challenge']) is not bool:
-                    raise ValueError('invalid site feedback status')
+            if path in feedback_paths:
                 key = TRANSFERMARKT_REQUEST_PERMITS._binding_key(
                     traffic_class, dag_id, run_id, request_id)
                 # Set the stream before computing the exact ticket binding.
@@ -4851,8 +5158,15 @@ async def _handle_control(
                 ticket = TRANSFERMARKT_REQUEST_PERMITS._tickets.get(key)
                 if ticket is None or ticket.permit_id != str(request['permit_id']):
                     raise TransfermarktPermitError('site feedback request binding mismatch')
+                permit_id = str(request['permit_id'])
+                if path == probe_feedback_path:
+                    TRANSFERMARKT_REQUEST_PERMITS.report_probe_passed(**stream_options, permit_id=permit_id)
+                    await _send_json(writer, 200, {'recorded': True})
+                    return True
+                if type(request['status']) is not int or type(request['challenge']) is not bool:
+                    raise ValueError('invalid site feedback status')
                 TRANSFERMARKT_REQUEST_PERMITS.report_block(
-                    **stream_options, permit_id=str(request['permit_id']),
+                    **stream_options, permit_id=permit_id,
                     status=request['status'], challenge=request['challenge'])
                 await _send_json(writer, 200, {'recorded': True})
                 return True
@@ -4925,7 +5239,8 @@ async def _handle_control(
         }
         if streams_enabled:
             response.update(stream_id=lease.stream_id,
-                paused_until_epoch=TRANSFERMARKT_REQUEST_PERMITS.rate.pause[lease.stream_id])
+                paused_until_epoch=TRANSFERMARKT_REQUEST_PERMITS.paused_until(lease.stream_id),
+                probe=decision.probe)
         if not decision.granted:
             await _send_json(
                 writer,

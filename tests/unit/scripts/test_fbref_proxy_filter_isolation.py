@@ -33,7 +33,8 @@ SHARED_FILTER_SHA256 = (
     # #2163: owned compaction scratch accounting; dedicated FBref bytes unchanged.
     # #2167: compact SofaScore state and retired parent markers; FBref unchanged.
     # #1368: signed season_fields phase across the shared transport; FBref unchanged.
-    "620615aee11e9b6bb58cda5f543858039a7ee9e775ca6773e1ffbb1b2f9201cb"
+    # #2405: Transfermarkt source stop, its one probe and refusal counters; FBref unchanged.
+    "bf6d6d8c317bda39f80b70f52255373eecacbf10554efc03026c37e34ef4d472"
 )
 
 

@@ -7175,10 +7175,522 @@ def test_transfermarkt_site_feedback_requires_consumed_stream_permit(shared_mod,
     for _ in range(3):
         controller.report_block(stream_id='history-0', permit_id=decision.permit_id,
                                 status=status, challenge=challenge)
-    assert controller.rate.pause['history-0'] == 0
+    if challenge:
+        # A human-verification reply holds every stream; repeating it adds nothing.
+        assert controller.stop.reason == 'human_verification'
+        assert set(controller.rate.pause.values()) == {10805}
+    else:
+        assert controller.rate.pause['history-0'] == 0
+        assert not controller.stop.active
     restarted = shared_mod.TransfermarktStreamPermitController(
         streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
     assert restarted.rate.slow['history-0'] == 1805
+    assert restarted.stop.active is challenge
+
+
+def _stopped_controller(shared_mod, tmp_path, clock, *, reason='addresses_exhausted'):
+    """A source held for the given reason by the site's own reported answers."""
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=str(tmp_path / 'stop.json'),
+        clock=lambda: clock[0])
+    context = dict(stream_id='history-0', traffic_class='transfermarkt_backfill',
+                   dag_id='dag_backfill_transfermarkt', run_id='run', request_id='refused-0')
+    clock[0] = 5
+    for number in range(4 if reason == 'addresses_exhausted' else 1):
+        if number:
+            # A refused address halves the stream: wait for its slowed interval.
+            context['request_id'] = f'refused-{number}'
+            clock[0] = controller.rate.ready_at('history-0', clock[0])
+        decision = controller.request(**context)
+        assert decision.granted
+        controller.consume(**context, permit_id=decision.permit_id, permit_token=decision.permit_token)
+        controller.report_block(stream_id='history-0', permit_id=decision.permit_id, status=403,
+                                challenge=reason == 'human_verification')
+    assert controller.stop.reason == reason and not controller.stop.probing
+    return controller, controller.stop.until
+
+
+def _current(request_id):
+    return dict(stream_id='current-0', traffic_class='transfermarkt',
+                dag_id='dag_ingest_transfermarkt', run_id='run', request_id=request_id)
+
+
+def test_transfermarkt_source_stop_holds_every_stream_then_admits_one_probe(shared_mod, tmp_path):
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    # Three refusals only slow the stream; the fourth holds the source.
+    assert clock[0] == 5 + 3 * 10 and until == clock[0] + 3 * 60 * 60
+    assert set(controller.rate.pause.values()) == {until}
+    # No stream is granted during the hold, and a caller learns when it ends.
+    clock[0] = until - 1
+    waiting = controller.request(**_current('waiting'))
+    assert not waiting.granted and not waiting.probe and waiting.retry_after_seconds == 1
+    # The oldest waiting request becomes the one probe.
+    clock[0] = until
+    probe = controller.request(**_current('waiting'))
+    assert probe.granted and probe.probe
+    assert controller.stop.probing and controller.stop.probe_permit_id == probe.permit_id
+    # While the probe is out, every stream waits for its answer.
+    assert set(controller.rate.pause.values()) == {until + controller.stop.PROBE_TIMEOUT_SECONDS}
+    other = controller.request(**_current('other'))
+    assert not other.granted and not other.probe
+    controller.consume(**_current('waiting'), permit_id=probe.permit_id, permit_token=probe.permit_token)
+    with pytest.raises(shared_mod.TransfermarktPermitError, match='probe permit'):
+        controller.report_probe_passed(stream_id='current-0', permit_id=other.permit_id)
+    controller.report_probe_passed(stream_id='current-0', permit_id=probe.permit_id)
+    assert not controller.stop.active and not controller.stop.probing
+    assert set(controller.rate.pause.values()) == {until}
+    clock[0] = until + 10
+    following = controller.request(**_current('other'))
+    assert following.granted and not following.probe
+
+
+def test_transfermarkt_refused_probe_holds_longer_and_stops_probing_after_three(shared_mod, tmp_path):
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    holds = []
+    for number in (1, 2):
+        clock[0] = until
+        name = f'probe-{number}'
+        probe = controller.request(**_current(name))
+        assert probe.granted and probe.probe
+        context = _current(name)
+        controller.consume(**context, permit_id=probe.permit_id, permit_token=probe.permit_token)
+        controller.report_block(stream_id='current-0', permit_id=probe.permit_id, status=403, challenge=False)
+        assert controller.stop.failed_probes == number and not controller.stop.probing
+        holds.append(controller.stop.until - until)
+        # The held time and the count survive a restart.
+        restarted = shared_mod.TransfermarktStreamPermitController(
+            streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
+        assert restarted.stop.until == controller.stop.until
+        assert restarted.stop.failed_probes == number
+        until = controller.stop.until
+    assert holds == [6 * 60 * 60, 12 * 60 * 60]
+    clock[0] = until
+    last = controller.request(**_current('probe-3'))
+    assert last.granted and last.probe
+    controller.consume(**_current('probe-3'), permit_id=last.permit_id, permit_token=last.permit_token)
+    controller.report_block(stream_id='current-0', permit_id=last.permit_id, status=429, challenge=False)
+    assert controller.stop.needs_owner and controller.stop.failed_probes == 3
+    # Three refusals end automatic probing: nothing is granted until the owner acts,
+    # and a week later a caller is still told to wait instead of spinning.
+    clock[0] = controller.stop.until - 1
+    assert not controller.request(**_current('never-probed')).granted
+    clock[0] = controller.stop.until + 1
+    week_later = controller.request(**_current('week-later'))
+    assert not week_later.granted and week_later.retry_after_seconds > 0
+    assert controller.paused_until('current-0') > clock[0]
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
+    assert restarted.stop.needs_owner
+    controller.resume_by_owner()
+    assert not controller.stop.active
+    clock[0] += 10
+    # The oldest waiting request is served first, as after any other pause.
+    assert controller.request(**_current('never-probed')).granted
+    with pytest.raises(shared_mod.TransfermarktPermitError, match='no source stop'):
+        controller.resume_by_owner()
+
+
+def _live_probe(controller, clock, name):
+    """Take the one probe of a held source on a fresh request and consume it."""
+    probe = controller.request(**_current(name))
+    assert probe.granted and probe.probe
+    context = _current(name)
+    controller.consume(**context, permit_id=probe.permit_id, permit_token=probe.permit_token)
+    assert controller.stop.probing and controller.stop.probe_sent
+    return probe, context
+
+
+def test_transfermarkt_unsent_and_unreported_probes_do_not_end_a_hold_by_themselves(shared_mod, tmp_path):
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    granted = shared_mod.TransfermarktRequestPermitController.GRANTED_TTL_SECONDS
+    timeout = controller.stop.PROBE_TIMEOUT_SECONDS
+    # An old gateway ignores the stop record and still honours the held pause.
+    old = shared_mod.TransfermarktRequestPermitController(state_path=controller.state_path,
+                                                          clock=lambda: clock[0])
+    clock[0] = until - 1
+    assert not controller.request(**_current('older')).granted
+    assert not old.request(traffic_class='transfermarkt', dag_id='dag_ingest_transfermarkt',
+                           run_id='run', request_id='legacy').granted
+    # The probe goes to the caller asking then, not to an older waiting ticket.
+    clock[0] = until
+    abandoned = controller.request(**_current('abandoned'))
+    assert abandoned.granted and abandoned.probe and not controller.stop.probe_sent
+    assert not controller.request(**_current('older')).granted
+    # A probe granted but never sent is no probe. While its grant could still be
+    # used nothing else is granted; afterwards the stop stands and a probe is due again.
+    clock[0] = until + granted - 1
+    assert not controller.request(**_current('waiting')).granted
+    clock[0] = until + granted
+    assert controller.stop.active
+    waiting, context = _live_probe(controller, clock, 'waiting')
+    assert waiting.permit_id != abandoned.permit_id
+    # A probe that was sent and never reported is no evidence of a refusal.
+    clock[0] = until + granted + timeout - 1
+    assert not controller.request(**_current('after')).granted
+    clock[0] = until + granted + timeout
+    following = controller.request(**_current('after'))
+    assert following.granted and not following.probe and not controller.stop.active
+
+
+def test_transfermarkt_a_challenge_on_the_probe_counts_as_its_refusal(shared_mod, tmp_path):
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    holds = []
+    for number, (status, challenge) in enumerate([(405, True), (202, True), (403, False)], start=1):
+        clock[0] = until
+        probe, _context = _live_probe(controller, clock, f'probe-{number}')
+        controller.report_block(stream_id='current-0', permit_id=probe.permit_id,
+                                status=status, challenge=challenge)
+        assert controller.stop.failed_probes == number and not controller.stop.probing
+        holds.append(controller.stop.until - until)
+        until = controller.stop.until
+    assert holds == [6 * 60 * 60, 12 * 60 * 60, 7 * 24 * 60 * 60]
+    assert controller.stop.needs_owner
+
+
+@pytest.mark.parametrize('failed_file', ['.source-stop', '.refusals', '.streams-v2'])
+def test_transfermarkt_feedback_retried_after_a_failed_write_arms_the_stop_once(
+        shared_mod, monkeypatch, tmp_path, failed_file):
+    from scrapers.transfermarkt.streams import TransfermarktStreams, calendar_day
+
+    clock = [0.0]
+    path = str(tmp_path / ('uncertain' + failed_file + '.json'))
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=path, clock=lambda: clock[0])
+    context = _current('attempt')
+    clock[0] = 5
+    ticket = controller.request(**context)
+    controller.consume(**context, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+    original = shared_mod._atomic_private_bytes
+    failures = [1]
+
+    def fail_once(target, *args, **kwargs):
+        if str(target).endswith(failed_file) and failures[0]:
+            failures[0] -= 1
+            raise OSError('injected write failure')
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', fail_once)
+    # The caller is not acknowledged until every state file is durable.
+    with pytest.raises(RuntimeError, match='write failed'):
+        controller.report_block(stream_id='current-0', permit_id=ticket.permit_id,
+                                status=405, challenge=True)
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
+    controller.report_block(stream_id='current-0', permit_id=ticket.permit_id,
+                            status=405, challenge=True)
+    assert controller.stop.active and controller.stop.reason == 'human_verification'
+    # Applied once, whatever came of the writes: one refusal, one stop.
+    assert controller.refusals.days == {calendar_day(5): {'requests': 1, 'refusals': 1}}
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=path, clock=lambda: clock[0])
+    assert restarted.stop.active and restarted.stop.until == controller.stop.until
+    assert restarted.refusals.days == {calendar_day(5): {'requests': 1, 'refusals': 1}}
+
+
+def test_transfermarkt_a_restart_restates_a_hold_whose_pause_was_not_written(shared_mod, monkeypatch, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    clock = [0.0]
+    path = str(tmp_path / 'hold-without-pause.json')
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=path, clock=lambda: clock[0])
+    context = _current('attempt')
+    clock[0] = 5
+    ticket = controller.request(**context)
+    controller.consume(**context, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+    original = shared_mod._atomic_private_bytes
+
+    def no_pause_file(target, *args, **kwargs):
+        if str(target).endswith('.streams-v2'):
+            raise OSError('injected write failure')
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', no_pause_file)
+    with pytest.raises(RuntimeError, match='write failed'):
+        controller.report_block(stream_id='current-0', permit_id=ticket.permit_id,
+                                status=405, challenge=True)
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
+    # The stop record reached the disk, the pause did not: the restart re-states the hold.
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=path, clock=lambda: clock[0])
+    until = controller.stop.until
+    assert restarted.stop.until == until
+    clock[0] = until - 1
+    assert not restarted.request(**_current('after-restart')).granted
+
+
+def test_transfermarkt_a_grant_made_before_a_stop_buys_no_request(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(history_streams=1), state_path=str(tmp_path / 'revoked.json'),
+        clock=lambda: clock[0])
+    clock[0] = 5
+    early = controller.request(**_current('early'))
+    assert early.granted            # granted on the current stream, not yet consumed
+    held = dict(stream_id='history-0', traffic_class='transfermarkt_backfill',
+                dag_id='dag_backfill_transfermarkt', run_id='run', request_id='refused-0')
+    for number in range(4):
+        held['request_id'] = f'refused-{number}'
+        if number:
+            clock[0] = controller.rate.ready_at('history-0', clock[0])
+        ticket = controller.request(**held)
+        controller.consume(**held, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+        controller.report_block(stream_id='history-0', permit_id=ticket.permit_id, status=403, challenge=False)
+    assert controller.stop.active and controller.stop.reason == 'addresses_exhausted'
+    with pytest.raises(shared_mod.TransfermarktPermitError, match='the source is held'):
+        controller.consume(**_current('early'), permit_id=early.permit_id, permit_token=early.permit_token)
+    again = controller.request(**_current('early'))
+    assert not again.granted and again.retry_after_seconds > 0 and not again.probe
+
+
+def test_transfermarkt_a_refusal_is_counted_on_the_day_of_its_request(shared_mod, tmp_path):
+    from datetime import datetime, timezone
+
+    from scrapers.transfermarkt.streams import TransfermarktStreams, calendar_day
+
+    night = datetime(2026, 11, 27, 21, 0, 0, tzinfo=timezone.utc).timestamp()   # midnight in Moscow
+    clock = [0.0]
+    path = str(tmp_path / 'around-midnight.json')
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=path, clock=lambda: clock[0])
+    context = _current('late')
+    clock[0] = night - 1
+    ticket = controller.request(**context)
+    controller.consume(**context, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+    clock[0] = night + 1
+    controller.report_block(stream_id='current-0', permit_id=ticket.permit_id, status=403, challenge=False)
+    # The request and its refusal share a day, so no day can refuse more than it asked.
+    assert controller.refusals.days == {calendar_day(night - 1): {'requests': 1, 'refusals': 1}}
+    assert calendar_day(night) != calendar_day(night - 1)
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=path, clock=lambda: clock[0])
+    assert restarted.refusals.rate(calendar_day(night - 1)) == {'requests': 1, 'refusals': 1, 'per_100': 100.0}
+
+
+def test_transfermarkt_owner_resume_survives_a_failed_write_and_a_retry(shared_mod, monkeypatch, tmp_path):
+    clock = [0.0]
+    controller, _until = _stopped_controller(shared_mod, tmp_path, clock)
+    original = shared_mod._atomic_private_bytes
+
+    def no_pause_file(target, *args, **kwargs):
+        if str(target).endswith('.streams-v2'):
+            raise OSError('injected write failure')
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', no_pause_file)
+    with pytest.raises(RuntimeError, match='write failed'):
+        controller.resume_by_owner()
+    # Nothing on disk says the stop is over, so a restart still holds the source.
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
+    assert restarted.stop.active
+    controller.resume_by_owner()          # the first process retries
+    assert not controller.stop.active
+    restarted.resume_by_owner()           # a restarted one can as well
+    assert not restarted.stop.active
+    clock[0] += 5
+    final = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
+    assert not final.stop.active and max(final.rate.pause.values()) <= clock[0]
+    with pytest.raises(shared_mod.TransfermarktPermitError, match='no source stop'):
+        final.resume_by_owner()
+
+
+def test_transfermarkt_nothing_held_reports_no_pause_to_waiting_callers(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'idle.json'), clock=lambda: clock[0])
+    clock[0] = 5
+    assert controller.request(**_current('first')).granted
+    clock[0] = 6
+    # A caller waiting only for the stream's own pace is told no pause: the present
+    # moment would read as a pause to a caller whose clock runs behind.
+    paced = controller.request(**_current('paced'))
+    assert not paced.granted and paced.retry_after_seconds == 4
+    assert controller.paused_until('current-0') == 0.0
+
+
+def test_transfermarkt_a_probe_whose_send_was_not_recorded_is_not_heard(shared_mod, monkeypatch, tmp_path):
+    from scrapers.transfermarkt.streams import calendar_day
+
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    clock[0] = until
+    probe = controller.request(**_current('probe'))
+    assert probe.granted and probe.probe and not controller.stop.probe_sent
+    before = {day: dict(entry) for day, entry in controller.refusals.days.items()}
+    original = shared_mod._atomic_private_bytes
+
+    def no_stop_file(target, *args, **kwargs):
+        if str(target).endswith('.source-stop'):
+            raise OSError('injected write failure')
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', no_stop_file)
+    # The caller is refused the consume and sends nothing.
+    with pytest.raises(RuntimeError, match='write failed'):
+        controller.consume(**_current('probe'), permit_id=probe.permit_id, permit_token=probe.permit_token)
+    assert controller.stop.active and controller.stop.probing and not controller.stop.probe_sent
+    # The permit made no request, so it takes no feedback: neither a pass nor a refusal.
+    with pytest.raises(shared_mod.TransfermarktPermitError):
+        controller.report_probe_passed(stream_id='current-0', permit_id=probe.permit_id)
+    with pytest.raises(shared_mod.TransfermarktPermitError):
+        controller.report_block(stream_id='current-0', permit_id=probe.permit_id,
+                                status=403, challenge=False)
+    assert controller.refusals.days == before and controller.stop.active
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
+    # The permit is spent and nothing went out: the stop stands, and a new request is the probe.
+    clock[0] = until + shared_mod.TransfermarktRequestPermitController.GRANTED_TTL_SECONDS
+    second, _context = _live_probe(controller, clock, 'second')
+    assert second.permit_id != probe.permit_id and controller.stop.active
+    # Only the request that was sent is counted, on its own day.
+    assert controller.refusals.days == {
+        **before, calendar_day(clock[0]): {
+            'requests': before.get(calendar_day(clock[0]), {}).get('requests', 0) + 1,
+            'refusals': before.get(calendar_day(clock[0]), {}).get('refusals', 0)}}
+
+
+def test_transfermarkt_a_probe_grant_whose_record_failed_leaves_no_trace(shared_mod, monkeypatch, tmp_path):
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    original = shared_mod._atomic_private_bytes
+    failures = [1]
+
+    def fail_streams_once(target, *args, **kwargs):
+        if str(target).endswith('.streams-v2') and failures[0]:
+            failures[0] -= 1
+            raise OSError('injected write failure')
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', fail_streams_once)
+    clock[0] = until
+    with pytest.raises(RuntimeError, match='write failed'):
+        controller.request(**_current('unlucky'))
+    unlucky = next(value for key, value in controller._tickets.items() if key[3] == 'unlucky')
+    assert unlucky.granted_at is None and not unlucky.probe
+    assert controller.stop.active and not controller.stop.probing
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
+    clock[0] = until + 5
+    # Later requests are answered rather than failing, and a live request is the probe.
+    live, context = _live_probe(controller, clock, 'live')
+    assert live.permit_id != unlucky.permit_id
+    assert not controller.request(**_current('unlucky')).granted
+    controller.report_probe_passed(stream_id='current-0', permit_id=live.permit_id)
+    clock[0] += 10
+    later = controller.request(**_current('unlucky'))
+    assert later.granted and later.permit_id == unlucky.permit_id and not later.probe
+
+
+def test_transfermarkt_human_verification_reply_holds_the_source_at_once(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'challenge.json'),
+        clock=lambda: clock[0])
+    context = _current('captcha')
+    clock[0] = 5
+    ticket = controller.request(**context)
+    controller.consume(**context, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+    controller.report_block(stream_id='current-0', permit_id=ticket.permit_id, status=405, challenge=True)
+    assert controller.stop.reason == 'human_verification'
+    assert set(controller.rate.pause.values()) == {5 + 3 * 60 * 60}
+    # Repeating the feedback of one attempt adds nothing to the hold.
+    controller.report_block(stream_id='current-0', permit_id=ticket.permit_id, status=405, challenge=True)
+    assert controller.stop.until == 5 + 3 * 60 * 60
+    assert set(controller.rate.pause.values()) == {5 + 3 * 60 * 60}
+
+
+def test_transfermarkt_three_refusals_slow_the_stream_without_holding_the_source(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'three.json'),
+        clock=lambda: clock[0])
+    clock[0] = 5
+    for number in range(3):
+        context = _current(f'refused-{number}')
+        if number:
+            clock[0] = controller.rate.ready_at('current-0', clock[0])
+        ticket = controller.request(**context)
+        controller.consume(**context, permit_id=ticket.permit_id, permit_token=ticket.permit_token)
+        assert controller.report_block(stream_id='current-0', permit_id=ticket.permit_id,
+                                       status=403, challenge=False) is None
+        assert not controller.stop.active and set(controller.rate.pause.values()) == {0}
+
+
+@pytest.mark.parametrize('damage', ['truncated', 'version', 'reason', 'extra'])
+def test_transfermarkt_corrupt_source_stop_record_fails_closed(shared_mod, tmp_path, damage):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    controller, _until = _stopped_controller(shared_mod, tmp_path, [0.0])
+    record = Path(controller.stop_path)
+    payload = json.loads(record.read_text())
+    if damage == 'truncated':
+        record.write_text(record.read_text()[:-3])
+    elif damage == 'version':
+        record.write_text(json.dumps({**payload, 'schema_version': 2}))
+    elif damage == 'reason':
+        record.write_text(json.dumps({**payload, 'reason': 'blocked'}))
+    else:
+        record.write_text(json.dumps({**payload, 'note': 'extra'}))
+    with pytest.raises(RuntimeError, match='source stop state is corrupt'):
+        shared_mod.TransfermarktStreamPermitController(
+            streams=TransfermarktStreams(history_streams=1), state_path=controller.state_path,
+            clock=lambda: 0)
+
+
+def test_transfermarkt_refusals_are_counted_per_day_and_survive_a_restart(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams, calendar_day
+
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'counters.json'),
+        clock=lambda: clock[0])
+    shared_mod.TRANSFERMARKT_REQUEST_PERMITS = controller
+    day = calendar_day(5)
+    assert controller.refusals.rate(day) is None   # no request, no rate
+    clock[0] = 5
+    first = controller.request(**_current('one'))
+    controller.consume(**_current('one'), permit_id=first.permit_id, permit_token=first.permit_token)
+    # A plain 405 is one exit's answer, not the source refusing the request.
+    controller.report_block(stream_id='current-0', permit_id=first.permit_id, status=405, challenge=False)
+    assert controller.refusals.rate(day) == {'requests': 1, 'refusals': 0, 'per_100': 0.0}
+    clock[0] = 15
+    second = controller.request(**_current('two'))
+    controller.consume(**_current('two'), permit_id=second.permit_id, permit_token=second.permit_token)
+    controller.report_block(stream_id='current-0', permit_id=second.permit_id, status=403, challenge=False)
+    controller.report_block(stream_id='current-0', permit_id=second.permit_id, status=403, challenge=False)
+    assert controller.refusals.rate(day) == {'requests': 2, 'refusals': 1, 'per_100': 50.0}
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
+    assert restarted.refusals.rate(day) == {'requests': 2, 'refusals': 1, 'per_100': 50.0}
+    shared_mod.TRANSFERMARKT_REQUEST_PERMITS = restarted
+    shared_mod.TRANSFERMARKT_STREAMS = restarted.streams
+    assert shared_mod._transfermarkt_permit_health()['transfermarkt_source_refusals'] == {
+        day: {'requests': 2, 'refusals': 1, 'per_100': 50.0}}
+
+
+def test_transfermarkt_corrupt_refusal_counters_fail_closed(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'counters.json'), clock=lambda: 0)
+    Path(controller.refusals_path).write_text('{"schema_version": 1, "days": {"x": 1}}')
+    with pytest.raises(RuntimeError, match='refusal counters are corrupt'):
+        shared_mod.TransfermarktStreamPermitController(
+            streams=controller.streams, state_path=controller.state_path, clock=lambda: 0)
 
 
 def test_transfermarkt_stream_slots_and_exits_do_not_steal_current(shared_mod, monkeypatch, tmp_path):
@@ -7401,6 +7913,94 @@ def test_transfermarkt_stream_control_binds_lease_and_feedback(shared_mod, monke
     assert invoke(feedback, '/site-block')[0] == 200
     assert shared_mod.TRANSFERMARKT_REQUEST_PERMITS.rate.slow['current-0'] == 1805
     assert invoke({**feedback, 'request_id': 'other-attempt'}, '/site-block')[0] == 409
+
+
+def test_transfermarkt_probe_feedback_and_owner_resume_are_controlled(shared_mod, monkeypatch, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+    clock = [0.0]
+    _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path)
+    monkeypatch.setattr(shared_mod, '_wall_time', lambda: clock[0])
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'stop-control.json'),
+        clock=lambda: clock[0])
+    shared_mod.TRANSFERMARKT_REQUEST_PERMITS = controller
+    mgr = _FakeManager(['http://u:p@pool.invalid:10000'])
+    lease = shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60, metadata=_tm_metadata())
+
+    def invoke(path, payload, token='t' * 32):
+        data = json.dumps(payload).encode()
+        class Reader:
+            async def readexactly(self, length):
+                return data
+        class Writer:
+            def __init__(self):
+                self.payload = bytearray()
+            def write(self, value):
+                self.payload.extend(value)
+            async def drain(self):
+                pass
+            def close(self):
+                pass
+        writer = Writer()
+        asyncio.run(shared_mod._handle_control('POST', path,
+            {'content-length': str(len(data)), 'x-proxy-control-token': token},
+            Reader(), writer, mgr))
+        head, body = bytes(writer.payload).split(b'\r\n\r\n', 1)
+        return int(head.split()[1]), json.loads(body)
+
+    permits = '/v1/transfermarkt/request-permits'
+    held = dict(dag_id=lease.dag_id, run_id=lease.run_id, request_id='attempt',
+                lease_id=lease.lease_id, lease_token=lease.token)
+    clock[0] = 5
+    status, decision = invoke(permits, held)
+    assert status == 200 and decision['probe'] is False
+    consumed = {**held, 'permit_id': decision['permit_id'], 'permit_token': decision['permit_token']}
+    assert invoke(permits + '/consume', consumed)[0] == 200
+    heard = {**held, 'permit_id': decision['permit_id']}
+    assert invoke(permits + '/probe-ok', heard)[0] == 409  # no probe is out
+    clock[0] = 6
+    status, paced = invoke(permits, {**held, 'request_id': 'paced'})
+    assert (status, paced['paused_until_epoch'], paced['retry_after_seconds']) == (429, 0.0, 4)
+    assert invoke(permits + '/site-block', {**heard, 'status': 405, 'challenge': True})[0] == 200
+    assert controller.stop.reason == 'human_verification'
+    # Nothing is granted until the hold ends; the one probe then reports back.
+    # A lease cannot outlive the hold, so the probe arrives on a fresh one.
+    probe_request = {**held, 'request_id': 'probe'}
+    assert invoke(permits, probe_request)[0] == 429
+    clock[0] = controller.stop.until
+    fresh = shared_mod._create_lease(mgr, max_bytes=1000, ttl_seconds=60, metadata=_tm_metadata())
+    probe_request.update(lease_id=fresh.lease_id, lease_token=fresh.token)
+    status, probe = invoke(permits, probe_request)
+    assert status == 200 and probe['probe'] is True
+    answer = {**probe_request, 'permit_id': probe['permit_id'], 'event': 'probe_ok'}
+    assert invoke(permits + '/probe-ok', answer)[0] == 400  # no extra field is accepted
+    answer = {**probe_request, 'permit_id': probe['permit_id']}
+    assert invoke(permits + '/probe-ok', {**answer, 'lease_token': 'wrong'})[0] == 409
+    assert invoke(permits + '/probe-ok', answer)[0] == 409  # the probe permit is not consumed yet
+    assert invoke(permits + '/consume', {**probe_request, 'permit_id': probe['permit_id'],
+                                         'permit_token': probe['permit_token']})[0] == 200
+    assert invoke(permits + '/probe-ok', {**answer, 'permit_id': decision['permit_id']})[0] == 409
+    assert invoke(permits + '/probe-ok', answer) == (200, {'recorded': True})
+    assert not controller.stop.active
+    # Only the owner's control token lifts a stop that is held.
+    resume = '/v1/transfermarkt/source-stop/resume'
+    assert invoke(resume, {})[0] == 409
+    clock[0] += 5
+    renewed = {**held, 'request_id': 'again', 'lease_id': fresh.lease_id, 'lease_token': fresh.token}
+    status, decision = invoke(permits, renewed)
+    assert status == 200 and decision['probe'] is False
+    assert invoke(permits + '/consume', {**renewed, 'permit_id': decision['permit_id'],
+                                         'permit_token': decision['permit_token']})[0] == 200
+    assert invoke(permits + '/site-block', {**renewed, 'permit_id': decision['permit_id'],
+                                            'status': 403, 'challenge': True})[0] == 200
+    assert controller.stop.active
+    assert invoke(resume, {'force': True})[0] == 400
+    # A valid token of another class is refused as a token, not as a wrong contour.
+    monkeypatch.setattr(shared_mod, 'CONTROL_TOKEN', 'g' * 32)
+    assert invoke(resume, {}, token='g' * 32) == (401, {'error': 'invalid control token'})
+    assert invoke(resume, {}, token='x' * 32)[0] == 401
+    assert invoke(resume, {}) == (200, {'resumed': True})
+    assert not controller.stop.active
 
 
 def test_transfermarkt_only_boots_without_budget_flags(
