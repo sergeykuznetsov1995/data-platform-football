@@ -60,8 +60,10 @@ META_DESCRIBE = re.compile(r"(?:describe|show\s+columns\s+from|show\s+create\s+t
                            r"(?:table\s+|from\s+)?[\w.$]+\s*;?")
 # The platform's Iceberg maintenance is DDL by the shared account. It reports
 # an output but expires snapshots and removes orphans without committing data.
+# The whole statement must be that one procedure call.
 MAINTENANCE = re.compile(r"alter\s+table\s+(?:[a-z_][a-z0-9_]*\s*\.\s*){0,2}clubelo_[a-z0-9_]+"
-                         r"\s+execute\s+(?:optimize|expire_snapshots|remove_orphan_files)\b", re.S)
+                         r"\s+execute\s+(?:optimize|expire_snapshots|remove_orphan_files)"
+                         r"\s*\((?:[^()]|\([^()]*\))*\)(?:\s+where\s+(?:(?!;)[\s\S])*)?\s*;?\s*$")
 
 
 def now_utc():
@@ -259,13 +261,16 @@ def classify(event, monitor_user):
         # is classified like any other.
         if not (input_data or output_data or broken) and (
             staged or (inputs and not bad_in)
-            or re.fullmatch(r"show\s+(catalogs|schemas|tables)(\s+(from|in)\s+[\w.]+)?\s*;?", clean_sql)
+            or re.fullmatch(r"show\s+(catalogs|schemas|tables)(\s+(from|in)\s+[\w.]+)?(\s+like)?(\s+escape)?\s*;?", clean_sql)
             or (re.match(r"select\b", clean_sql) and META_FROM.search(clean_sql)
                 and len(re.findall(r"\b(?:from|join|select|union)\b", clean_sql)) == 2)
         ):
             return None
-    # An empty staging copy reads no split of the table it copies.
-    if staged and not reads and STAGING_CTAS.fullmatch(clean_sql):
+    # An empty staging copy reads no split of the table it copies. Anything
+    # else the event carries (another actor, a real output, broken or other
+    # data-table I/O) is classified like any other event.
+    if (own and staged and not (reads or writes or broken or input_data or output_data)
+            and STAGING_CTAS.fullmatch(clean_sql)):
         return None
 
     if own:
@@ -286,7 +291,7 @@ def classify(event, monitor_user):
                  or (not writes and bool(WRITE.search(clean_sql)) and bool(hints))
                  or not success)
     return {"actor": actor, "reads": reads, "outputs": sorted(writes), "finished": success,
-            "uncertain": uncertain, "maintenance": MAINTENANCE.match(clean_sql) is not None}
+            "uncertain": uncertain, "maintenance": MAINTENANCE.fullmatch(clean_sql) is not None}
 
 
 def initialize(root):
@@ -543,10 +548,14 @@ def discovery(client):
     for row in rows(client, DISCOVER):
         if len(row) != 1 or not TABLE.fullmatch(row[0]):
             raise ValueError("discovery row")
-        names.append(row[0])
+        if not STAGING.fullmatch(row[0]):   # a staging table left behind is not a Bronze table
+            names.append(row[0])
     if not 0 < len(names) <= 256 or len(names) != len(set(names)):
         raise ValueError("discovery set")
     return sorted(names)
+
+
+BATCH = "replace-identity-partition-batch"
 
 
 def empty_evidence():
@@ -560,9 +569,11 @@ def snapshots(client, day, names):
     Trino stamps ``trino_user`` and ``trino_query_id``. The platform's bulk
     writer reaches the catalog directly and leaves no principal. Its
     identity-partition replace is an unstamped delete followed by an append
-    stamped ``dpf.operation``; ClubElo stamps its plain bulk appends with
-    ``dpf.source`` (ClubEloIcebergWriter.SNAPSHOT_STAMP). Any other commit
-    without an engine belongs to a writer the source cannot own.
+    stamped ``dpf.operation`` whose parent is that delete; ClubElo stamps its
+    plain bulk appends with ``dpf.source`` (ClubEloIcebergWriter.SNAPSHOT_STAMP).
+    Any other commit without an engine belongs to a writer the source cannot
+    own. The hour after the day is read only to find the append that closes a
+    delete committed just before midnight.
     """
     selects = []
     for name in names:
@@ -570,35 +581,48 @@ def snapshots(client, day, names):
             raise ValueError("table")
         selects.append(f"""SELECT '{name}', operation, element_at(summary, 'engine-name'),
 element_at(summary, 'trino_user'), element_at(summary, 'trino_query_id'), element_at(summary, 'dpf.operation'),
-element_at(summary, 'dpf.source')
+element_at(summary, 'dpf.source'), cast(snapshot_id AS varchar), coalesce(cast(parent_id AS varchar), ''),
+to_iso8601(committed_at)
 FROM iceberg.bronze."{name}$snapshots"
 WHERE committed_at >= TIMESTAMP '{day.isoformat()} 00:00:00 UTC'
-AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 00:00:00 UTC'""")
-    # The monitor reports an empty result as a failure; a quiet day still needs evidence.
-    selects.append("SELECT '', '', '', '', '', '', ''")
+AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 01:00:00 UTC'""")
+    # The monitor reports an empty result as a failure: the sentinel row keeps
+    # a quiet day answerable, and it must come back for the evidence to count.
+    selects.append("SELECT " + ", ".join(["''"] * 10))
     evidence = {name: empty_evidence() for name in names}
+    fetched, sentinels = [], 0
     for row in rows(client, " UNION ALL ".join(selects)):
-        if len(row) != 7:
+        if len(row) != 10:
             raise ValueError("snapshot row")
-        if row == [""] * 7:
+        if row == [""] * 10:
+            sentinels += 1
             continue
-        name, operation, engine, user, query_id, stamped, source = row
-        info = evidence.get(name)
-        if info is None or not re.fullmatch(r"[a-z_]+", operation) or info["snapshots"] >= LIMIT * 64:
+        name, operation, engine, user, query_id, stamped, source, snapshot_id, parent_id, committed = row
+        if (name not in evidence or not re.fullmatch(r"[a-z_]+", operation) or len(fetched) >= LIMIT * 64
+                or not re.fullmatch(r"[0-9]{1,20}", snapshot_id) or not re.fullmatch(r"[0-9]{0,20}", parent_id)):
             raise ValueError("snapshot row")
+        fetched.append((name, operation, engine.lower(), user or "", query_id or "", stamped or "",
+                        source or "", snapshot_id, parent_id, timestamp(committed)))
+    if sentinels != 1:
+        raise ValueError("snapshot evidence incomplete")
+    # The append that closes a delete names that delete as its parent.
+    closed = {row[8] for row in fetched if row[1] == "append" and row[5] == BATCH}
+    stop = datetime.combine(day + DAY, time.min, UTC)
+    for name, operation, engine, user, query_id, stamped, source, snapshot_id, parent_id, committed in fetched:
+        if committed >= stop:
+            continue
+        info = evidence[name]
         info["snapshots"] += 1
-        if engine.lower() == "trino":
+        if engine == "trino":
             info["trino"] += 1
-            if QUERY_ID.fullmatch(query_id or ""):
-                info["users"][user or ""] = info["users"].get(user or "", 0) + 1
+            info["users"][user] = info["users"].get(user, 0) + 1
+            if QUERY_ID.fullmatch(query_id):
                 info["query_ids"].append(query_id)
             else:
                 info["unmatched"] += 1   # the query id is missing evidence
         elif not engine:
-            # A replace batch (unstamped delete, stamped append) or a stamped
-            # ClubElo bulk append. Everything else is not the source's output.
-            if operation == "delete" or (operation == "append" and (
-                    stamped == "replace-identity-partition-batch" or source == "clubelo")):
+            if ((operation == "append" and (stamped == BATCH or source == "clubelo"))
+                    or (operation == "delete" and snapshot_id in closed)):
                 info["catalog"] += 1
             else:
                 info["unstamped"] += 1
@@ -609,13 +633,17 @@ AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 00:00:00 UTC'""")
 
 def valid_evidence(info):
     counters = ("snapshots", "trino", "catalog", "unmatched", "unstamped", "other_engine")
+    users = info.get("users") if isinstance(info, dict) else None
+    query_ids = info.get("query_ids") if isinstance(info, dict) else None
     return (isinstance(info, dict) and set(info) == set(empty_evidence())
             and all(type(info[key]) is int and info[key] >= 0 for key in counters)
-            and isinstance(info["users"], dict)
-            and all(isinstance(key, str) and type(value) is int and value >= 0
-                    for key, value in info["users"].items())
-            and isinstance(info["query_ids"], list)
-            and all(isinstance(value, str) and QUERY_ID.fullmatch(value) for value in info["query_ids"]))
+            and isinstance(query_ids, list)
+            and info["snapshots"] == sum(info[key] for key in counters[1:])
+            and info["trino"] == len(query_ids) + info["unmatched"]
+            and isinstance(users, dict)
+            and all(isinstance(key, str) and type(value) is int and value >= 1 for key, value in users.items())
+            and sum(users.values()) == info["trino"]
+            and all(isinstance(value, str) and QUERY_ID.fullmatch(value) for value in query_ids))
 
 
 def empty_metrics():
@@ -643,10 +671,12 @@ def summarize(db, day, evidence):
     for key, facts_text in db.execute("SELECT id,facts FROM events WHERE day=?", (day_text,)):
         facts = json.loads(facts_text)
         actor = facts["actor"]
-        reads, outputs = facts["reads"], [name for name in facts["outputs"] if not STAGING.fullmatch(name)]
+        # Facts stored before staging tables were excluded still name them.
+        reads = {name: count for name, count in facts["reads"].items() if not STAGING.fullmatch(name)}
+        outputs = [name for name in facts["outputs"] if not STAGING.fullmatch(name)]
         if actor == "source" and (reads or (facts["finished"] and outputs)):
             source_activity += 1
-        violations.update(event_violations({**facts, "outputs": outputs}))
+        violations.update(event_violations({**facts, "reads": reads, "outputs": outputs}))
         if actor == "airflow" and facts.get("maintenance") is True:
             pass  # the platform's own DDL maintenance of Bronze tables
         elif actor == "airflow" and reads and not outputs:
@@ -656,8 +686,6 @@ def summarize(db, day, evidence):
         if facts["uncertain"]:
             reasons.add("uncertain_event")
         for name, count in reads.items():
-            if STAGING.fullmatch(name):
-                continue
             tables[name]["input_records"][actor] += count
             tables[name]["input_records_total"] += count
         for name in outputs:

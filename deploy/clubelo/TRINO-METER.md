@@ -34,9 +34,11 @@
 - Снимки делятся по движку. Коммит Trino (`trino_user`, `trino_query_id`) сопоставляется
   с успешным запросом записи по query id; коммит Trino без query id — недостающее
   доказательство (`unattributed_snapshot_or_output`). Коммиты каталога не имеют принципала
-  и узнаются по штампу: аппенд ClubElo несёт `dpf.source=clubelo` (`ClubEloIcebergWriter`),
-  замена партиции — `dpf.operation=replace-identity-partition-batch` и незаштампованная
-  delete-половина. Коммит без штампа, другого движка или принципала — `non_source_output`.
+  и узнаются по штампу и цепочке родителей: аппенд ClubElo несёт `dpf.source=clubelo`
+  (`ClubEloIcebergWriter`), замена партиции — аппенд с
+  `dpf.operation=replace-identity-partition-batch`, а её незаштампованный `delete` засчитывается
+  только когда именно этот аппенд идёт следующим с ним как родителем. Коммит без штампа,
+  другого движка или принципала — `non_source_output`.
 - Чтение таблиц ClubElo от общей учётки `airflow` даёт `unattributed_airflow_read`, день
   не PASS. Поэтому сторожа ClubElo (часовой сторож простоя и секция утренней сводки)
   читают через `clubelo_trino_ro.sh`, то есть от `src_clubelo`.
