@@ -118,8 +118,8 @@ def test_attendance_lane_maps_recorded_pages_to_observation_rows():
     assert arsenal['club_name'] == 'Arsenal FC'
     assert arsenal['capacity'] == 60704
     assert arsenal['spectators_total'] == 1151376
-    assert arsenal['parser_revision'] == 'attendance-v1'
-    assert chelsea['parser_revision'] == 'attendance-v1'
+    assert arsenal['parser_revision'] == 'attendance-v2'
+    assert chelsea['parser_revision'] == 'attendance-v2'
     assert all(row['source_url'] in (ATTENDANCE_START, ATTENDANCE_PAGE_2)
                for row in outcome.rows)
     assert all(row['observation_status'] == 'observed_present' for row in outcome.rows)

@@ -31,7 +31,7 @@ confirmed_empty_referee_season_aggregates(
 ) -> RefereeAggregateResult
 ```
 
-Parser/schema revisions are `referees-v1` / `1`. Referee IDs are canonical positive decimal strings; competition IDs are uppercase; edition IDs are the season start year. `24/25` becomes `2024`, `1999/00` becomes `1999`, and calendar-year `2026` remains `2026`. Two-part seasons must name consecutive years. Every history row's visible competition link must match the requested competition.
+Parser/schema revisions are `referees-v2` / `1`. Referee IDs are canonical positive decimal strings; competition IDs are uppercase; edition IDs are the season start year. `24/25` becomes `2024`, `1999/00` becomes `1999`, and calendar-year `2026` remains `2026`. Two-part seasons must name consecutive years. Every history row's visible competition link must match the requested competition.
 
 ## Grain, fields and metrics
 

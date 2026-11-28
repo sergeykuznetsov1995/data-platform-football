@@ -58,8 +58,11 @@ PAGINATED = frozenset({'agency_clients', 'agency_directory'})
 _BASE = 'https://www.transfermarkt.com'
 _PATH = r'https://www\.transfermarkt\.com/[A-Za-z0-9_-]+/'
 _ID = r'[1-9][0-9]*'
+# A statistics page is addressed by its land filter, or since 2026-11-28 by
+# the page of the all-countries grid alone.
 _STATISTICS_URL = re.compile(r'https://www\.transfermarkt\.com/berater/beraterfirmenuebersicht/berater'
-                             r'(?:\?landid=(0|[1-9][0-9]{0,3})(?:&page=([1-9][0-9]{0,4}))?)?')
+                             r'(?:\?landid=(0|[1-9][0-9]{0,3})(?:&page=([1-9][0-9]{0,4}))?'
+                             r'|\?page=([1-9][0-9]{0,4}))?')
 _AGENCY = re.compile(rf'({_PATH}beraterfirma/berater/({_ID}))(?:/page/({_ID}))?/?')
 _AGENT = re.compile(rf'{_PATH}profil/berater/({_ID})/?')
 _PLAYER = re.compile(rf'{_PATH}profil/spieler/({_ID})/?')
@@ -449,7 +452,7 @@ def extract(captures, scope, *, extracted_at, universe_version):
 
     def outcome(entity, capture, status, reason, records=(), proof=None):
         return make_outcome(entity, capture, scope, status=status, reason=f'{endpoint}:{reason}',
-                            records=records, proof=proof, parser_revision='agency-sections-v5',
+                            records=records, proof=proof, parser_revision='agency-sections-v6',
                             extracted_at=extracted_at, universe_version=universe_version)
 
     for capture in captures:
@@ -515,7 +518,7 @@ def agency_statistics_route(url):
     match = _STATISTICS_URL.fullmatch(url)
     if not match:
         raise AgencyError('agency_statistics_url_invalid')
-    return match[1], int(match[2] or '1')
+    return match[1], int(match[2] or match[3] or '1')
 
 
 def _statistics_page(capture, statistics_page):
@@ -531,7 +534,9 @@ def _statistics_page(capture, statistics_page):
     if len(keys) != 1:
         raise AgencyError('agency_statistics_keys_missing')
     land, published_page = agency_statistics_route(_absolute(keys[0]['title']))
-    if land is None or requested_land not in (None, land) or number != published_page:
+    # The all-countries page publishes no land filter; since 2026-11-28 its
+    # keys, canonical link and pager all agree on that.
+    if requested_land not in (None, land) or number != published_page:
         raise AgencyError('agency_statistics_scope_mismatch')
     canonical = soup.select('meta[property="og:url"]')
     if len(canonical) != 1 or agency_statistics_route(_absolute(canonical[0].get('content'))) not in {(land, 1), (land, number)}:

@@ -10,7 +10,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
-REFEREE_PARSER_REVISION = 'referees-v1'
+REFEREE_PARSER_REVISION = 'referees-v2'
 REFEREE_SCHEMA_REVISION = '1'
 REFEREE_OBSERVATION_STATUSES = frozenset({
     'observed_present', 'observed_empty', 'explicit_none', 'not_applicable',
@@ -43,6 +43,7 @@ _COMPETITION_HREF_RE = re.compile(
 _DATE_FORMATS = ('%d/%m/%Y', '%d.%m.%Y', '%Y-%m-%d', '%b %d, %Y', '%B %d, %Y')
 _DIRECTORY_HEADERS = {
     'referee': 'identity',
+    'referees': 'identity',
     'debut': 'debut_date',
     'matches': 'matches_officiated',
     'appearances': 'matches_officiated',
@@ -60,7 +61,13 @@ _DIRECTORY_HEADERS = {
     'penalty kicks': 'penalties_awarded',
     'penalties per match': 'average_penalties_awarded',
     'penalties per game': 'average_penalties_awarded',
+    'penalty kicks per match': 'average_penalties_awarded',
+    'penalty kicks per game': 'average_penalties_awarded',
+    # Published since 2026-11-28.  The profile and the debut date already
+    # carry these facts, so the directory reads this column past.
+    'age at debut': 'age_at_debut',
 }
+_DIRECTORY_PASSED_COLUMNS = frozenset({'age_at_debut'})
 _HISTORY_HEADERS = {
     'season': 'season',
     'competition': 'competition',
@@ -262,7 +269,8 @@ def parse_referee_directory_page(
     else:
         fields = _detailed_fields(thead, _DIRECTORY_HEADERS, 'directory_headers_changed')
         required = {'identity', 'debut_date', *REFEREE_COUNT_METRICS, *REFEREE_AVERAGE_METRICS}
-        if set(fields) != required or len(set(fields)) != len(fields):
+        if (set(fields) - _DIRECTORY_PASSED_COLUMNS != required or len(set(fields)) != len(fields)
+                or any(fields.count(field) != 1 for field in _DIRECTORY_PASSED_COLUMNS & set(fields))):
             raise RefereeParseError('directory_headers_changed')
 
     referees: dict[str, RefereeDirectoryEntry] = {}
@@ -431,7 +439,7 @@ def _detailed_fields(thead: Any, mapping: dict[str, str], reason: str) -> list[s
     fields = []
     for header in headers:
         text = ' '.join(header.get_text(' ', strip=True).lower().split())
-        field = mapping.get(text)
+        field = mapping.get(_header_label(text, header))
         if field is None:
             raise RefereeParseError(reason)
         try:
@@ -442,6 +450,22 @@ def _detailed_fields(thead: Any, mapping: dict[str, str], reason: str) -> list[s
             raise RefereeParseError(reason)
         fields.extend([field] * span)
     return fields
+
+
+def _header_label(text: str, header: Any) -> str:
+    """Name a column by its text, or by the title of the icon that replaced it.
+
+    Since 2026-11-28 the directory names its card columns by icon only, and
+    marks the per-match average of a card with "ø-" before the icon.
+    """
+    titles = {' '.join(icon['title'].lower().split()) for icon in header.find_all(title=True)}
+    if len(titles) != 1 or '' in titles:
+        return text
+    if not text:
+        return titles.pop()
+    if text in {'ø', 'ø-'}:
+        return f'{titles.pop()} per match'
+    return text
 
 
 def _directory_entry(identity_cell: Any, debut_cell: Any) -> RefereeDirectoryEntry:

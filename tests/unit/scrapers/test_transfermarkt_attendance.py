@@ -55,6 +55,16 @@ def single_page() -> AttendancePage:
     return fixture_page('single_page.html')
 
 
+def crest_page() -> AttendancePage:
+    return fixture_page('with_league_table.html')
+
+
+LEAGUE_BOX = b'<div class="box"><h2 class="content-box-headline">Table</h2>'
+EMPTY_ATTENDANCE_GRID = (b'<div class="box"><div class="grid-view"><table class="items">'
+                         b'<thead><tr><th>#</th><th>Stadium</th><th>Capacity</th>'
+                         b'<th>Spectators</th><th>Average</th></tr></thead><tbody></tbody></table></div></div>')
+
+
 def multi_pages() -> tuple[AttendancePage, AttendancePage]:
     return (
         fixture_page('page_1.html'),
@@ -120,7 +130,7 @@ def test_extraction_has_full_lineage_deterministic_batch_and_no_match_fields():
         assert row['extracted_at'] == row['_ingested_at'] == EXTRACTED
         assert row['source_capture_id'] == 'capture-single_page.html'
         assert row['source_body_hash'] == hashlib.sha256(single_page().body).hexdigest()
-        assert row['parser_revision'] == 'attendance-v1'
+        assert row['parser_revision'] == 'attendance-v2'
         assert row['schema_revision'] == '1'
         assert row['scope_id'] == 'scope-attendance'
         assert row['run_id'] == 'run-attendance'
@@ -415,6 +425,52 @@ def test_bad_club_link_and_header_fail_whole_capture():
     bad_header = single_page().body.replace(b'<th>Spectators</th>', b'<th>Attendance</th>')
     with pytest.raises(AttendanceParseError, match='attendance_headers_changed'):
         parse_attendance([make_page(bad_header)], start_url=START, competition_id='GB1', edition_id=2025)
+
+
+def test_page_with_league_table_reads_only_the_attendance_grid_and_the_crest_layout():
+    result = parse_attendance([crest_page()], start_url=START, competition_id='GB1', edition_id=2025)
+    assert result.status == 'observed_present' and result.page_count == 1
+    assert [(row.club_id, row.club_name, row.stadium_name) for row in result.rows] == [
+        ('985', 'Manchester United', 'Old Trafford'), ('379', 'West Ham United', 'London Stadium')]
+    united, west_ham = result.rows
+    # The crest and the club name carry the same season-schedule link.
+    assert united.natural_key == ('GB1', '2025', '985', CAPTURED)
+    assert united.stadium_url == 'https://www.transfermarkt.com/985tm/stadion/verein/985'
+    assert (united.capacity, united.spectators_total, united.spectators_average) == (74158, 1405516, 73975)
+    assert (west_ham.capacity, west_ham.spectators_total, west_ham.spectators_average) == (62500, 1184601, 62347)
+    # This grid publishes neither matches, sold out nor capacity filled.
+    assert united.matches is None and united.sold_out is None and united.capacity_filled_raw == ''
+    assert united.observation_status == 'observed_present' and united.status_reason == 'published_values_present'
+
+
+def test_league_table_alone_is_not_an_attendance_grid_and_two_attendance_grids_stay_ambiguous():
+    _head, league = crest_page().body.split(LEAGUE_BOX, 1)
+    # A lone foreign grid is one grid whose headers are not the attendance ones.
+    with pytest.raises(AttendanceParseError, match='attendance_headers_changed'):
+        parse_attendance([make_page(b'<html><body>' + LEAGUE_BOX + league)], start_url=START,
+                         competition_id='GB1', edition_id=2025)
+    twice = crest_page().body.replace(b'</body>', EMPTY_ATTENDANCE_GRID + b'</body>')
+    with pytest.raises(AttendanceParseError, match='attendance_table_ambiguous'):
+        parse_attendance([make_page(twice)], start_url=START, competition_id='GB1', edition_id=2025)
+    # A changed attendance header is still reported as such beside the league table.
+    changed = crest_page().body.replace(b'>Spectators</th>', b'>Attendance</th>')
+    with pytest.raises(AttendanceParseError, match='attendance_headers_changed'):
+        parse_attendance([make_page(changed)], start_url=START, competition_id='GB1', edition_id=2025)
+
+
+@pytest.mark.parametrize('old,new,reason', [
+    (b'<a href="/west-ham-united/spielplan/verein/379/saison_id/2025" title="West Ham United">West Ham United</a>',
+     b'<a href="/west-ham-united/startseite/verein/379">West Ham United</a>', 'club_identity_invalid'),
+    (b'<a href="/west-ham-united/spielplan/verein/379/saison_id/2025" title="West Ham United">West Ham United</a>',
+     b'<a href="/west-ham-united/spielplan/verein/380/saison_id/2025">West Ham United</a>', 'club_identity_invalid'),
+    (b'<a href="/379tm/stadion/verein/379">London Stadium</a>', b'London Stadium', 'attendance_club_layout_changed'),
+    (b'<a href="/west-ham-united/spielplan/verein/379/saison_id/2025" title="West Ham United">West Ham United</a>',
+     b'<a href="/west-ham-united/spielplan/verein/0379/saison_id/2025">West Ham United</a>', 'club_identity_invalid'),
+])
+def test_crest_layout_keeps_one_club_link_and_needs_the_stadium_link(old, new, reason):
+    body = crest_page().body.replace(old, new)
+    with pytest.raises(AttendanceParseError, match=reason):
+        parse_attendance([make_page(body)], start_url=START, competition_id='GB1', edition_id=2025)
 
 
 def test_german_headers_and_thousands_separators_are_supported():

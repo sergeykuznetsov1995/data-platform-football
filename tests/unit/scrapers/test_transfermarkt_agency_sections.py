@@ -386,6 +386,31 @@ def test_statistics_rows_keep_the_published_filter_next_url_and_only_this_page()
     assert lane.scope_from_url('agency_statistics', result.rows[0]['next_page_url']) == {'statistics_page': '12/2'}
 
 
+def test_all_countries_statistics_page_publishes_no_land_and_pages_without_it():
+    result, = observe(capture('agency_statistics', STATISTICS,
+                              (FIXTURES / 'statistics-all-countries.html').read_text()))
+    assert result.status == 'observed_present' and result.parser_revision == 'agency-sections-v6'
+    assert [(r['agency_id'], r['agency_country'], r['published_player_count']) for r in result.rows] == [
+        ('440', 'United States', 1541), ('190', 'United Kingdom', 1082)]
+    assert all((r['published_land_id'], r['statistics_page'], r['page_number'], r['next_page_url']) ==
+               (None, 'default/1', 1, STATISTICS + '?page=2') for r in result.rows)
+    assert lane.scope_from_url('agency_statistics', result.rows[0]['next_page_url']) == {'statistics_page': 'default/2'}
+    assert core.plan_for_outcome(result, captured_at=result.capture.captured_at,
+                                 scope_values={'statistics_page': 'default/1'}).rows
+
+
+@pytest.mark.parametrize('old,new', [
+    ('berater?page=3', 'berater?landid=12&page=3'),
+    ('title="/berater/beraterfirmenuebersicht/berater"><span>', 'title="/berater/beraterfirmenuebersicht/berater?landid=12"><span>'),
+    ('berater?page=2">Next', 'berater?page=4">Next'),
+    ('<span>190</span>', ''),
+])
+def test_damaged_all_countries_statistics_page_never_reports_rows(old, new):
+    html = (FIXTURES / 'statistics-all-countries.html').read_text()
+    result, = observe(capture('agency_statistics', STATISTICS, html.replace(old, new)))
+    assert result.status == 'error' and not result.rows
+
+
 @pytest.mark.parametrize('old,new', [
     ('&amp;page=2', '&amp;page=3'), ('<span>5024</span>', '<span>440</span>'),
     ('<span>440</span>', ''), ('&amp;page=2', '&amp;sort=name'), ('landid=12&amp;page=2', 'landid=1&amp;page=2'),
@@ -397,7 +422,8 @@ def test_damaged_statistics_page_never_reports_an_empty_directory(old, new):
     assert result.status == 'error' and not result.rows
 
 
-@pytest.mark.parametrize('suffix', ['?sort=firma', '?page=2', '?landid=12&page=00', '?landid=12&landid=3',
+@pytest.mark.parametrize('suffix', ['?sort=firma', '?page=00', '?page=2&landid=12', '?page=2&page=3',
+                                     '?landid=12&page=00', '?landid=12&landid=3',
                                      '?landid=12&x=1', '?landid=12#fragment'])
 def test_statistics_query_allowlist_includes_only_documented_pagination(suffix):
     from scrapers.transfermarkt import raw_store
@@ -407,3 +433,4 @@ def test_statistics_query_allowlist_includes_only_documented_pagination(suffix):
     with pytest.raises(ValueError):
         raw_store._safe_url(STATISTICS + suffix)
     assert raw_store._safe_url(STATISTICS + '?landid=12&page=2') == STATISTICS + '?landid=12&page=2'
+    assert raw_store._safe_url(STATISTICS + '?page=2') == STATISTICS + '?page=2'
