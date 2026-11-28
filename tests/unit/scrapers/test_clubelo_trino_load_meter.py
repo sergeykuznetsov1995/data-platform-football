@@ -516,22 +516,54 @@ def test_snapshots_are_attributed_by_the_committing_engine(tmp_path):
     assert (report["tables"][TABLE]["snapshots"], report["tables"][TABLE]["trino_snapshots"],
             report["tables"][TABLE]["catalog_snapshots"]) == (2, 0, 2)
     unattributed = {"unattributed_snapshot_or_output"}
-    # A Trino commit without its query, an append the bulk writer did not stamp,
-    # and a Trino commit without its query id cannot be attributed.
-    for rows in ([trino_commit("20260301_120000_00009_wm2jf")], [("append", "", "", "", "")],
+    # The bulk writer's plain append carries no stamp at all (clubelo_raw_page).
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("append", "", "", "", "")]}))
+    assert report["verdict"] == "PASS" and report["tables"][TABLE]["catalog_snapshots"] == 1
+    # A Trino commit whose query was not stored cannot be matched.
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [trino_commit("20260301_120000_00009_wm2jf")]}))
+    assert report["verdict"] == "INCOMPLETE" and unattributed <= set(report["incomplete"])
+    # A shape neither Trino nor the bulk writer produces, another engine, another
+    # principal, or a Trino commit without its query id is not the source's output.
+    for rows in ([("overwrite", "", "", "", "")], [("append", "spark-3.5", "bob", "", "")],
+                 [trino_commit("20260301_120000_00009_wm2jf", user="bob")],
                  [("overwrite", "Trino", "src_clubelo", "", "")]):
         report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: rows}))
-        assert report["verdict"] == "INCOMPLETE" and unattributed <= set(report["incomplete"]), rows
-    # Another engine or principal committing to a ClubElo table is a violation.
-    for rows in ([("append", "spark-3.5", "bob", "", "")], [trino_commit("20260301_120000_00009_wm2jf", user="bob")]):
-        report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: rows}))
         assert report["verdict"] == "VIOLATION" and "non_source_output" in report["violations"], rows
-    # A successful data write is matched to its committed snapshot by query id.
+    # A query id is matched per table: the write to one table cannot stand in for a
+    # commit to another. (SECOND is now a known table and needs its evidence too.)
     sink.capture(event(4, reads=(), output=TABLE, sql=f"insert into bronze.{TABLE} values (1)"), NOW.isoformat())
-    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: bulk}))
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [], SECOND: [trino_commit("20260301_120000_00004_wm2jf")]}))
     assert unattributed <= set(report["incomplete"])
-    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [trino_commit("20260301_120000_00004_wm2jf")]}))
+    assert report["tables"][SECOND]["trino_snapshots"] == 1
+    assert not any(report["tables"][SECOND]["successful_outputs"].values())
+    # A successful data write is matched to its committed snapshot by query id.
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: bulk, SECOND: []}))
+    assert unattributed <= set(report["incomplete"])
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [trino_commit("20260301_120000_00004_wm2jf")], SECOND: []}))
     assert report["verdict"] == "PASS" and report["incomplete"] == []
+
+
+def test_stored_report_without_a_table_in_its_evidence_never_renders_pass(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    club.aggregate(root, DAY, monitor(tmp_path, {TABLE: []}))
+    assert " PASS " in club.render(root)
+    path = root / "daily" / f"{DAY}.json"
+    for tables in ({}, {SECOND: club.empty_evidence()}):
+        report = json.loads(path.read_text())
+        report["snapshot_evidence"]["tables"] = tables
+        path.write_text(json.dumps(report))
+        assert " PASS " not in club.render(root)
+
+
+def test_describe_hides_no_write():
+    assert club.classify(event(reads=(), sql=f"DESCRIBE iceberg.bronze.{TABLE}"), None) is None
+    two = f"DESCRIBE iceberg.bronze.{TABLE}; DROP TABLE iceberg.bronze.{TABLE}"
+    for user in ("src_clubelo", "airflow"):
+        assert club.classify(event(reads=(), sql=two, user=user), None)["uncertain"]
+    dropped = club.classify(event(reads=(), output=TABLE, user="airflow", sql=two), None)
+    assert dropped["outputs"] == [TABLE] and club.event_violations(dropped) == {"airflow_table_use"}
 
 
 def test_legacy_facts_with_staging_tables_do_not_break_the_report(tmp_path):

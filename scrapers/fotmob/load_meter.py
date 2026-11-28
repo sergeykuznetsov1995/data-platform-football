@@ -1064,7 +1064,7 @@ def _rotate(root: Path, now: datetime) -> None:
     # One raw file is appended per kept event, so "raw" grows by tens of
     # thousands of entries a day. A long-running receiver sweeps a root at
     # most once an hour; one-shot cron callers keep their per-run sweep.
-    stamp = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    stamp = (now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
     last = _rotated_at.get(str(root))
     if last is not None and last <= stamp < last + ROTATE_INTERVAL:
         return

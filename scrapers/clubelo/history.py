@@ -183,13 +183,18 @@ class IcebergHistoryStore:
         ``IcebergWriter.read_table`` repeats the query to learn the column
         names and then closes that cursor unread. Trino reports the cancelled
         repeat as a failed query, and the Trino meter refuses such a day
-        (#2132). The names are known here, so one fetch is enough.
+        (#2132). The names are known here, so one fetch is enough. The
+        statement is the one ``read_table`` builds: validated table name and
+        the requested columns.
         """
         import pandas as pd
 
+        from scrapers.base.sql_validator import validate_catalog_qualified_name
+
         manager = self.writer._get_trino_manager()
         names = ", ".join(f'"{column}"' for column in columns)
-        rows = manager.execute_query(f"SELECT {names} FROM {self.writer.catalog}.{self.database}.{table}")
+        table_ref = validate_catalog_qualified_name(self.writer.catalog, self.database, table)
+        rows = manager.execute_query(f"SELECT {names} FROM {table_ref}")
         return pd.DataFrame(rows, columns=columns)
 
     def known_slugs(self) -> Set[str]:

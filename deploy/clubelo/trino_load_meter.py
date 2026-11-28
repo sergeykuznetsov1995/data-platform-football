@@ -554,9 +554,11 @@ def empty_evidence():
 def snapshots(client, day, names):
     """Snapshot rows of one UTC day, tagged by the engine that committed them.
 
-    Trino stamps ``trino_user`` and ``trino_query_id``; the platform's bulk
-    writer reaches the catalog directly and stamps only ``dpf.operation`` on
-    its appends. Its delete half carries no stamp at all.
+    Trino stamps ``trino_user`` and ``trino_query_id``. The platform's bulk
+    writer reaches the catalog directly and leaves no principal: its plain
+    appends carry no stamp at all, and an identity-partition replace is an
+    unstamped delete followed by an append stamped ``dpf.operation``. Any
+    other shape without an engine cannot be attributed.
     """
     selects = []
     for name in names:
@@ -588,7 +590,8 @@ AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 00:00:00 UTC'""")
             else:
                 info["unmatched"] += 1
         elif not engine:
-            if stamped or operation == "delete":
+            # The bulk writer's shapes: an append (stamped or not) and its delete half.
+            if operation in ("append", "delete"):
                 info["catalog"] += 1
             else:
                 info["unmatched"] += 1
@@ -669,14 +672,17 @@ def summarize(db, day, evidence):
             continue
         metrics["trino_snapshots"], metrics["catalog_snapshots"] = info["trino"], info["catalog"]
         # Every Trino commit needs the stored successful output of the same
-        # query, and every successful data write its committed snapshot.
+        # query on the same table, and every successful data write its
+        # committed snapshot. Procedures such as expire_snapshots report an
+        # output without committing one.
         committed = {digest(value.encode()) for value in info["query_ids"]}
         outputs = written.get(name, [])
         if (not committed <= {key for key, _ in outputs}
-                or any(not procedure and key not in committed for key, procedure in outputs)
-                or info["unmatched"]):
+                or any(not procedure and key not in committed for key, procedure in outputs)):
             reasons.add("unattributed_snapshot_or_output")
-        if info["other_engine"] or set(info["users"]) - {"src_clubelo", "airflow"}:
+        # A commit of a shape neither Trino nor the bulk writer produces, or by
+        # another engine or principal, is an output the source cannot own.
+        if info["unmatched"] or info["other_engine"] or set(info["users"]) - {"src_clubelo", "airflow"}:
             violations.add("non_source_output")
         if metrics["input_records_total"] > LIMIT:
             violations.add("input_record_limit")
@@ -688,8 +694,8 @@ def summarize(db, day, evidence):
             "scan_metric": "Trino QueryCompleted physical input records, including repeats and failed queries. "
                            "Iceberg ScanReports, rows and bytes require separate instrumentation.",
             "snapshot_metric": "Iceberg snapshots by committed_at. A Trino commit is matched to its successful "
-                               "output query by trino_query_id. Catalog commits are written by the platform bulk "
-                               "writer, which stamps no principal into the snapshot."}
+                               "output query by trino_query_id. Catalog commits (the bulk writer's appends and "
+                               "delete halves) carry no principal in the snapshot."}
 
 
 def write_report(root, day, report):

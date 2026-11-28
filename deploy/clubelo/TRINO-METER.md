@@ -32,9 +32,9 @@
 - `ALTER TABLE … EXECUTE optimize|expire_snapshots|remove_orphan_files` от `airflow` —
   обслуживание платформы, а не `airflow_table_use`.
 - Снимки делятся по движку. Коммит Trino (`trino_user`, `trino_query_id`) сопоставляется
-  с успешным запросом записи по query id. Снимки bulk-writer (`dpf.operation` и их
-  delete-половины) — коммиты каталога: в снимке нет принципала. Всё остальное даёт
-  `unattributed_snapshot_or_output` или `non_source_output`.
+  с успешным запросом записи по query id. Аппенды и delete-половины bulk-writer'а —
+  коммиты каталога: в снимке нет принципала, у простого аппенда нет и штампа. Коммит
+  другой формы, другого движка или принципала — `non_source_output`.
 - Чтение таблиц ClubElo от общей учётки `airflow` даёт `unattributed_airflow_read`, день
   не PASS. Поэтому сторожа ClubElo (часовой сторож простоя и секция утренней сводки)
   читают через `clubelo_trino_ro.sh`, то есть от `src_clubelo`.
