@@ -2700,6 +2700,84 @@ def test_scope_bundle_authoritative_empty_cannot_shrink_published_snapshot():
     writer.write_dataframe.assert_not_called()
 
 
+def _shrunk_incidents_bundle():
+    base = {"league": "WS-233-85", "season": "2026"}
+    return {
+        "league": "WS-233-85",
+        "season": "2026",
+        "entity_group": "season",
+        "datasets": {
+            "whoscored_schedule": [
+                dict(base, game_id=2040137),
+                dict(base, game_id=2040138),
+            ],
+            "whoscored_match_incidents": [
+                dict(base, game_id=2040138, entity_key="2040138:incidents[0]"),
+                dict(base, game_id=2040138, entity_key="2040138:incidents[1]"),
+            ],
+        },
+        "distinct_keys": {
+            "whoscored_schedule": "game_id",
+            "whoscored_match_incidents": "entity_key",
+        },
+        "payload_sha256": "a" * 64,
+        "raw_uris": ["s3://raw/schedule.json.gz"],
+    }
+
+
+@pytest.mark.unit
+def test_incidents_shrink_names_the_games_with_fewer_rows():
+    # #2473: the rejected snapshot says which game lost rows (2040137: 4 -> 0).
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [],
+        [('{"whoscored_schedule":2,"whoscored_match_incidents":6}',)],
+        [("wss2-" + "b" * 64,)],
+        [("2040137", "4"), ("2040138", "2")],
+    ]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+
+    with pytest.raises(ValueError, match="published snapshot cannot shrink") as caught:
+        repository.commit_scope_bundle(**_shrunk_incidents_bundle())
+
+    message = str(caught.value)
+    assert message.startswith(
+        "whoscored_match_incidents completeness guard: new=2, old=6, "
+        "published snapshot cannot shrink"
+    )
+    assert message.endswith("; games with fewer rows: [2040137:4->0]")
+    sql = [call.args[0] for call in trino.execute_query.call_args_list]
+    assert sql[2].startswith("SELECT batch_id FROM")
+    assert "AND _scope_batch_id = 'wss2-" + "b" * 64 + "' GROUP BY game_id" in sql[3]
+    assert (
+        "FROM whoscored_match_incidents WHERE league = 'WS-233-85' "
+        "AND season = '2026'" in sql[3]
+    )
+    writer.write_dataframe.assert_not_called()
+
+
+@pytest.mark.unit
+def test_incidents_shrink_keeps_plain_guard_message_when_detail_is_unavailable():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [],
+        [('{"whoscored_schedule":2,"whoscored_match_incidents":6}',)],
+        RuntimeError("trino unavailable"),
+    ]
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+
+    with pytest.raises(ValueError) as caught:
+        repository.commit_scope_bundle(**_shrunk_incidents_bundle())
+
+    assert str(caught.value) == (
+        "whoscored_match_incidents completeness guard: new=2, old=6, "
+        "published snapshot cannot shrink"
+    )
+    writer.write_dataframe.assert_not_called()
+
+
 @pytest.mark.unit
 def test_missing_schedule_ids_are_read_only_and_bound_to_scope():
     trino = MagicMock()
