@@ -127,7 +127,7 @@ def test_two_page_capture_reconciles_metrics_and_preserves_raw_lineage(tmp_path)
         assert row['source_body_hash'] and row['source_url'] in {first_url, second_url}
         assert row['scope_id'] == value['scope_id'] and row['cycle_id'] == 'cycle-test'
         assert row['run_id'] == 'run-test' and row['universe_version'] == 'registry-test'
-        assert row['parser_revision'] == 'referees-v1'
+        assert row['parser_revision'] == 'referees-v2'
 
 
 def test_next_page_cannot_turn_directory_into_match_discovery(tmp_path):

@@ -12,6 +12,7 @@ from scrapers.transfermarkt.referees import (
     REFEREE_AGGREGATE_OBSERVATION_KEY,
     REFEREE_AVERAGE_METRICS,
     REFEREE_COUNT_METRICS,
+    REFEREE_METRICS,
     REFEREE_OBSERVATION_STATUSES,
     REFEREE_PARSER_REVISION,
     REFEREE_SCHEMA_REVISION,
@@ -29,6 +30,7 @@ pytestmark = pytest.mark.unit
 FIXTURES = Path(__file__).resolve().parents[2] / 'fixtures' / 'transfermarkt' / 'referees'
 DIRECTORY_COMPACT = (FIXTURES / 'directory_compact.html').read_text()
 DIRECTORY_DETAILED = (FIXTURES / 'directory_detailed.html').read_text()
+DIRECTORY_ICONS = (FIXTURES / 'directory_icons.html').read_text()
 PROFILE = (FIXTURES / 'profile.html').read_text()
 HISTORY_COMPACT = (FIXTURES / 'history_compact.html').read_text()
 HISTORY_DETAILED = (FIXTURES / 'history_detailed.html').read_text()
@@ -104,6 +106,46 @@ def test_detailed_directory_reads_published_averages():
     assert len(result.aggregates) == len(REFEREE_COUNT_METRICS) + len(REFEREE_AVERAGE_METRICS)
     assert aggregate(result, '101', 'average_yellow_cards').value == Decimal('4.36')
     assert aggregate(result, '101', 'average_direct_red_cards').value == Decimal('0.00')
+
+
+def test_directory_with_icon_headers_reads_every_metric_and_passes_the_debut_age():
+    result = parse_referee_directory_page(
+        DIRECTORY_ICONS, competition_id='GB1', edition_id='2025',
+    )
+    assert len(result.referees) == 2
+    assert len(result.aggregates) == 2 * len(REFEREE_METRICS)
+    entry = next(row for row in result.referees if row.referee_id == '847')
+    assert entry.as_dict() == {
+        'referee_id': '847', 'name': 'Anthony Taylor',
+        'nationality': 'Cheshire', 'debut_date': '2010-02-03',
+    }
+    assert aggregate(result, '847', 'matches_officiated').value == Decimal('31')
+    assert aggregate(result, '847', 'matches_officiated').source_column == 'matches_officiated'
+    assert aggregate(result, '847', 'yellow_cards').value == Decimal('121')
+    assert aggregate(result, '847', 'average_yellow_cards').value == Decimal('3.90')
+    second_yellow = aggregate(result, '847', 'second_yellow_cards')
+    assert second_yellow.value is None
+    assert second_yellow.observation_status == 'explicit_none' and second_yellow.raw_value == '-'
+    assert aggregate(result, '847', 'average_second_yellow_cards').value is None
+    assert aggregate(result, '847', 'direct_red_cards').value == Decimal('2')
+    assert aggregate(result, '847', 'average_direct_red_cards').value == Decimal('0.06')
+    assert aggregate(result, '847', 'penalties_awarded').value == Decimal('6')
+    assert aggregate(result, '847', 'average_penalties_awarded').value == Decimal('0.19')
+    # "Age at debut" is read past: it is not an aggregate.
+    assert {row.metric for row in result.aggregates} == set(REFEREE_METRICS)
+
+
+@pytest.mark.parametrize('old,new', [
+    ('title="Penalty kicks"', 'title="Fouls"'),
+    ('&oslash;-<span class="icons_sprite icon-gelbekarte-table-header"', '<span class="icons_sprite icon-gelbekarte-table-header"'),
+    ('<th class="rechts" id="yw1_c2">', '<th class="rechts" id="yw1_c2">x</th><th class="rechts" id="yw1_c2">'),
+    ('title="Appearances"', ''),
+])
+def test_unknown_or_repeated_icon_header_fails_closed(old, new):
+    with pytest.raises(RefereeParseError, match='directory_headers_changed'):
+        parse_referee_directory_page(
+            DIRECTORY_ICONS.replace(old, new), competition_id='GB1', edition_id='2025',
+        )
 
 
 def test_compact_history_preserves_seasons_without_inventing_averages():

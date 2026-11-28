@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
-ATTENDANCE_PARSER_REVISION = 'attendance-v1'
+ATTENDANCE_PARSER_REVISION = 'attendance-v2'
 ATTENDANCE_SCHEMA_REVISION = '1'
 ATTENDANCE_TABLE = 'iceberg.bronze.transfermarkt_attendance_observations'
 ATTENDANCE_KEY = ('competition_id', 'edition_id', 'club_id', 'observed_at')
@@ -38,7 +38,11 @@ _LINEAGE_FIELDS = (
 _FORBIDDEN_MATCH_FIELDS = frozenset({'match_id', 'match_date', 'matchday_id', 'fixture_id'})
 _COMPETITION_RE = re.compile(r'[A-Za-z0-9_-]+')
 _DIGITS_RE = re.compile(r'[0-9]+')
-_CLUB_HREF_RE = re.compile(r'^/[^/]+/startseite/verein/([1-9][0-9]*)(?:[/?#].*)?$')
+# The club cell links the club by its profile page or, since 2026-11-28, by its
+# season schedule; both carry the same club id.
+_CLUB_HREF_RE = re.compile(r'^/[^/]+/(?:startseite|spielplan)/verein/([1-9][0-9]*)(?:[/?#].*)?$')
+_CLUB_PATHS = ('/startseite/verein/', '/spielplan/verein/')
+_STADIUM_PATH = '/stadion/verein/'
 _ATTENDANCE_PATH_RE = re.compile(
     r'^/[^/]+/besucherzahlen/wettbewerb/([A-Za-z0-9_-]+)/saison_id/([0-9]+)(?:/plus/[0-9]+)?/?$'
 )
@@ -352,22 +356,31 @@ def _row(tr, fields: list[str], *, competition: str, edition: str,
         match = _CLUB_HREF_RE.match(anchor['href'])
         if match is not None:
             club_links.append((match.group(1), anchor))
-        elif '/startseite/verein/' in anchor['href']:
+        elif any(path in anchor['href'] for path in _CLUB_PATHS):
             raise AttendanceParseError('club_identity_invalid')
     if not club_links:
         summary = ' '.join(cells[0].get_text(' ', strip=True).lower().split())
         if summary in {'total', 'total:', 'insgesamt', 'insgesamt:'}:
             return None
         raise AttendanceParseError('club_identity_invalid')
-    if len(club_links) != 1 or len({club_id for club_id, _ in club_links}) != 1:
+    # The crest and the club name can both carry the club link.
+    if (len({club_id for club_id, _ in club_links}) != 1
+            or len({anchor['href'] for _, anchor in club_links}) != 1):
         raise AttendanceParseError('club_identity_invalid')
-    club_id, club_anchor = club_links[0]
-    club_name = club_anchor.get_text(' ', strip=True)
+    club_id = club_links[0][0]
+    club_name = next((name for name in (
+        ' '.join(anchor.get_text(' ', strip=True).split()) for _, anchor in club_links) if name), '')
     inline = club_cell.find('table', class_='inline-table')
     detail_rows = inline.find_all('tr') if inline is not None else []
-    if not club_name or len(detail_rows) != 2:
+    detail_cells = [cell for row in detail_rows for cell in row.find_all('td', recursive=False)]
+    stadium_cells = [cell for cell in detail_cells
+                     if any(_STADIUM_PATH in anchor['href'] for anchor in cell.find_all('a', href=True))]
+    # Two published layouts put the stadium above the club name: with a crest
+    # beside the stadium, or without one.  The stadium row names it by link.
+    if not club_name or len(stadium_cells) > 1 or (
+            not stadium_cells and (len(detail_rows) != 2 or len(detail_cells) != 2)):
         raise AttendanceParseError('attendance_club_layout_changed')
-    stadium_cell = detail_rows[0]
+    stadium_cell = stadium_cells[0] if stadium_cells else detail_rows[0]
     stadium_name = stadium_cell.get_text(' ', strip=True)
     if stadium_name in _MISSING:
         stadium_name = None
@@ -413,6 +426,10 @@ def _parse_page(page: AttendancePage, *, competition: str,
         raise AttendanceParseError('invalid_utf8') from exc
     soup = BeautifulSoup(html, 'html.parser')
     tables = soup.select('table.items')
+    if len(tables) > 1:
+        # The page can carry another grid, such as the league table, beside the
+        # attendance grid.  Only the grid headed by the stadium column qualifies.
+        tables = [table for table in tables if _is_attendance_grid(table)]
     if len(tables) != 1:
         raise AttendanceParseError('attendance_table_missing' if not tables
                                    else 'attendance_table_ambiguous')
@@ -423,6 +440,15 @@ def _parse_page(page: AttendancePage, *, competition: str,
                  observed_at=observed_at)
             for tr in tbody.find_all('tr', recursive=False)]
     return [row for row in rows if row is not None], _next_url(soup, page.url)
+
+
+def _is_attendance_grid(table) -> bool:
+    """The attendance grid is the one headed by the stadium column."""
+    thead = table.find('thead', recursive=False)
+    if thead is None:
+        return False
+    heads = (' '.join(th.get_text(' ', strip=True).lower().split()) for th in thead.find_all('th'))
+    return any(_HEADER_ALIASES.get(head) == 'stadium' for head in heads)
 
 
 def parse_attendance(pages: Iterable[AttendancePage], *, start_url: str,
