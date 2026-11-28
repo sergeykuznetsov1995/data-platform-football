@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 import warnings
 from dataclasses import dataclass
@@ -54,9 +55,13 @@ logger = logging.getLogger("purge_sofascore_standings_duplicates")
 TABLE = "iceberg.bronze.sofascore_league_table"
 SNAPSHOTS_TABLE = 'iceberg.bronze."sofascore_league_table$snapshots"'
 REFS_TABLE = 'iceberg.bronze."sofascore_league_table$refs"'
+# Real ids look like 20261124_173750_86204_dyben or 20261121_120820_33877_3qvg9.
+QID = re.compile(r"[0-9]{8}_[0-9]{6}_[0-9]{5,}_[a-z0-9]{4,8}")
 
-# Every pinned column is compared both in the preflight and in the DELETE arm,
-# so a row that changed since the review can neither be deleted nor hide.
+# The preflight compares every pinned column. The DELETE arm carries all of
+# them but raw_fetched_at, which the preflight has already pinned at the
+# guarded snapshot, so a row that changed since the review can neither be
+# deleted nor hide.
 IDENTITY_COLUMNS = (
     "league",
     "season",
@@ -296,6 +301,13 @@ class SnapshotMetadata:
 
 
 @dataclass(frozen=True)
+class SnapshotNode:
+    snapshot_id: int
+    parent_id: int | None
+    operation: str
+
+
+@dataclass(frozen=True)
 class DeleteExecution:
     query_id_after_execute: str | None
     query_id_after_fetch: str | None
@@ -304,10 +316,11 @@ class DeleteExecution:
 
 @dataclass(frozen=True)
 class TableState:
-    """Rows found under every pinned name, plus the duplicate key census."""
+    """Rows found under every pinned name and key, plus the duplicate census."""
 
     stale: Mapping[StandingsRow, Sequence[Sequence[object]]]
     keepers: Mapping[StandingsRow, Sequence[Sequence[object]]]
+    key_counts: Mapping[StandingsRow, int]
     duplicate_keys: frozenset[tuple[str, str, str, str]]
 
 
@@ -328,8 +341,10 @@ def _sql_literal(value: object) -> str:
 
 
 def _execute(cursor, sql: str) -> list[Sequence[object]]:
+    compact = " ".join(sql.split())
+    logger.info("SQL: %s%s", compact[:180], "..." if len(compact) > 180 else "")
     cursor.execute(sql)
-    return cursor.fetchall()
+    return list(cursor.fetchall())
 
 
 def _partition_predicate(row: StandingsRow, *, with_name: bool) -> str:
@@ -366,6 +381,19 @@ def load_named_rows(cursor, row: StandingsRow) -> list[Sequence[object]]:
         f"WHERE {_partition_predicate(row, with_name=True)}"
     )
     return _execute(cursor, sql)
+
+
+def load_key_count(cursor, row: StandingsRow) -> int:
+    """Count every row under the pinned key, whatever name the team carries."""
+
+    rows = _execute(
+        cursor,
+        f"SELECT COUNT(*) FROM {TABLE} "
+        f"WHERE {_partition_predicate(row, with_name=False)}",
+    )
+    if len(rows) != 1 or len(rows[0]) != 1:
+        raise PurgeRefused("key row-count query returned an invalid shape")
+    return int(rows[0][0])
 
 
 def load_duplicate_keys(cursor) -> frozenset[tuple[str, str, str, str]]:
@@ -434,6 +462,31 @@ def rollback_call(snapshot_id: int) -> str:
     )
 
 
+def load_owned_snapshots(cursor, query_id: str) -> dict[int, SnapshotNode]:
+    """Every snapshot that one Trino query committed to this table."""
+
+    if not QID.fullmatch(query_id):
+        raise PurgeRefused(f"not a Trino query id: {query_id!r}")
+    rows = _execute(
+        cursor,
+        f"""
+SELECT snapshot_id, parent_id, operation
+FROM {SNAPSHOTS_TABLE}
+WHERE summary['trino_query_id'] = {_sql_literal(query_id)}
+""".strip(),
+    )
+    owned: dict[int, SnapshotNode] = {}
+    for snapshot_id, parent_id, operation in rows:
+        if snapshot_id is None or operation is None:
+            raise PurgeRefused("owned snapshot row is incomplete")
+        owned[int(snapshot_id)] = SnapshotNode(
+            snapshot_id=int(snapshot_id),
+            parent_id=None if parent_id is None else int(parent_id),
+            operation=str(operation),
+        )
+    return owned
+
+
 def conditional_rollback_instruction(
     *, pre_snapshot_id: int, purge_snapshot_id: int
 ) -> str:
@@ -445,13 +498,13 @@ def conditional_rollback_instruction(
 
 
 def load_table_state(cursor) -> TableState:
-    stale = {
-        row: load_named_rows(cursor, row) for row in STALE_ROWS
-    }
+    stale = {row: load_named_rows(cursor, row) for row in STALE_ROWS}
     keepers = {keeper: load_named_rows(cursor, keeper) for keeper in KEEPER_ROWS}
+    key_counts = {row: load_key_count(cursor, row) for row in STALE_ROWS}
     return TableState(
         stale=stale,
         keepers=keepers,
+        key_counts=key_counts,
         duplicate_keys=load_duplicate_keys(cursor),
     )
 
@@ -461,6 +514,11 @@ def _require_pinned_row(rows: Sequence[Sequence[object]], expected: StandingsRow
         raise PurgeRefused(
             f"{label} {expected.stable_id()}: expected exactly one row, "
             f"found {len(rows)}"
+        )
+    if len(rows[0]) < len(IDENTITY_COLUMNS):
+        raise PurgeRefused(
+            f"{label} {expected.stable_id()}: row has {len(rows[0])} columns, "
+            f"expected at least {len(IDENTITY_COLUMNS)}"
         )
     actual = {
         column: None if value is None else str(value)
@@ -477,21 +535,35 @@ def _require_pinned_row(rows: Sequence[Sequence[object]], expected: StandingsRow
 def validate_table_state(state: TableState) -> str:
     """Return ``"dirty"`` when the exact reviewed set can be deleted, else ``"clean"``."""
 
-    present = [row for row, rows in state.stale.items() if rows]
+    if len(KEEPER_ROWS) != len(STALE_ROWS):
+        raise PurgeRefused("pinned keeper set is not aligned with the stale set")
     expected_keys = frozenset(row.natural_key for row in STALE_ROWS)
+    present = [row for row, rows in state.stale.items() if rows]
     if not present:
         if state.duplicate_keys:
             raise PurgeRefused(
                 "pinned stale rows are gone but duplicate keys remain: "
                 f"{sorted(state.duplicate_keys)}"
             )
+        for row, count in state.key_counts.items():
+            if count != 1:
+                raise PurgeRefused(
+                    f"pinned stale rows are gone but key {row.natural_key} holds "
+                    f"{count} rows instead of the single keeper"
+                )
         return "clean"
     if len(present) != len(STALE_ROWS):
-        missing = sorted(set(STALE_ROWS) - set(present))
+        missing = sorted(set(STALE_ROWS) - set(present), key=lambda row: row.stable_id())
         raise PurgeRefused(
             "partially applied state: pinned stale rows are missing: "
             f"{[row.stable_id() for row in missing]}"
         )
+    for stale, count in state.key_counts.items():
+        if count != 2:
+            raise PurgeRefused(
+                f"key {stale.natural_key} holds {count} rows instead of exactly "
+                "the stale row and its keeper"
+            )
     for stale, keeper, stale_rows, keeper_rows in zip(
         STALE_ROWS, KEEPER_ROWS, state.stale.values(), state.keepers.values()
     ):
@@ -512,13 +584,59 @@ def validate_table_state(state: TableState) -> str:
     return "dirty"
 
 
+def validate_delete_lineage(
+    *,
+    pre_snapshot_id: int,
+    current: SnapshotMetadata,
+    owned: Mapping[int, SnapshotNode],
+) -> int:
+    """Prove that the current snapshot chain down to ``pre`` is only this DELETE.
+
+    Trino may commit a copy-on-write DELETE as one snapshot or as a rewritten
+    files snapshot followed by the delete one. Either way every snapshot must
+    carry the query id of this cursor and the current one must be the delete.
+    Returns the number of owned snapshots in the chain.
+    """
+
+    ownership_error: str | None = None
+    node_id = current.snapshot_id
+    chain = 0
+    while node_id != pre_snapshot_id and ownership_error is None:
+        node = owned.get(node_id)
+        if node is None:
+            ownership_error = (
+                f"snapshot {node_id} between pre-delete {pre_snapshot_id} and current "
+                f"{current.snapshot_id} was not committed by this DELETE"
+            )
+        elif node.parent_id is None or chain >= 8:
+            ownership_error = (
+                f"owned snapshot chain does not reach pre-delete {pre_snapshot_id}: "
+                f"stopped at {node_id}"
+            )
+        else:
+            chain += 1
+            node_id = node.parent_id
+    if ownership_error is None and current.operation != "delete":
+        ownership_error = (
+            "current snapshot operation is not delete "
+            f"(operation={current.operation!r})"
+        )
+    if ownership_error is not None:
+        raise PostDeleteVerificationError(
+            "DELETE outcome is unknown and ownership is unproven; do not run "
+            "a rollback automatically: " + ownership_error
+        )
+    return chain
+
+
 def validate_delete_ownership(
     *,
     pre_snapshot: SnapshotMetadata,
     purge_snapshot: SnapshotMetadata,
     execution: DeleteExecution,
-) -> str:
-    """Prove that the direct child snapshot belongs to this exact DELETE."""
+    owned: Mapping[int, SnapshotNode],
+) -> int:
+    """Prove that the snapshots committed since ``pre`` belong to this exact DELETE."""
 
     query_id = execution.query_id_after_fetch
     ownership_error: str | None = None
@@ -536,33 +654,25 @@ def validate_delete_ownership(
             "Trino DELETE update count is not exactly "
             f"{len(STALE_ROWS)} (rowcount={execution.rowcount})"
         )
-    elif (
-        purge_snapshot.snapshot_id == pre_snapshot.snapshot_id
-        or purge_snapshot.parent_id != pre_snapshot.snapshot_id
-    ):
-        ownership_error = (
-            "current snapshot is not exactly one direct child of pre-delete "
-            f"(pre={pre_snapshot.snapshot_id}, current={purge_snapshot.snapshot_id}, "
-            f"parent={purge_snapshot.parent_id})"
-        )
-    elif purge_snapshot.operation != "delete":
-        ownership_error = (
-            "direct child snapshot operation is not delete "
-            f"(operation={purge_snapshot.operation!r})"
-        )
     elif purge_snapshot.summary.get("trino_query_id") != query_id:
         ownership_error = (
-            "direct delete snapshot trino_query_id does not own this cursor "
+            "current snapshot was not committed by this cursor "
             f"(cursor={query_id!r}, "
             f"snapshot={purge_snapshot.summary.get('trino_query_id')!r})"
         )
+    elif not owned:
+        ownership_error = "no snapshot carries the query id of this cursor"
 
     if ownership_error is not None:
         raise PostDeleteVerificationError(
             "DELETE outcome is unknown and ownership is unproven; do not run "
             "a rollback automatically: " + ownership_error
         )
-    return query_id
+    return validate_delete_lineage(
+        pre_snapshot_id=pre_snapshot.snapshot_id,
+        current=purge_snapshot,
+        owned=owned,
+    )
 
 
 def render_delete_sql() -> str:
@@ -666,22 +776,38 @@ def purge(cursor, *, apply: bool = False) -> PurgeResult:
             "DELETE was sent or may have been sent, but its first snapshot could "
             "not be owned; outcome is unknown and no rollback instruction is safe"
         ) from exc
-    delete_query_id = validate_delete_ownership(
+    delete_query_id = execution_query_id = delete_execution.query_id_after_fetch
+    try:
+        owned_snapshots = (
+            load_owned_snapshots(cursor, execution_query_id)
+            if execution_query_id
+            else {}
+        )
+    except Exception as exc:
+        # The DELETE was already sent, so nothing below may report a refusal.
+        raise PostDeleteVerificationError(
+            "DELETE was sent or may have been sent, but its snapshots could not "
+            "be read; outcome is unknown and no rollback instruction is safe"
+        ) from exc
+    owned_chain = validate_delete_ownership(
         pre_snapshot=pre_snapshot,
         purge_snapshot=purge_snapshot,
         execution=delete_execution,
+        owned=owned_snapshots,
     )
     rollback_instruction = conditional_rollback_instruction(
         pre_snapshot_id=pre_snapshot.snapshot_id,
         purge_snapshot_id=purge_snapshot.snapshot_id,
     )
     logger.warning(
-        "PURGE SNAPSHOT OWNED: id=%s parent=%s operation=%s query_id=%s rowcount=%s",
+        "PURGE SNAPSHOT OWNED: id=%s parent=%s operation=%s query_id=%s "
+        "rowcount=%s owned_chain=%s",
         purge_snapshot.snapshot_id,
         purge_snapshot.parent_id,
         purge_snapshot.operation,
         delete_query_id,
         delete_execution.rowcount,
+        owned_chain,
     )
     logger.warning("CONDITIONAL ROLLBACK: %s", rollback_instruction)
 
@@ -733,12 +859,11 @@ def purge(cursor, *, apply: bool = False) -> PurgeResult:
                 f"current={final_snapshot.snapshot_id})",
                 conditional_rollback_instruction=rollback_instruction,
             )
-        if final_snapshot.parent_id != pre_snapshot.snapshot_id:
-            raise PostDeleteVerificationError(
-                "purge snapshot parent changed during verification; inspect the "
-                "snapshot lineage manually and do not run an unconditional rollback",
-                conditional_rollback_instruction=rollback_instruction,
-            )
+        validate_delete_lineage(
+            pre_snapshot_id=pre_snapshot.snapshot_id,
+            current=final_snapshot,
+            owned=owned_snapshots,
+        )
     except PostDeleteVerificationError:
         raise
     except Exception as exc:
