@@ -6,8 +6,13 @@ replacing its HTTP client or lease never changes the rate identity.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, timedelta
+import json
 import math
 import os
+from pathlib import Path
+import re
+import time
 from typing import Mapping
 
 
@@ -298,3 +303,92 @@ class SourceStopState:
         return dict(schema_version=self.SCHEMA_VERSION, reason=self.reason, stopped_at=self.stopped_at,
                     until=self.until, failed_probes=self.failed_probes, probe_permit_id=self.probe_permit_id,
                     probe_started_at=self.probe_started_at, needs_owner=self.needs_owner)
+
+
+MOSCOW_OFFSET_SECONDS = 3 * 60 * 60
+
+
+def calendar_day(now):
+    """The Moscow calendar day of an epoch time; daily reports count by it."""
+    moment = StreamRateState._time(now) + MOSCOW_OFFSET_SECONDS
+    return time.strftime('%Y-%m-%d', time.gmtime(moment))
+
+
+class RefusalCounters:
+    """Source requests and the source's refusals of them, per Moscow calendar day.
+
+    Both pass through the gateway: a request is a consumed permit, a refusal is
+    the site's answer the client reports back.  Days are kept for five weeks.
+    """
+
+    SCHEMA_VERSION = 1
+    KEPT_DAYS = 35
+    _DAY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+    _FIELDS = {'schema_version', 'days'}
+
+    def __init__(self, saved=None):
+        self.days = {}
+        if saved is not None:
+            self._restore(saved)
+
+    def _restore(self, saved):
+        if not isinstance(saved, dict) or set(saved) != self._FIELDS:
+            raise ValueError('invalid TM refusal counters')
+        if type(saved['schema_version']) is not int or saved['schema_version'] != self.SCHEMA_VERSION:
+            raise ValueError('unsupported TM refusal counters')
+        if not isinstance(saved['days'], dict):
+            raise ValueError('invalid TM refusal counters')
+        for day, entry in saved['days'].items():
+            if not isinstance(day, str) or not self._DAY.fullmatch(day):
+                raise ValueError('invalid TM refusal day')
+            try:
+                date.fromisoformat(day)
+            except ValueError:
+                raise ValueError('invalid TM refusal day') from None
+            if (not isinstance(entry, dict) or set(entry) != {'requests', 'refusals'}
+                    or any(type(entry[name]) is not int or entry[name] < 0 for name in entry)
+                    or entry['refusals'] > entry['requests']):
+                raise ValueError('invalid TM refusal count')
+            self.days[day] = dict(entry)
+        self._prune()
+
+    def _prune(self):
+        if self.days:
+            oldest = date.fromisoformat(max(self.days)) - timedelta(days=self.KEPT_DAYS - 1)
+            for day in [day for day in self.days if date.fromisoformat(day) < oldest]:
+                del self.days[day]
+
+    def _bump(self, now, name):
+        entry = self.days.setdefault(calendar_day(now), {'requests': 0, 'refusals': 0})
+        entry[name] += 1
+        self._prune()
+
+    def count_request(self, now):
+        self._bump(now, 'requests')
+
+    def count_refusal(self, now):
+        self._bump(now, 'refusals')
+
+    def rate(self, day):
+        """Refusals per 100 requests of one day; None is a day without requests."""
+        entry = self.days.get(day)
+        if not entry or not entry['requests']:
+            return None
+        return dict(requests=entry['requests'], refusals=entry['refusals'],
+                    per_100=round(100.0 * entry['refusals'] / entry['requests'], 2))
+
+    def dump(self):
+        return dict(schema_version=self.SCHEMA_VERSION,
+                    days={day: dict(entry) for day, entry in sorted(self.days.items())})
+
+
+def refusal_rate(path, day):
+    """Read one day's refusal rate from the gateway's counters; None when they are absent."""
+    try:
+        saved = json.loads(Path(path).read_bytes().decode('utf-8'))
+    except (OSError, ValueError):
+        return None
+    try:
+        return RefusalCounters(saved).rate(day)
+    except ValueError:
+        return None

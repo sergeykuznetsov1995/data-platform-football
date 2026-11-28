@@ -819,7 +819,7 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
     """Dedicated TM slots; the shared gateway retains its existing controller."""
 
     def __init__(self, *, streams, state_path=None, clock=time.time, **kwargs):
-        from scrapers.transfermarkt.streams import SourceStopState, StreamRateState
+        from scrapers.transfermarkt.streams import RefusalCounters, SourceStopState, StreamRateState
 
         super().__init__(requests_per_minute=streams.requests_per_minute,
                          clock=clock, state_path=None, **kwargs)
@@ -827,6 +827,7 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         self.state_path = str(state_path or '')
         self.stream_state_path = self.state_path + '.streams-v2' if self.state_path else ''
         self.stop_path = self.state_path + '.source-stop' if self.state_path else ''
+        self.refusals_path = self.state_path + '.refusals' if self.state_path else ''
         self._active_stream = 'current-0'
         self._feedback = {}
         self._durable_feedback = set()
@@ -878,10 +879,30 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
             self.stop = SourceStopState(saved_stop)
         except ValueError:
             raise RuntimeError('Transfermarkt source stop state is corrupt') from None
+        saved_refusals = None
+        if self.refusals_path and os.path.lexists(self.refusals_path):
+            try:
+                saved_refusals = json.loads(_require_private_regular_file(
+                    self.refusals_path, allow_empty=False, max_bytes=16384))
+            except (ValueError, RuntimeError):
+                raise RuntimeError('Transfermarkt refusal counters are corrupt') from None
+        try:
+            self.refusals = RefusalCounters(saved_refusals)
+        except ValueError:
+            raise RuntimeError('Transfermarkt refusal counters are corrupt') from None
         if self.stop.active:
             # Re-state the hold in case its pause was not written before a restart.
             self.rate.hold(clock(), max(0.0, self.stop.until - clock()))
         self._persist_streams()
+
+    def _persist_refusals(self):
+        if self.state_path:
+            try:
+                _atomic_private_bytes(self.refusals_path,
+                    canonical_json_bytes(self.refusals.dump()) + b'\n',
+                    replace=os.path.isfile(self.refusals_path))
+            except (OSError, RuntimeError) as exc:
+                raise RuntimeError('Transfermarkt refusal counters write failed') from exc
 
     def _persist_stop(self):
         if self.state_path:
@@ -1003,7 +1024,11 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         if stream_id not in self.streams.ids(kwargs['traffic_class']):
             raise TransfermarktPermitError('stream does not match traffic class')
         self._active_stream = stream_id
-        return super().consume(**kwargs)
+        consumed_at = super().consume(**kwargs)
+        # A consumed permit is one request to the source: the denominator of the refusal rate.
+        self.refusals.count_request(self._clock())
+        self._persist_refusals()
+        return consumed_at
 
     def report_block(self, *, stream_id, permit_id, status, challenge):
         self._consumed_ticket(stream_id, permit_id)
@@ -1013,6 +1038,9 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         if permit_id not in self._feedback:
             alerts = self.rate.site_block(stream_id, now, status=status, challenge=challenge)
             self._feedback[permit_id] = alerts
+            if challenge or status in (403, 429):   # the source refused this request
+                self.refusals.count_refusal(now)
+                self._persist_refusals()
             # The site asked for a human, or refused address after address: hold
             # the source, whatever the client does next.
             if challenge:
@@ -4752,6 +4780,10 @@ def _transfermarkt_permit_health() -> dict[str, Any]:
                 'needs_owner': TRANSFERMARKT_REQUEST_PERMITS.stop.needs_owner,
                 'probing': TRANSFERMARKT_REQUEST_PERMITS.stop.probing,
             } if TRANSFERMARKT_REQUEST_PERMITS.stop.active else None),
+            'transfermarkt_source_refusals': ({
+                day: TRANSFERMARKT_REQUEST_PERMITS.refusals.rate(day) for day in
+                sorted(TRANSFERMARKT_REQUEST_PERMITS.refusals.days)[-7:]
+            }),
             'transfermarkt_alerts': ([
                 'transfermarkt_source_rate_halved'
             ] if TRANSFERMARKT_REQUEST_PERMITS.rate.source_slow > time.time() else []) + [

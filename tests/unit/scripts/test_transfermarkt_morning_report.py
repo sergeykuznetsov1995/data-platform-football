@@ -374,3 +374,33 @@ def test_script_entrypoint_without_evidence_is_read_only(tmp_path):
     output = json.loads(result.stdout)
     assert output["report"] is None and "Bronze DQ unknown" in output["summary"]
     assert list(tmp_path.iterdir()) == []
+
+
+def test_refusal_rate_is_added_only_when_the_gateway_counters_are_named(tmp_path, monkeypatch, capsys):
+    import json
+
+    from dags.scripts import transfermarkt_morning_report as report
+
+    monkeypatch.setattr(report, "morning_report", lambda *args: {
+        "summary": "Transfermarkt 2026-11-28 МСК: сводка", "report": {"report_day": "2026-11-28"},
+        "provenance": {}})
+    common = ["--day", "2026-11-28", "--as-of", "2026-11-28T12:00:00+03:00"]
+    assert report.main(common) == 0
+    assert "source_refusals" not in json.loads(capsys.readouterr().out)
+    state = tmp_path / "permits.json.refusals"
+    empty = {"day": "2026-11-28", "requests": None, "refusals": None, "per_100": None}
+    assert report.main([*common, "--refusals-state", str(state)]) == 0
+    # No counters, or damaged ones, leave the rate unknown instead of inventing a zero.
+    assert json.loads(capsys.readouterr().out)["source_refusals"] == empty
+    state.write_text('{"schema_version": 1, "days": {')
+    assert report.main([*common, "--refusals-state", str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)["source_refusals"] == empty
+    state.write_text(json.dumps({
+        "schema_version": 1,
+        "days": {"2026-11-27": {"requests": 4, "refusals": 4},
+                 "2026-11-28": {"requests": 8, "refusals": 2}}}))
+    assert report.main([*common, "--refusals-state", str(state)]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["source_refusals"] == {
+        "day": "2026-11-28", "requests": 8, "refusals": 2, "per_100": 25.0}
+    assert output["summary"] == "Transfermarkt 2026-11-28 МСК: сводка"   # the rest is untouched

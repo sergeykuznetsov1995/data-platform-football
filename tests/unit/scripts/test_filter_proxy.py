@@ -7369,6 +7369,48 @@ def test_transfermarkt_corrupt_source_stop_record_fails_closed(shared_mod, tmp_p
             clock=lambda: 0)
 
 
+def test_transfermarkt_refusals_are_counted_per_day_and_survive_a_restart(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams, calendar_day
+
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'counters.json'),
+        clock=lambda: clock[0])
+    shared_mod.TRANSFERMARKT_REQUEST_PERMITS = controller
+    day = calendar_day(5)
+    assert controller.refusals.rate(day) is None   # no request, no rate
+    clock[0] = 5
+    first = controller.request(**_current('one'))
+    controller.consume(**_current('one'), permit_id=first.permit_id, permit_token=first.permit_token)
+    # A plain 405 is one exit's answer, not the source refusing the request.
+    controller.report_block(stream_id='current-0', permit_id=first.permit_id, status=405, challenge=False)
+    assert controller.refusals.rate(day) == {'requests': 1, 'refusals': 0, 'per_100': 0.0}
+    clock[0] = 15
+    second = controller.request(**_current('two'))
+    controller.consume(**_current('two'), permit_id=second.permit_id, permit_token=second.permit_token)
+    controller.report_block(stream_id='current-0', permit_id=second.permit_id, status=403, challenge=False)
+    controller.report_block(stream_id='current-0', permit_id=second.permit_id, status=403, challenge=False)
+    assert controller.refusals.rate(day) == {'requests': 2, 'refusals': 1, 'per_100': 50.0}
+    restarted = shared_mod.TransfermarktStreamPermitController(
+        streams=controller.streams, state_path=controller.state_path, clock=lambda: clock[0])
+    assert restarted.refusals.rate(day) == {'requests': 2, 'refusals': 1, 'per_100': 50.0}
+    shared_mod.TRANSFERMARKT_REQUEST_PERMITS = restarted
+    shared_mod.TRANSFERMARKT_STREAMS = restarted.streams
+    assert shared_mod._transfermarkt_permit_health()['transfermarkt_source_refusals'] == {
+        day: {'requests': 2, 'refusals': 1, 'per_100': 50.0}}
+
+
+def test_transfermarkt_corrupt_refusal_counters_fail_closed(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'counters.json'), clock=lambda: 0)
+    Path(controller.refusals_path).write_text('{"schema_version": 1, "days": {"x": 1}}')
+    with pytest.raises(RuntimeError, match='refusal counters are corrupt'):
+        shared_mod.TransfermarktStreamPermitController(
+            streams=controller.streams, state_path=controller.state_path, clock=lambda: 0)
+
+
 def test_transfermarkt_stream_slots_and_exits_do_not_steal_current(shared_mod, monkeypatch, tmp_path):
     _boot_transfermarkt_only(shared_mod, monkeypatch, tmp_path,
                             ['--transfermarkt-history-streams', '2'])

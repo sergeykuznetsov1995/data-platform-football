@@ -80,3 +80,55 @@ def test_legacy_state_migration_is_conservative_and_corruption_rejected():
     bad['pause']['current-0'] = float('nan')
     with pytest.raises(ValueError):
         StreamRateState(rates.streams, 20, bad)
+
+
+def test_refusal_counters_count_by_moscow_day_keep_five_weeks_and_fail_closed(tmp_path):
+    import json
+    from datetime import datetime, timezone
+
+    from scrapers.transfermarkt.streams import RefusalCounters, calendar_day, refusal_rate
+
+    evening = datetime(2026, 11, 27, 20, 59, 59, tzinfo=timezone.utc).timestamp()
+    night = datetime(2026, 11, 27, 21, 0, 0, tzinfo=timezone.utc).timestamp()   # midnight in Moscow
+    assert (calendar_day(evening), calendar_day(night)) == ('2026-11-27', '2026-11-28')
+    counters = RefusalCounters()
+    assert counters.rate('2026-11-28') is None   # a day without requests has no rate
+    for offset in range(7):
+        counters.count_request(night + 60 * offset)
+    counters.count_refusal(night + 10)
+    counters.count_refusal(evening)                # belongs to the evening before
+    counters.count_request(night + 86400)          # the next day
+    assert counters.rate('2026-11-28') == {'requests': 7, 'refusals': 1, 'per_100': 14.29}
+    assert counters.rate('2026-11-27') is None   # refusals without a request have no rate
+    assert counters.days['2026-11-27'] == {'requests': 0, 'refusals': 1}
+    assert counters.rate('2026-11-29') == {'requests': 1, 'refusals': 0, 'per_100': 0.0}
+    # Five weeks are kept, older days go, and the record round-trips.
+    for day in range(50):
+        counters.count_request(night + 86400 * day)
+    assert len(counters.days) == RefusalCounters.KEPT_DAYS
+    assert min(counters.days) == '2026-12-13' and max(counters.days) == '2027-01-16'
+    saved = counters.dump()
+    assert RefusalCounters(saved).dump() == saved
+    # The reader answers None for an absent or damaged record instead of guessing.
+    path = tmp_path / 'state.json.refusals'
+    assert refusal_rate(path, '2026-11-28') is None
+    path.write_text(json.dumps(saved))
+    assert refusal_rate(path, '2026-12-13') == counters.rate('2026-12-13')
+    path.write_text('{"days": ')
+    assert refusal_rate(path, '2026-12-13') is None
+
+
+@pytest.mark.parametrize('saved', [
+    {}, [], {'schema_version': 1}, {'schema_version': 1, 'days': []}, {'schema_version': 2, 'days': {}},
+    {'schema_version': 1, 'days': {'28.11.2026': {'requests': 1, 'refusals': 0}}},
+    {'schema_version': 1, 'days': {'2026-13-01': {'requests': 1, 'refusals': 0}}},
+    {'schema_version': 1, 'days': {'2026-11-28': {'requests': 1}}},
+    {'schema_version': 1, 'days': {'2026-11-28': {'requests': 1, 'refusals': 2}}},
+    {'schema_version': 1, 'days': {'2026-11-28': {'requests': -1, 'refusals': 0}}},
+    {'schema_version': 1, 'days': {'2026-11-28': {'requests': True, 'refusals': 0}}},
+])
+def test_damaged_refusal_counters_are_rejected(saved):
+    from scrapers.transfermarkt.streams import RefusalCounters
+
+    with pytest.raises(ValueError):
+        RefusalCounters(saved)
