@@ -949,13 +949,16 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         self._applied.intersection_update(live_ids)
 
     def _closed_until(self, now):
-        """When a held source may hear a request again; never a moment already past.
+        """When a held source may hear a request again; 0.0 when nothing holds it.
+
+        Never a moment already past: a caller that is told a pause in the past
+        spins, and one told the present takes clock skew for a pause.
 
         A stop left to the owner renews its horizon, so a waiting caller is
         always told to come back later instead of spinning on an expired pause.
         """
         if not self.stop.active or self.stop.probing:
-            return now
+            return 0.0            # nothing held: the caller waits only for the stream's own pace
         if self.stop.needs_owner and now >= self.stop.until:
             return now + 3600
         return self.stop.until
@@ -978,11 +981,12 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         if self.stop.probing:
             if not self.stop.probe_sent:
                 ticket = self._probe_ticket()
-                if (ticket is not None and ticket.consumed_at is None
+                if (ticket is not None and ticket.granted_at is not None
+                        and ticket.consumed_at is None
                         and now < ticket.granted_at + self.GRANTED_TTL_SECONDS):
                     return False, False   # granted: its caller may still send the probe
-                # Never sent, its caller having left: no probe was made. The stop
-                # stands, and the next live request is the probe.
+                # Never sent, its caller having left or its grant never completed:
+                # no probe was made. The stop stands, and the next live request is the probe.
                 self.stop.abandon_probe()
                 self.rate.release(now)
                 self._persist_stop()
@@ -1018,12 +1022,20 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
                 continue
             self.rate.grant(stream, now)
             if probe:
-                # While the probe is out, every stream waits for its answer.
+                # While the probe is out, every stream waits for its answer. Until
+                # the record is durable no ticket carries the probe.
                 self.stop.begin_probe(now, self._tickets[key].permit_id)
-                self._tickets[key].probe = True
                 self.rate.hold(now, self.stop.PROBE_TIMEOUT_SECONDS)
-                self._persist_stop()
-            self._persist_streams()
+                try:
+                    self._persist_stop()
+                    self._persist_streams()
+                except RuntimeError:
+                    self.stop.abandon_probe()
+                    self.rate.release(now)
+                    raise
+                self._tickets[key].probe = True
+            else:
+                self._persist_streams()
             self._tickets[key].granted_at = now
             queue.remove(key)
             if probe:
@@ -1080,7 +1092,12 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         consumed_at = super().consume(permit_id=permit_id, **kwargs)
         if probe:
             self.stop.mark_sent()
-            self._persist_stop()
+            try:
+                self._persist_stop()
+            except RuntimeError:
+                # The caller is told the consume failed and sends nothing.
+                self.stop.probe_sent = False
+                raise
         # A consumed permit is one request to the source, counted on the day it
         # was consumed: the denominator of the refusal rate.
         self.refusals.count_request(consumed_at)
@@ -1126,9 +1143,9 @@ class TransfermarktStreamPermitController(TransfermarktRequestPermitController):
         now = self._clock()
         self.stop.probe_passed()
         self.rate.release(now)
-        # The pause goes first: should the stop record stay, its own timeout ends the probe.
-        self._persist_streams()
+        # The stop record goes first: should the pause stay, it ends by itself within two minutes.
         self._persist_stop()
+        self._persist_streams()
         log.error('transfermarkt_source_resumed')
 
     def resume_by_owner(self):

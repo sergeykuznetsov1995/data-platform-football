@@ -7504,6 +7504,78 @@ def test_transfermarkt_owner_resume_survives_a_failed_write_and_a_retry(shared_m
         final.resume_by_owner()
 
 
+def test_transfermarkt_nothing_held_reports_no_pause_to_waiting_callers(shared_mod, tmp_path):
+    from scrapers.transfermarkt.streams import TransfermarktStreams
+
+    clock = [0.0]
+    controller = shared_mod.TransfermarktStreamPermitController(
+        streams=TransfermarktStreams(), state_path=str(tmp_path / 'idle.json'), clock=lambda: clock[0])
+    clock[0] = 5
+    assert controller.request(**_current('first')).granted
+    clock[0] = 6
+    # A caller waiting only for the stream's own pace is told no pause: the present
+    # moment would read as a pause to a caller whose clock runs behind.
+    paced = controller.request(**_current('paced'))
+    assert not paced.granted and paced.retry_after_seconds == 4
+    assert controller.paused_until('current-0') == 0.0
+
+
+def test_transfermarkt_a_probe_whose_send_was_not_recorded_is_not_heard(shared_mod, monkeypatch, tmp_path):
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    clock[0] = until
+    probe = controller.request(**_current('probe'))
+    assert probe.granted and probe.probe and not controller.stop.probe_sent
+    original = shared_mod._atomic_private_bytes
+
+    def no_stop_file(target, *args, **kwargs):
+        if str(target).endswith('.source-stop'):
+            raise OSError('injected write failure')
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', no_stop_file)
+    # The caller is refused the consume and sends nothing.
+    with pytest.raises(RuntimeError, match='write failed'):
+        controller.consume(**_current('probe'), permit_id=probe.permit_id, permit_token=probe.permit_token)
+    assert controller.stop.active and controller.stop.probing and not controller.stop.probe_sent
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
+    # The permit is spent and nothing went out: the stop stands, and a new request is the probe.
+    clock[0] = until + shared_mod.TransfermarktRequestPermitController.GRANTED_TTL_SECONDS
+    second, _context = _live_probe(controller, clock, 'second')
+    assert second.permit_id != probe.permit_id and controller.stop.active
+
+
+def test_transfermarkt_a_probe_grant_whose_record_failed_leaves_no_trace(shared_mod, monkeypatch, tmp_path):
+    clock = [0.0]
+    controller, until = _stopped_controller(shared_mod, tmp_path, clock)
+    original = shared_mod._atomic_private_bytes
+    failures = [1]
+
+    def fail_streams_once(target, *args, **kwargs):
+        if str(target).endswith('.streams-v2') and failures[0]:
+            failures[0] -= 1
+            raise OSError('injected write failure')
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', fail_streams_once)
+    clock[0] = until
+    with pytest.raises(RuntimeError, match='write failed'):
+        controller.request(**_current('unlucky'))
+    unlucky = next(value for key, value in controller._tickets.items() if key[3] == 'unlucky')
+    assert unlucky.granted_at is None and not unlucky.probe
+    assert controller.stop.active and not controller.stop.probing
+    monkeypatch.setattr(shared_mod, '_atomic_private_bytes', original)
+    clock[0] = until + 5
+    # Later requests are answered rather than failing, and a live request is the probe.
+    live, context = _live_probe(controller, clock, 'live')
+    assert live.permit_id != unlucky.permit_id
+    assert not controller.request(**_current('unlucky')).granted
+    controller.report_probe_passed(stream_id='current-0', permit_id=live.permit_id)
+    clock[0] += 10
+    later = controller.request(**_current('unlucky'))
+    assert later.granted and later.permit_id == unlucky.permit_id and not later.probe
+
+
 def test_transfermarkt_human_verification_reply_holds_the_source_at_once(shared_mod, tmp_path):
     from scrapers.transfermarkt.streams import TransfermarktStreams
 
@@ -7871,6 +7943,9 @@ def test_transfermarkt_probe_feedback_and_owner_resume_are_controlled(shared_mod
     assert invoke(permits + '/consume', consumed)[0] == 200
     heard = {**held, 'permit_id': decision['permit_id']}
     assert invoke(permits + '/probe-ok', heard)[0] == 409  # no probe is out
+    clock[0] = 6
+    status, paced = invoke(permits, {**held, 'request_id': 'paced'})
+    assert (status, paced['paused_until_epoch'], paced['retry_after_seconds']) == (429, 0.0, 4)
     assert invoke(permits + '/site-block', {**heard, 'status': 405, 'challenge': True})[0] == 200
     assert controller.stop.reason == 'human_verification'
     # Nothing is granted until the hold ends; the one probe then reports back.
