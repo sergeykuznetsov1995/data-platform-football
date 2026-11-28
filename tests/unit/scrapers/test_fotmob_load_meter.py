@@ -97,6 +97,8 @@ def table_row(report, table=MATCHES, attr="src_fotmob"):
     ("ALTER TABLE iceberg.bronze.fotmob_matches EXECUTE optimize", {(MATCHES, "commit")}),
     ('SELECT * FROM "ICEBERG"."BRONZE"."FOTMOB_MATCHES"', {(MATCHES, "scan_read")}),
     ("EXPLAIN ANALYZE SELECT * FROM fotmob_matches", {(MATCHES, "scan_read")}),
+    # A column alias list keeps CTAS on the query path.
+    ("CREATE TABLE fotmob_matches (id) AS SELECT id FROM fotmob_ingest_manifest", {(MATCHES, "commit"), (MANIFEST, "scan_write")}),
     ("SELECT * FROM fotmob_matches a JOIN fotmob_matches b ON a.id=b.id", {(MATCHES, "scan_read")}),
 ])
 def test_parser_operations(sql, operations):
@@ -202,12 +204,22 @@ def test_wave_ddl_is_parsed_without_inventing_work(sql, operations):
     f"CREATE TABLE {MATCHES} (id bigint) ENGINE 'x'",
     f"CREATE TABLE IF {MATCHES} (id bigint)",
     "CREATE TABLE IF NOT EXISTS fotmob_unknown (id bigint)",
+    # A quoted identifier is one opaque token: it never opens a column list.
+    'CREATE TABLE fotmob_matches "(" ")"',
+    'CREATE TABLE IF NOT EXISTS fotmob_matches "("',
     "TRUNCATE TABLE fotmob_matches",
 ])
 def test_wave_ddl_variants_are_never_guessed(sql):
     parsed = meter.parse_sql(sql, KNOWN)
     assert parsed.unparsed and parsed.operations == ()
     assert parsed.unparsed_fotmob is any(name.split(".")[-1] in sql for name in KNOWN)
+
+
+def test_reference_sql_keeps_ctas_with_aliased_columns_and_rejects_ensure_ctas():
+    clauses = " ".join(meter.S3_SQL.split())
+    ensure_ctas = r"^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b') AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'other'"
+    assert ensure_ctas in clauses
+    assert clauses.index("'other'") < clauses.index("'ensure_table'") < clauses.index("'ctas'") < clauses.index("'table_ddl'")
 
 
 def test_wave_publication_ddl_does_not_fail_an_otherwise_quiet_day():

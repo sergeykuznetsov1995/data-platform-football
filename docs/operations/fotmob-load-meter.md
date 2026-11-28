@@ -206,9 +206,11 @@ CASE
  WHEN regexp_like(query, '(?i)^\s*DELETE\s+FROM\b') THEN 'delete'
  WHEN regexp_like(query, '(?i)^\s*DROP\s+TABLE\b') THEN 'drop'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b') THEN 'view_write'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b')
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'other'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b') THEN 'ensure_table'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b')
-  AND regexp_like(query, '(?i)\bAS\b') THEN 'ctas'
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'ctas'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b') THEN 'table_ddl'
  WHEN regexp_like(query, '(?i)^\s*ALTER\s+TABLE\b') THEN 'alter_write'
  WHEN regexp_like(query, '(?i)^\s*EXPLAIN\s+ANALYZE\b') THEN 'read_exec'
@@ -298,8 +300,10 @@ DDL контура разбирается по форме, без угадыва
 Список колонок и тело представления не разбираются как отношения. Любые
 другие формы — `CASCADE`, параметры после `WITH`, `DROP VIEW`, `TRUNCATE`,
 `CREATE OR REPLACE TABLE`, `CREATE TABLE IF NOT EXISTS … AS SELECT` — дают
-`unparsed=true`. Эфемерный стейджинг `fotmob_*__stg_<hex>` исключён из норм
-и для этих команд.
+`unparsed=true`. Имя в кавычках, совпадающее со скобкой, не открывает список
+колонок. CTAS со списком псевдонимов колонок (`CREATE TABLE имя (колонки) AS
+SELECT …`) разбирается как запрос, как и раньше. Эфемерный стейджинг
+`fotmob_*__stg_<hex>` исключён из норм и для этих команд.
 
 Producer никогда не исполняет SQL, который разбирает. S1/S2/S4 исключаются
 по содержанию: system/information_schema дают ноль source-сканов, независимо

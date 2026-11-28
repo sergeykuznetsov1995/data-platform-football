@@ -83,9 +83,11 @@ S3_SQL = r'''CASE
  WHEN regexp_like(query, '(?i)^\s*DELETE\s+FROM\b') THEN 'delete'
  WHEN regexp_like(query, '(?i)^\s*DROP\s+TABLE\b') THEN 'drop'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b') THEN 'view_write'
+ WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b')
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'other'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\b') THEN 'ensure_table'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b')
-  AND regexp_like(query, '(?i)\bAS\b') THEN 'ctas'
+  AND regexp_like(query, '(?i)\bAS\s*\(?\s*(SELECT|WITH|TABLE|VALUES)\b') THEN 'ctas'
  WHEN regexp_like(query, '(?i)^\s*CREATE\s+TABLE\b') THEN 'table_ddl'
  WHEN regexp_like(query, '(?i)^\s*ALTER\s+TABLE\b') THEN 'alter_write'
  WHEN regexp_like(query, '(?i)^\s*EXPLAIN\s+ANALYZE\b') THEN 'read_exec'
@@ -344,6 +346,11 @@ def _classify(tokens: Sequence[Token]) -> tuple[str, int | None]:
     raise ValueError("statement outside the grammar")
 
 
+def _opens_column_list(tokens, after, matches):
+    """A real '(' token that opens a group; a quoted identifier named '(' is not one."""
+    return after < len(tokens) and tokens[after].kind == "punct" and tokens[after].value == "(" and after in matches
+
+
 def _ddl_operations(kind, tokens, after, target, matches):
     """Operations of the DDL the contour emits; other shapes stay unparsed.
 
@@ -356,7 +363,7 @@ def _ddl_operations(kind, tokens, after, target, matches):
         if not (_word(tokens, after, "as") and (_word(tokens, after + 1, "select") or _word(tokens, after + 1, "with"))):
             raise ValueError("CREATE VIEW without AS SELECT")
         return ()
-    if not (after < len(tokens) and tokens[after].value == "("):
+    if not _opens_column_list(tokens, after, matches):
         raise ValueError("CREATE TABLE without a column list")
     options = matches[after] + 1
     if options < len(tokens):
@@ -374,8 +381,11 @@ def parse_sql(sql: str, tables: Iterable[str]) -> ParsedSQL:
         kind, target_index = _classify(tokens)
         if kind in {"view_write", "ensure_table", "ctas"}:
             parts, after = _name(tokens, target_index)
-            if kind != "ctas" or (after < len(tokens) and tokens[after].value == "("):
-                # DDL defines schema only: its column list and view body are never relations.
+            # DDL defines schema only: its column list and view body are never
+            # relations. CTAS may also carry a column alias list, so it stays
+            # on the query path whenever the list is followed by AS.
+            if kind != "ctas" or (_opens_column_list(tokens, after, matches)
+                                  and not _word(tokens, matches[after] + 1, "as")):
                 return ParsedSQL("table_ddl" if kind == "ctas" else kind,
                                  _ddl_operations(kind, tokens, after, _resolve(parts, known), matches))
         scopes = _cte_scopes(tokens, matches, depths)
