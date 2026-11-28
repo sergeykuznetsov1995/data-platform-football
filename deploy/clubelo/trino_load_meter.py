@@ -605,8 +605,8 @@ AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 01:00:00 UTC'""")
                         source or "", snapshot_id, parent_id, timestamp(committed)))
     if sentinels != 1:
         raise ValueError("snapshot evidence incomplete")
-    # The append that closes a delete names that delete as its parent.
-    closed = {row[8] for row in fetched if row[1] == "append" and row[5] == BATCH}
+    # The append that closes a delete is a replace batch of the same table.
+    closed = {(row[0], row[8]) for row in fetched if row[1] == "append" and row[5] == BATCH and not row[2]}
     stop = datetime.combine(day + DAY, time.min, UTC)
     for name, operation, engine, user, query_id, stamped, source, snapshot_id, parent_id, committed in fetched:
         if committed >= stop:
@@ -622,7 +622,7 @@ AND committed_at < TIMESTAMP '{(day + DAY).isoformat()} 01:00:00 UTC'""")
                 info["unmatched"] += 1   # the query id is missing evidence
         elif not engine:
             if ((operation == "append" and (stamped == BATCH or source == "clubelo"))
-                    or (operation == "delete" and snapshot_id in closed)):
+                    or (operation == "delete" and (name, snapshot_id) in closed)):
                 info["catalog"] += 1
             else:
                 info["unstamped"] += 1
@@ -638,7 +638,8 @@ def valid_evidence(info):
     return (isinstance(info, dict) and set(info) == set(empty_evidence())
             and all(type(info[key]) is int and info[key] >= 0 for key in counters)
             and isinstance(query_ids, list)
-            and info["snapshots"] == sum(info[key] for key in counters[1:])
+            # unmatched is part of trino: a Trino commit whose query id is missing.
+            and info["snapshots"] == info["trino"] + info["catalog"] + info["unstamped"] + info["other_engine"]
             and info["trino"] == len(query_ids) + info["unmatched"]
             and isinstance(users, dict)
             and all(isinstance(key, str) and type(value) is int and value >= 1 for key, value in users.items())

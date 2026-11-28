@@ -670,6 +670,26 @@ def test_a_trino_commit_without_its_query_id_keeps_its_principal(tmp_path):
     report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("overwrite", "Trino", "bob", "", "")]}))
     assert report["verdict"] == "VIOLATION" and "non_source_output" in report["violations"]
     assert "unattributed_snapshot_or_output" in report["incomplete"]
+    # Such a day still renders its verdict; it is not hidden as an unavailable report.
+    assert " VIOLATION non_source_output " in club.render(root)
+    club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [("overwrite", "Trino", "src_clubelo", "", "")]}))
+    assert " INCOMPLETE unattributed_snapshot_or_output " in club.render(root)
+
+
+def test_a_delete_is_closed_only_by_a_replace_batch_of_its_own_table(tmp_path):
+    root = tmp_path / "club"
+    club.Sink(root).capture(event(), NOW.isoformat())
+    coverage(root)
+    delete = {"row": DELETE, "id": "77", "at": f"{DAY}T10:00:00.000Z"}
+    # the same parent id on another table
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [delete], SECOND: [{"row": BATCH, "id": "88", "parent": "77"}]}))
+    assert report["tables"][TABLE]["snapshots"] == 1 and report["verdict"] == "VIOLATION"
+    assert report["violations"] == ["non_source_output"]
+    # a Trino commit that merely carries the stamp
+    other = {"row": ("append", "Trino", "src_clubelo", "20260301_120000_00005_wm2jf", "replace-identity-partition-batch"),
+             "id": "88", "parent": "77"}
+    report = club.aggregate(root, DAY, monitor(tmp_path, {TABLE: [delete, other]}))
+    assert report["verdict"] == "VIOLATION" and report["violations"] == ["non_source_output"]
 
 
 def test_snapshot_evidence_needs_the_sentinel_row(tmp_path):
