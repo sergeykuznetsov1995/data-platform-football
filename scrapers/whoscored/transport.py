@@ -124,6 +124,9 @@ DEFAULT_DIRECT_BROWSER_ATTEMPTS = 4
 # solve is skipped by every transport of this process for a short while.
 DEFAULT_CF_ROTATIONS_PER_FETCH = 3
 CF_UNSOLVED_MEMBER_TTL_SECONDS = 600.0
+# Member proxy URL -> monotonic time of its last unsolved challenge. One runner
+# process works through its scopes in a single thread, so plain dict access is
+# enough; the URL is the same credential-bearing value the transport holds.
 _UNSOLVED_CHALLENGE_MEMBERS: dict[str, float] = {}
 # The daily runner opts in; history, replay and tooling keep their member.
 POOL_CHALLENGE_ROTATION_ENV = "WHOSCORED_POOL_CHALLENGE_ROTATION"
@@ -621,6 +624,15 @@ def reset_unsolved_challenge_members() -> None:
     _UNSOLVED_CHALLENGE_MEMBERS.clear()
 
 
+def _browser_failure_blames_member(exc: WhoScoredTransportError) -> bool:
+    """Whether a retryable browser failure describes the pool member.
+
+    An unsolved-challenge timeout and a broken proxy tunnel do. A crashed
+    Chromium tab does not: its cure is a new browser session, not a new member.
+    """
+    return not isinstance(exc.__cause__, FlareSolverrTabCrashed)
+
+
 _CF_STRONG_BODY_MARKERS = (
     "<title>just a moment",
     "<title>attention required! | cloudflare</title>",
@@ -1045,9 +1057,15 @@ def _validator_accepts(response: TransportResponse, validator: Validator) -> boo
     leaves the classification to the caller.
     """
     try:
-        return validator(response) is not False
-    except Exception:
+        accepted = validator(response) is True
+    except Exception as exc:
+        logger.debug(
+            "WhoScored validator rejected a page with Cloudflare markup (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
         return False
+    return accepted
 
 
 @dataclass(frozen=True)
@@ -1597,7 +1615,10 @@ class WhoScoredTransport:
     def _leave_unsolved_member(self) -> None:
         """Start a page on another member when the current one is remembered."""
         seen = _UNSOLVED_CHALLENGE_MEMBERS.get(self._pool_proxy_url)
-        if seen is None or time.monotonic() - seen >= CF_UNSOLVED_MEMBER_TTL_SECONDS:
+        if seen is None:
+            return
+        if time.monotonic() - seen >= CF_UNSOLVED_MEMBER_TTL_SECONDS:
+            del _UNSOLVED_CHALLENGE_MEMBERS[self._pool_proxy_url]
             return
         self._rotate_after_unsolved_challenge(
             reason="an unsolved challenge earlier in this run"
@@ -1995,12 +2016,19 @@ class WhoScoredTransport:
             else None
         )
 
-        def _store(direct: TransportResponse) -> TransportResponse:
-            if direct_gate_key is not None:
-                self._direct_gate_circuits.discard(direct_gate_key)
-            stored = self._store_and_return(key, direct)
+        def _store(network: TransportResponse) -> TransportResponse:
+            # A network page kept despite Cloudflare markup is worth counting;
+            # later cache hits of the same page are not.
+            if _matched_cf_markers(network.content):
+                self.stats.cf_marker_pages_accepted += 1
+            stored = self._store_and_return(key, network)
             self._source_succeeded(url)
             return stored
+
+        def _store_direct(direct: TransportResponse) -> TransportResponse:
+            if direct_gate_key is not None:
+                self._direct_gate_circuits.discard(direct_gate_key)
+            return _store(direct)
 
         def _direct_phase() -> TransportResponse:
             """Direct route on the current member; ``CloudflareChallenge`` when gated."""
@@ -2031,6 +2059,9 @@ class WhoScoredTransport:
                 return _direct_phase()
             except CloudflareChallenge:
                 return None
+            # Any other direct failure answers for the new member exactly as
+            # it would have on the first one: it propagates and is not retried
+            # in the browser.
 
         def _direct_once() -> TransportResponse:
             response = self._http_fetch(
@@ -2097,7 +2128,7 @@ class WhoScoredTransport:
         if fresh_member:
             fresh = _fresh_member_direct_phase()
             if fresh is not None:
-                return _store(fresh)
+                return _store_direct(fresh)
 
         if not skip_direct and not fresh_member:
             try:
@@ -2105,7 +2136,7 @@ class WhoScoredTransport:
             except CloudflareChallenge:
                 pass
             else:
-                return _store(direct)
+                return _store_direct(direct)
 
         last_cf: Optional[CloudflareChallenge] = None
         last_transient: Optional[WhoScoredTransportError] = None
@@ -2114,7 +2145,7 @@ class WhoScoredTransport:
                 self._pool_rotation_pending = False
                 fresh = _fresh_member_direct_phase()
                 if fresh is not None:
-                    return _store(fresh)
+                    return _store_direct(fresh)
             try:
                 browser = self._browser_fetch(
                     url,
@@ -2177,7 +2208,12 @@ class WhoScoredTransport:
                     if exc.kind is FailureKind.CONTENT:
                         self._store_response(key, browser)
                     raise
-                if rotation_candidate and exc.retryable and exc.kind is FailureKind.BROWSER:
+                if (
+                    rotation_candidate
+                    and exc.retryable
+                    and exc.kind is FailureKind.BROWSER
+                    and _browser_failure_blames_member(exc)
+                ):
                     # An unsolved-challenge timeout and a broken proxy tunnel both
                     # arrive here; they describe the member, not the page.
                     self._remember_unsolved_member()
@@ -2198,6 +2234,7 @@ class WhoScoredTransport:
                     if (
                         rotation_candidate
                         and exc.kind is FailureKind.BROWSER
+                        and _browser_failure_blames_member(exc)
                         and self._rotate_after_unsolved_challenge(
                             reason="a browser failure in the solver"
                         )
@@ -2212,9 +2249,7 @@ class WhoScoredTransport:
                 if exc.kind is FailureKind.CONTENT:
                     self._store_response(key, browser)
                 raise
-            stored = self._store_and_return(key, browser)
-            self._source_succeeded(url)
-            return stored
+            return _store(browser)
 
         # Any non-CF browser outcome wins over a later challenge.
         if last_transient is not None:
@@ -3597,7 +3632,6 @@ class WhoScoredTransport:
             # does, the payload wins.  Anything less stays a challenge.
             payload_checked = _validator_accepts(response, validator)
             if payload_checked:
-                self.stats.cf_marker_pages_accepted += 1
                 logger.info(
                     "WhoScored page with Cloudflare markup accepted by its "
                     "validator (route=%s, markers=%s)",

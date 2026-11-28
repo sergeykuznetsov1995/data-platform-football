@@ -1005,6 +1005,28 @@ def test_daily_runner_opts_the_transport_into_challenge_rotation(monkeypatch, tm
 
 
 @pytest.mark.unit
+def test_daily_runner_restores_an_existing_challenge_rotation_setting(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("WHOSCORED_POOL_CHALLENGE_ROTATION", "0")
+    seen = []
+    schedule = _result(
+        "schedule", counts={"schedule": 1}, tables=["iceberg.bronze.whoscored_schedule"]
+    )
+
+    rc, report, _, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["daily", "--scope", "ENG-Premier League=2526", "--skip-profiles"],
+        behaviors={"schedule": _challenge_rotation_when(schedule, seen)},
+    )
+
+    assert rc == 0
+    assert seen == ["1"]
+    assert os.environ["WHOSCORED_POOL_CHALLENGE_ROTATION"] == "0"
+
+
+@pytest.mark.unit
 def test_replay_runner_keeps_the_transport_on_its_pool_member(monkeypatch, tmp_path):
     monkeypatch.delenv("WHOSCORED_POOL_CHALLENGE_ROTATION", raising=False)
     seen = []

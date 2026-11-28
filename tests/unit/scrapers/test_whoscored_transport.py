@@ -3832,6 +3832,84 @@ def test_pool_challenge_rotation_leaves_stage_bootstrap_and_feeds_alone(
 
 
 @pytest.mark.unit
+def test_pool_tab_crash_keeps_the_member(monkeypatch, tmp_path):
+    # A crashed Chromium tab is cured by a new browser session, not a member.
+    from scrapers.base.flaresolverr_client import FlareSolverrTabCrashed
+
+    fs = FakeFSClient(
+        FlareSolverrTabCrashed("FlareSolverr tab crashed (cmd=request.get): target crashed"),
+        {"html": OK_HTML.decode(), "status": 200},
+    )
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT)],
+        fs,
+        pool_size=3,
+        attempts=2,
+    )
+
+    result = transport.fetch("https://www.whoscored.com/Matches/1/Live")
+
+    assert result.route is TransportRoute.DIRECT_FLARESOLVERR
+    assert len(seen) == 1
+    assert {proxy for _, proxy in fs.created} == set(seen)
+    assert transport.stats.pool_rotations_cloudflare == 0
+    assert transport_module._UNSOLVED_CHALLENGE_MEMBERS == {}
+
+
+@pytest.mark.unit
+def test_pool_fresh_member_direct_failure_answers_for_the_page(monkeypatch, tmp_path):
+    # On the new member the schedule document answers directly with a 404:
+    # that is the page's verdict, exactly as on a first member, and no browser
+    # attempt follows.
+    fs = FakeFSClient(FlareSolverrCFChallengeFailed("cloudflare challenge"))
+    transport, seen = _cf_pool_transport(
+        monkeypatch,
+        tmp_path,
+        [FakeHTTPSession(CF_DIRECT), FakeHTTPSession(FakeHTTPResponse(404, b"gone"))],
+        fs,
+    )
+
+    with pytest.raises(WhoScoredTransportError) as caught:
+        transport.fetch(SCHEDULE_MONTH)
+
+    assert (caught.value.kind, caught.value.status_code) == (FailureKind.HTTP_STATUS, 404)
+    assert len(seen) == 2
+    assert len(fs.get_calls) == 1
+
+
+@pytest.mark.unit
+def test_page_with_cloudflare_markup_needs_an_explicit_validator_yes(monkeypatch):
+    direct = FakeHTTPSession(FakeHTTPResponse(403, CF_HTML, {"cf-ray": "initial"}))
+    fs = FakeFSClient({"html": CF_MARKUP_OK_HTML.decode(), "status": 200})
+    transport, _ = _transport(direct, direct_fs=fs, attempts=1)
+
+    with pytest.raises(CloudflareChallenge):
+        transport.fetch(
+            "https://www.whoscored.com/Matches/1/Live", validator=lambda _: None
+        )
+
+    assert transport.stats.cf_marker_pages_accepted == 0
+
+
+@pytest.mark.unit
+def test_cache_hits_of_a_kept_page_are_not_counted_again():
+    direct = FakeHTTPSession(FakeHTTPResponse(200, CF_MARKUP_OK_HTML))
+    transport, _ = _transport(direct, raw_cache=KeyedMemoryRawCache())
+    url = "https://www.whoscored.com/Matches/1/Live"
+
+    first = transport.fetch(url, validator=_payload_validator)
+    second = transport.fetch(url, validator=_payload_validator)
+
+    assert first.route is TransportRoute.DIRECT_HTTP
+    assert second.route is TransportRoute.RAW_CACHE
+    assert second.content == CF_MARKUP_OK_HTML
+    assert transport.stats.cache_hits == 1
+    assert transport.stats.cf_marker_pages_accepted == 1
+
+
+@pytest.mark.unit
 def test_pool_without_a_spare_member_keeps_its_same_member_retries(
     monkeypatch, tmp_path
 ):
