@@ -259,8 +259,14 @@ def build_compaction_manager():
     )
 
 
-def probe_wave(environ: Optional[Mapping[str, str]] = None):
-    """Идёт ли волна контура и когда кончилась последняя (метабаза изолята)."""
+def probe_wave(
+    environ: Optional[Mapping[str, str]] = None, *, with_start: bool = False
+):
+    """Идёт ли волна контура, когда кончилась последняя и когда началась ранняя.
+
+    ``with_start`` добавляет момент запуска самой ранней идущей или queued
+    волны; ``None`` значит, что она ещё не стартовала.
+    """
 
     import os
 
@@ -275,12 +281,16 @@ def probe_wave(environ: Optional[Mapping[str, str]] = None):
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT count(*) FILTER (WHERE state IN ('running', 'queued')), "
-                "max(end_date) FROM dag_run WHERE dag_id = %s",
+                "max(end_date), "
+                "min(start_date) FILTER (WHERE state IN ('running', 'queued')) "
+                "FROM dag_run WHERE dag_id = %s",
                 (WAVE_DAG_ID,),
             )
-            running, last_end = cursor.fetchone()
+            running, last_end, first_start = cursor.fetchone()
     finally:
         connection.close()
+    if with_start:
+        return bool(running), last_end, first_start
     return bool(running), last_end
 
 

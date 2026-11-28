@@ -28,6 +28,7 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
 
     events = []
     calls = []
+    held = []
     connection = object()
     result = {"generation": "synthetic-generation", "seasons": 0, "rows": 1}
     failure = RuntimeError("synthetic refresh failure")
@@ -50,8 +51,8 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
             events.append("release")
 
     def connect(**kwargs):
-        assert authority.held
         events.append("connect")
+        held.append(authority.held)
         calls.append(kwargs)
         return connection
 
@@ -80,17 +81,22 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
     monkeypatch.setattr(trino_instrumentation.FotMobTrinoTableManager, "__init__", construct)
     monkeypatch.setattr(c1, "build_writer_lock", build_writer_lock)
 
-    def refresh(manager, *, writer_lock):
+    def refresh(manager, *, writer_lock, stage_manager=None):
         assert type(manager) is trino_instrumentation.FotMobTrinoTableManager
+        assert type(stage_manager) is trino_instrumentation.FotMobTrinoTableManager
+        assert stage_manager is not manager
         assert not authority.held
         assert manager._write_authority is None
         events.append("refresh")
+        # Candidate staging connects and mutates without ever taking a lease.
+        assert stage_manager._create_connection() is connection
         with writer_lock() as lease:
             manager.set_write_authority(lease)
             assert manager._authority_required is True
             # Exercise real construction, authority binding and connection forwarding.
             assert manager._create_connection() is connection
             manager.set_write_authority(None)
+        assert stage_manager._authority_required is False
         if refresh_fails:
             raise failure
         return result
@@ -105,8 +111,12 @@ def test_run_refresh_connection_contract(monkeypatch, password, refresh_fails):
         assert c1.run_refresh(dag_run=SimpleNamespace(conf={})) is result
 
     assert authority.held is False
-    assert events == ["wave", "construct", "build_lock", "refresh", "acquire", "check", "connect", "release"]
-    assert len(calls) == 1
+    assert events == [
+        "wave", "construct", "construct", "build_lock", "refresh", "connect",
+        "acquire", "check", "connect", "release",
+    ]
+    assert held == [False, True]
+    assert len(calls) == 2 and calls[0] == calls[1]
     kwargs = calls[0]
     assert kwargs["source"] == "fotmob:c1-inputs"
     assert kwargs["session_properties"] == {
@@ -164,9 +174,11 @@ def test_run_refresh_retries_snapshot_invalidation(monkeypatch):
     ), raising=False)
     monkeypatch.setattr(c1, "wait_for_wave", lambda: None)
     calls = []
+    staging = []
 
-    def refresh(manager, *, writer_lock):
+    def refresh(manager, *, writer_lock, stage_manager=None):
         calls.append(None)
+        staging.append(id(stage_manager))
         if len(calls) < c1.C1_REFRESH_ATTEMPTS:
             raise RuntimeError("C1 source snapshots changed during refresh")
         return {"generation": "g", "seasons": 0, "rows": 1}
@@ -175,11 +187,13 @@ def test_run_refresh_retries_snapshot_invalidation(monkeypatch):
     result = c1.run_refresh(dag_run=SimpleNamespace(conf={}))
     assert result == {"generation": "g", "seasons": 0, "rows": 1}
     assert len(calls) == c1.C1_REFRESH_ATTEMPTS
+    # Every attempt stages candidates on the same never-leased manager.
+    assert len(set(staging)) == 1 and staging[0] is not None
 
     fatal = RuntimeError("C1 requires an approved bootstrap")
     calls.clear()
 
-    def refresh_fatal(manager, *, writer_lock):
+    def refresh_fatal(manager, *, writer_lock, stage_manager=None):
         calls.append(None)
         raise fatal
 

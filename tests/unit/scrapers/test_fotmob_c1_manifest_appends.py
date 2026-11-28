@@ -2,6 +2,7 @@
 from collections import Counter
 from contextlib import nullcontext
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -86,6 +87,18 @@ def test_only_proven_compactions_have_an_empty_logical_difference():
     manager.schema_rows = [(sid, 1) for sid in (902, 33, 81)]
     assert list(c1.manifest_changes(manager, 902, 81)) == []
     assert len(manager.calls) == 2
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_rewrite_without_a_file_count_in_its_summary_is_still_a_proven_compaction(empty):
+    manager = compaction_followed_by_appends()
+    # Only appends need their file inventory; a rewrite proves itself by rows.
+    manager.snapshots[2] = snapshot(81, 33, "replace", None, 69, 0 if empty else 39918,
+                                    0 if empty else 39918)
+    manager.schema_rows = [(sid, 1) for sid in (902, 33, 81, 7)]
+
+    assert Counter(c1.manifest_changes(manager, 902, 7)) == Counter({(None, None, "match", "b"): 2})
+    assert len(manager.calls) == 4
 
 
 @pytest.fixture
@@ -182,7 +195,7 @@ def test_unavailable_catalog_proof_is_bounded_and_read_only(monkeypatch, case):
 @pytest.mark.parametrize("case", [
     "missing_schema", "schema_change", "conflicting_schema", "missing_schema_id",
     "missing_rows", "unequal_rows", "missing_removed_files", "wrong_operation",
-    "append_before_replace", "cycle",
+    "cycle",
 ])
 def test_incomplete_compaction_proof_uses_the_existing_exact_comparison(monkeypatch, case):
     monkeypatch.setattr(c1, "_retained_manifest_metadata", lambda: None)
@@ -231,14 +244,16 @@ def test_compaction_schema_read_failure_stops_before_file_reads():
 
 
 @pytest.mark.parametrize("case", [
-    "overwrite", "replace", "delete", "not_ancestor", "expired", "no_summary",
+    "overwrite", "replace", "delete", "append_with_deletes", "not_ancestor", "expired", "no_summary",
     "missing_file", "duplicate_file", "null_path", "wrong_row_count", "missing_data",
-    "unexpected_path", "file_limit", "row_limit",
+    "unexpected_path",
 ])
 def test_unproven_append_uses_exact_signed_difference_before_yield(monkeypatch, case):
     manager = AppendManager()
     if case in {"overwrite", "replace", "delete"}:
         manager.snapshots[1] = snapshot(10, 902, case, 1)
+    elif case == "append_with_deletes":
+        manager.snapshots[1] = snapshot(10, 902, "append", 1, 3)
     elif case == "not_ancestor":
         manager.snapshots[1] = snapshot(10, 1, "append", 1)
     elif case == "expired":
@@ -253,17 +268,185 @@ def test_unproven_append_uses_exact_signed_difference_before_yield(monkeypatch, 
         manager.files[1] = (10, None, 2)
     elif case == "wrong_row_count":
         manager.files[1] = (10, manager.files[1][1], 1)
-    elif case == "missing_data":
-        manager.rows.clear()
-    elif case == "file_limit":
-        monkeypatch.setattr(c1, "MAX_APPEND_FILES", 1)
-    elif case == "row_limit":
-        monkeypatch.setattr(c1, "MAX_APPEND_ROWS", 2)
     else:
         manager.rows[0] = ("s3://fixture/surprise", *manager.rows[0][1:])
     sentinel = ("2", "2024", "match", "from-comparison")
     monkeypatch.setattr(c1, "_compare_manifest_buckets", lambda m, old, new: iter([sentinel]))
     assert list(c1.manifest_changes(manager, 902, 7)) == [sentinel]
+
+
+PROJECTION_FIELDS = "competition_id, source_season_key, target_type, entity_id"
+PROJECTION = re.compile(
+    r"SELECT " + PROJECTION_FIELDS + r" FROM \(SELECT " + PROJECTION_FIELDS
+    + r" FROM \(SELECT \* FROM iceberg\.bronze\.fotmob_ingest_manifest FOR VERSION AS OF (\d+) "
+    r"WHERE (target_type='[^']+')\) EXCEPT ALL SELECT " + PROJECTION_FIELDS
+    + r" FROM \(SELECT \* FROM iceberg\.bronze\.fotmob_ingest_manifest "
+    r"FOR VERSION AS OF (\d+) WHERE \2\)\) LIMIT (\d+)"
+)
+
+
+class ProjectionManager:
+    """Answer the key-level comparison of two pinned snapshots from an oracle.
+
+    ``versions`` holds whole synthetic snapshots per target type; the expected
+    additions are the multiset difference computed independently of the SQL.
+    """
+
+    def __init__(self, snapshots, versions):
+        self.snapshots = snapshots
+        self.versions = versions
+        # The SQL metadata log retains exactly the snapshots a rewrite proof needs.
+        rewrites = [row[0] for row in snapshots if row[2] == "replace"]
+        self.schema_rows = [(sid, 1) for sid in (902, *rewrites, 7)]
+        self.calls = []
+        self.fail_type = None
+
+    def execute_query(self, sql):
+        self.calls.append(sql)
+        if '$snapshots"' in sql:
+            return iter(self.snapshots)
+        if '$metadata_log_entries"' in sql:
+            assert "latest_schema_id" in sql
+            return iter(self.schema_rows)
+        match = PROJECTION.fullmatch(sql)
+        assert match, "unexpected query: " + sql
+        new, predicate, old, limit = match.groups()
+        assert (int(old), int(new)) == (902, 7)
+        target_type = predicate.split("'")[1]
+        if target_type == self.fail_type:
+            raise RuntimeError("synthetic expired snapshot")
+        before = Counter(self.versions[902].get(target_type, ()))
+        after = Counter(self.versions[7].get(target_type, ()))
+        return list((after - before).elements())[: int(limit)]
+
+
+def interleaved():
+    """Appends on both sides of two proven compactions, with an ignored type."""
+    manager = ProjectionManager(
+        [snapshot(7, 10, "append", 1), snapshot(10, 81, "append", 1),
+         snapshot(81, 33, "replace", 4, 69, 39918, 39918),
+         snapshot(33, 20, "append", 1), snapshot(20, 902, "replace", 7, 995, 189947, 189947),
+         snapshot(902, 4, "overwrite", None)],
+        {
+            902: {"match": [("1", "2025", "match", "a")] * 2 + [("2", "2025", "match", "gone")],
+                  "league_season": [(None, None, "league_season", "x")],
+                  "transfer": [("9", "2025", "transfer", "t0")]},
+            7: {"match": [("1", "2025", "match", "a")] * 3
+                + [("2", "2025", "match", "gone"), (None, "2025", "match", "n")],
+               "league_season": [(None, None, "league_season", "x")] * 2
+               + [("5", None, "league_season", "y")],
+               "competition_profile": [("50", None, "competition_profile", "p")],
+               "transfer": [("9", "2025", "transfer", "t0"), ("9", "2025", "transfer", "t1")]},
+        },
+    )
+    return manager, Counter({("1", "2025", "match", "a"): 1, (None, "2025", "match", "n"): 1,
+                             (None, None, "league_season", "x"): 1,
+                             ("5", None, "league_season", "y"): 1,
+                             ("50", None, "competition_profile", "p"): 1})
+
+
+def refuse_buckets():
+    return lambda *_: pytest.fail("an additive history must not run 512 bucket comparisons")
+
+
+def test_interleaved_compactions_read_exact_additions_in_four_comparisons(monkeypatch):
+    manager, expected = interleaved()
+    monkeypatch.setattr(c1, "_compare_manifest_buckets", refuse_buckets())
+
+    assert Counter(c1.manifest_changes(manager, 902, 7)) == expected
+
+    comparisons = [sql for sql in manager.calls if sql.startswith("SELECT " + PROJECTION_FIELDS)]
+    assert [PROJECTION.fullmatch(sql).group(2) for sql in comparisons] == [
+        "target_type='match'", "target_type='league_season'",
+        "target_type='competition_profile'", "target_type='competition_seasons'",
+    ]
+    assert not any('$files"' in sql or 'SELECT "$path",' in sql for sql in manager.calls)
+    assert len(manager.calls) == 6
+
+
+def test_projection_caps_every_type_at_the_overflow_sentinel():
+    manager, expected = interleaved()
+    original = manager.execute_query
+    seen = []
+
+    def execute_query(sql):
+        rows = original(sql)
+        if match := PROJECTION.fullmatch(sql):
+            seen.append((len(rows), int(match.group(4))))
+        return rows
+
+    manager.execute_query = execute_query
+    assert Counter(c1.manifest_changes(manager, 902, 7)) == expected
+    # The cap is a truncation sentinel per type, never a share of the delta:
+    # a smaller LIMIT could silently drop rows of a later type.
+    assert [count for count, _ in seen] == [2, 2, 1, 0]
+    assert {limit for _, limit in seen} == {c1.MAX_PROJECTION_ROWS + 1}
+
+
+def test_projection_overflow_keeps_the_exact_comparison(monkeypatch):
+    manager, _ = interleaved()
+    monkeypatch.setattr(c1, "MAX_PROJECTION_ROWS", 3)
+    sentinel = ("2", "2024", "match", "from-comparison")
+    monkeypatch.setattr(c1, "_compare_manifest_buckets", lambda m, old, new: iter([sentinel]))
+
+    assert list(c1.manifest_changes(manager, 902, 7)) == [sentinel]
+
+
+@pytest.mark.parametrize("case", ["schema_change", "append_with_deletes", "append_with_deleted_rows",
+                                  "rewrite_without_rows_for_its_files", "unbalanced_rewrite",
+                                  "delete_between", "overwrite_between", "cycle"])
+def test_unproven_interleaved_history_uses_the_exact_comparison(monkeypatch, case):
+    manager, _ = interleaved()
+    if case == "schema_change":
+        manager.schema_rows[1] = (33, 2)
+    elif case == "append_with_deletes":
+        manager.snapshots[3] = snapshot(33, 20, "append", 1, 2)
+    elif case == "append_with_deleted_rows":
+        manager.snapshots[3] = snapshot(33, 20, "append", 1, None, 5, 1)
+    elif case == "rewrite_without_rows_for_its_files":
+        manager.snapshots[2] = snapshot(81, 33, "replace", 0, 69, 39918, 39918)
+    elif case == "unbalanced_rewrite":
+        manager.snapshots[2] = snapshot(81, 33, "replace", 4, 69, 39918, 39917)
+    elif case == "delete_between":
+        manager.snapshots[3] = snapshot(33, 20, "delete", None, 2, 0, 5)
+    elif case == "overwrite_between":
+        manager.snapshots[3] = snapshot(33, 20, "overwrite", 1)
+    else:
+        manager.snapshots[3] = snapshot(33, 81, "append", 1)
+    sentinel = ("2", "2024", "match", "from-comparison")
+    monkeypatch.setattr(c1, "_compare_manifest_buckets", lambda m, old, new: iter([sentinel]))
+
+    assert list(c1.manifest_changes(manager, 902, 7)) == [sentinel]
+    assert not any(PROJECTION.fullmatch(sql) for sql in manager.calls)
+
+
+def test_projection_read_failure_propagates_without_wide_fallback(monkeypatch):
+    manager, _ = interleaved()
+    manager.fail_type = "league_season"
+    monkeypatch.setattr(c1, "_compare_manifest_buckets", refuse_buckets())
+
+    with pytest.raises(RuntimeError, match="synthetic expired snapshot"):
+        list(c1.manifest_changes(manager, 902, 7))
+    assert sum(bool(PROJECTION.fullmatch(sql)) for sql in manager.calls) == 2
+
+
+@pytest.mark.parametrize("limit", ["MAX_APPEND_FILES", "MAX_APPEND_ROWS"])
+def test_append_inventory_over_its_limit_reads_additions_by_projection(monkeypatch, limit):
+    manager = ProjectionManager(
+        [snapshot(7, 10, "append", 1, None, 2), snapshot(10, 902, "append", 1, None, 2),
+         snapshot(902, 4, "overwrite", None)],
+        {902: {"match": [("0", "2025", "match", "kept")]},
+         7: {"match": [("0", "2025", "match", "kept"), ("1", "2025", "match", "a"),
+                       ("1", "2025", "match", "a"), ("1", "2025", "match", "b")]}},
+    )
+    monkeypatch.setattr(c1, limit, 1)
+    monkeypatch.setattr(c1, "_compare_manifest_buckets", refuse_buckets())
+
+    assert list(c1.manifest_changes(manager, 902, 7)) == [
+        ("1", "2025", "match", "a"), ("1", "2025", "match", "a"), ("1", "2025", "match", "b")]
+    # No rewrite occurred, so the common-schema proof is not needed.
+    assert not any('$metadata_log_entries"' in sql for sql in manager.calls)
+    assert len(manager.calls) == 5
 
 
 def test_partial_read_never_yields_changes():

@@ -1,7 +1,7 @@
 """Offline C1 change detection, closure batching and publication regressions."""
 
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import json
 import re
 import sys
@@ -813,13 +813,183 @@ def test_refresh_locks_only_shared_writes_and_unbinds_released_lease(monkeypatch
     )
     publication = [event for event in events if event[0] == "publication"]
     assert publication and all(event[1] and event[2] for event in publication)
+    # Bootstrap pins and republishes under its single lease.
     assert [event[1] for event in events if event[0] == "snapshots"] == (
-        [True, True] if bootstrap else [False, True]
+        [True, True] if bootstrap else [False, False, False, True]
     )
     if bootstrap:
         assert any(
             event[0] == "bootstrap" and event[1] and event[2] for event in events
         )
+
+
+def test_refresh_fails_fast_when_a_source_commit_precedes_candidate_reads(monkeypatch):
+    pair = ("10", "2026/27")
+    manager = ClosureManager([pair], changed={pair})
+    setup_refresh(monkeypatch, manager)
+    controls = list(manager.controls)
+    current, moved = dict(manager.current), {**manager.current, c1.MANIFEST: 555}
+    pins = []
+
+    def snapshots(_):
+        pins.append(None)
+        return dict(current if len(pins) == 1 else moved)
+
+    monkeypatch.setattr(c1, "snapshots", snapshots)
+
+    # The wave committed while the closure was read: candidates and inputs
+    # computed from the old pins could never be published.
+    with pytest.raises(RuntimeError, match="C1 source snapshots changed during refresh"):
+        c1.refresh(manager, writer_lock=lambda: pytest.fail("a stale refresh must not lease"))
+
+    assert len(pins) == 2
+    assert manager.writes == []
+    assert list(manager.controls) == controls
+
+
+def test_refresh_fails_fast_before_leasing_when_pins_moved_during_candidate_reads(monkeypatch):
+    pair = ("10", "2026/27")
+    manager = ClosureManager([pair], changed={pair})
+    setup_refresh(monkeypatch, manager)
+    current, moved = dict(manager.current), {**manager.current, c1.MANIFEST: 555}
+    state = SimpleNamespace(committed=False)
+    execute_query = manager.execute_query
+
+    def wave_commits_during_candidate_reads(sql):
+        result = execute_query(sql)
+        if sql.startswith("CREATE TABLE "):
+            state.committed = True
+        return result
+
+    monkeypatch.setattr(c1, "snapshots", lambda _: dict(moved if state.committed else current))
+    manager.execute_query = wave_commits_during_candidate_reads
+
+    with pytest.raises(RuntimeError, match="C1 source snapshots changed during refresh"):
+        c1.refresh(manager, writer_lock=lambda: pytest.fail("a stale refresh must not lease"))
+
+    # Only the private candidate table was touched; no publication stage exists.
+    assert len(manager.writes) == 2
+    assert all("fotmob_c1_candidates__stg_" in sql for sql in manager.writes)
+
+
+def test_refresh_stages_candidates_on_the_unleased_staging_manager(monkeypatch):
+    pair = ("10", "2026/27")
+    manager = ClosureManager([pair], changed={pair})
+    staging = ClosureManager()
+    setup_refresh(monkeypatch, manager)
+    authority = SimpleNamespace(held=False)
+    events = []
+    manager.authority = None
+
+    @contextmanager
+    def write_lease():
+        assert not authority.held
+        authority.held = True
+        try:
+            yield authority
+        finally:
+            authority.held = False
+
+    def set_write_authority(value):
+        manager.authority = value
+
+    execute_query = manager.execute_query
+
+    def record(sql):
+        if sql.startswith(("CREATE TABLE ", "INSERT INTO ", "MERGE INTO ", "DROP TABLE ")):
+            events.append((authority.held, manager.authority is authority))
+        return execute_query(sql)
+
+    manager.set_write_authority = set_write_authority
+    manager.execute_query = record
+
+    result = c1.refresh(manager, writer_lock=write_lease, stage_manager=staging)
+
+    assert result["rows"] > 0 and not authority.held and manager.authority is None
+    assert not any("fotmob_c1_candidates__stg_" in sql for sql in manager.writes)
+    assert events and all(events)
+    assert len(staging.writes) == 2
+    assert staging.writes[0].startswith("CREATE TABLE " + c1.PREFIX + "fotmob_c1_candidates__stg_")
+    assert staging.writes[1].startswith("DROP TABLE IF EXISTS " + c1.PREFIX + "fotmob_c1_candidates__stg_")
+
+
+def test_run_refresh_retry_stages_candidates_after_a_leased_attempt(monkeypatch):
+    from scrapers.base import trino_manager as base
+    from scrapers.fotmob import trino_instrumentation as instrumentation
+
+    pair = ("10", "2026/27")
+    database = ClosureManager([pair], changed={pair})
+    monkeypatch.delenv("TRINO_SRC_FOTMOB_PASSWORD", raising=False)
+    monkeypatch.delenv("TRINO_PASSWORD", raising=False)
+    monkeypatch.delenv("TRINO_USER", raising=False)
+    monkeypatch.setenv("TRINO_PORT", "8080")
+    monkeypatch.setattr(base, "TRINO_AVAILABLE", True)
+    monkeypatch.setattr(base, "trino", SimpleNamespace(
+        dbapi=SimpleNamespace(connect=lambda **kwargs: pytest.fail("no real connection")),
+        auth=SimpleNamespace(BasicAuthentication=lambda user, password: None),
+    ), raising=False)
+    # The real instrumentation keeps its lease latch; only the transport is replaced.
+    monkeypatch.setattr(base.TrinoTableManager, "_execute",
+                        lambda self, sql, fetch=False, params=None, **_: database.execute_query(sql))
+    monkeypatch.setattr(instrumentation.FotMobTrinoTableManager, "_execute_guarded",
+                        lambda self, sql, fetch, params: database.execute_query(sql))
+    monkeypatch.setattr(c1, "datetime", FrozenDatetime)
+    monkeypatch.setattr(c1, "partition_fingerprints", lambda _, table: database.files[table])
+    monkeypatch.setattr(c1, "scope_decisions", lambda *_: dict(database.scope_decisions))
+    monkeypatch.setattr(c1, "seasons_latest", lambda *_: dict(database.seasons_latest))
+    monkeypatch.setattr(c1, "manifest_changes", lambda *_: iter(()))
+
+    current, moved = dict(database.current), {**database.current, c1.MANIFEST: 555}
+    state = SimpleNamespace(committed=False)
+    monkeypatch.setattr(c1, "snapshots", lambda _: dict(moved if state.committed else current))
+    execute_query = database.execute_query
+
+    def wave_commits_while_c1_holds_the_lease(sql):
+        result = execute_query(sql)
+        if sql.startswith("INSERT INTO "):
+            state.committed = True
+        return result
+
+    database.execute_query = wave_commits_while_c1_holds_the_lease
+
+    class Authority:
+        held = False
+
+        def check(self):
+            assert self.held, "a released lease must not be probed"
+
+    authority, leases, managers = Authority(), [], []
+    construction = instrumentation.FotMobTrinoTableManager.__init__
+
+    def built(self, **kwargs):
+        construction(self, **kwargs)
+        managers.append(self)
+
+    @contextmanager
+    def writer_lock():
+        authority.held = True
+        leases.append(None)
+        try:
+            yield authority
+        finally:
+            authority.held = False
+
+    monkeypatch.setattr(instrumentation.FotMobTrinoTableManager, "__init__", built)
+    monkeypatch.setattr(c1, "wait_for_wave", lambda: None)
+    monkeypatch.setattr(c1, "build_writer_lock", lambda: writer_lock)
+
+    # 28.11 01:30 UTC: the first publication saw the wave commit under its
+    # lease; the retry then failed with WriterLockBusy on its candidate table.
+    result = c1.run_refresh(dag_run=SimpleNamespace(conf={}))
+
+    assert result["rows"] > 0 and not authority.held
+    assert len(leases) == 2
+    assert sum(sql.startswith("MERGE INTO ") for sql in database.writes) == 1
+    assert sum(sql.startswith("CREATE TABLE ") and "fotmob_c1_candidates__stg_" in sql
+               for sql in database.writes) == 2
+    # The refresh manager latched after its lease; the staging manager never leases.
+    assert [manager._authority_required for manager in managers] == [True, False]
+    assert all(manager._write_authority is None for manager in managers)
 
 
 @pytest.fixture
@@ -883,12 +1053,38 @@ def test_wait_for_wave_stops_on_idle_or_deadline(monkeypatch, clock, states, bud
     from scrapers.fotmob import maintenance
 
     observations = iter(states)
-    monkeypatch.setattr(maintenance, "probe_wave", lambda: (next(observations), None))
+    # A queued wave has no start: it keeps the whole head start.
+    monkeypatch.setattr(maintenance, "probe_wave", lambda **_: (next(observations), None, None))
     monkeypatch.setattr(c1, "C1_WAVE_WAIT_SECONDS", budget)
 
     assert c1.wait_for_wave() is None
     assert clock.sleeps == sleeps
     assert list(observations) == []
+
+
+@pytest.mark.parametrize("age,sleeps,probes", [
+    (1800.0, [], 1),      # a long backfill wave: no head start at all
+    (570.0, [30.0], 1),   # a young wave: only the rest of its head start, no re-probe
+])
+def test_wait_for_wave_head_start_is_measured_from_the_wave_start(monkeypatch, clock, age, sleeps, probes):
+    from scrapers.fotmob import maintenance
+
+    probes_seen = []
+
+    def probe_wave(**options):
+        assert options == {"with_start": True}
+        probes_seen.append(None)
+        # Keep the wave's real start fixed while the fake monotonic clock advances.
+        elapsed = age + clock.now
+        return True, None, datetime.now(timezone.utc) - timedelta(seconds=elapsed)
+
+    monkeypatch.setattr(maintenance, "probe_wave", probe_wave)
+    monkeypatch.setattr(c1, "C1_WAVE_WAIT_SECONDS", 600.0)
+
+    assert c1.wait_for_wave() is None
+    # The real wall clock advances a little while the fake monotonic one sleeps.
+    assert clock.sleeps == pytest.approx(sleeps, abs=0.05)
+    assert len(probes_seen) == probes
 
 
 def test_wait_for_wave_tolerates_probe_failures_then_recovers(monkeypatch, clock):
@@ -897,11 +1093,11 @@ def test_wait_for_wave_tolerates_probe_failures_then_recovers(monkeypatch, clock
     failure = RuntimeError("synthetic wave probe failure")
     probes = []
 
-    def probe_wave():
+    def probe_wave(**_):
         probes.append(None)
         if len(probes) < c1.C1_WAVE_PROBE_ATTEMPTS:
             raise failure
-        return (False, None)  # recovered: idle right after the blips
+        return (False, None, None)  # recovered: idle right after the blips
 
     monkeypatch.setattr(maintenance, "probe_wave", probe_wave)
     c1.wait_for_wave()
@@ -912,7 +1108,7 @@ def test_wait_for_wave_tolerates_probe_failures_then_recovers(monkeypatch, clock
 def test_wait_for_wave_proceeds_after_exhausted_probe_attempts(monkeypatch, clock):
     from scrapers.fotmob import maintenance
 
-    def probe_wave():
+    def probe_wave(**_):
         raise RuntimeError("synthetic transient DNS failure")
 
     monkeypatch.setattr(maintenance, "probe_wave", probe_wave)
