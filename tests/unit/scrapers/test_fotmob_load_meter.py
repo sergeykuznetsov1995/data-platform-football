@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import types
@@ -994,3 +995,58 @@ def test_rotation_only_removes_owned_old_artifacts(tmp_path):
     meter._rotate(tmp_path, meter.utc_datetime("2026-11-02T00:00:00Z"))
     assert not old.exists()
     assert all(path.exists() for path in (retained, foreign, state))
+
+
+def test_rotation_stats_only_names_not_newer_than_cutoff(tmp_path, monkeypatch):
+    for folder in ("raw", "minute", "day", "verdict"):
+        (tmp_path / folder).mkdir()
+    # One file per kept event: a production day is tens of thousands of names.
+    for index in range(300):
+        (tmp_path / "raw" / f"20261101-{index:06d}-recv.jsonl").write_text("{}\n", encoding="utf-8")
+    for name in ("2026-11-01.json", "unrelated.jsonl", "producer-state.json"):
+        (tmp_path / "day" / name).write_text("{}\n", encoding="utf-8")
+    (tmp_path / "raw" / "nested").mkdir()
+    (tmp_path / "raw" / "20260901-000000-link.jsonl").symlink_to(tmp_path / "raw" / "20261101-000000-recv.jsonl")
+    old_raw = tmp_path / "raw" / "20260901-000000-synthetic.jsonl"
+    old_day = tmp_path / "day" / "2026-09-01.json"
+    old_raw.write_text("{}\n", encoding="utf-8")
+    old_day.write_text("{}\n", encoding="utf-8")
+    stats = []
+    real_stat = os.stat
+
+    def counting_stat(*args, **kwargs):
+        stats.append(args[0] if args else None)
+        return real_stat(*args, **kwargs)
+
+    monkeypatch.setattr(meter.os, "stat", counting_stat)
+    meter._rotate(tmp_path, meter.utc_datetime("2026-11-02T00:00:00Z"))
+    # Four directory checks and at most the two owned old files; the 300 recent
+    # names are skipped by prefix without a stat.
+    stat_calls = len(stats)
+    assert stat_calls <= 6
+    assert not old_raw.exists() and not old_day.exists()
+    assert len(list((tmp_path / "raw" / "20261101-000001-recv.jsonl").parent.glob("20261101-*.jsonl"))) == 300
+    assert all((tmp_path / "day" / name).exists() for name in ("2026-11-01.json", "unrelated.jsonl", "producer-state.json"))
+    assert (tmp_path / "raw" / "20260901-000000-link.jsonl").is_symlink()
+    assert (tmp_path / "raw" / "nested").is_dir()
+
+
+def test_rotation_sweeps_a_root_once_an_hour_in_one_process(tmp_path, monkeypatch):
+    monkeypatch.setattr(meter, "_rotated_at", {})
+    for root in (tmp_path / "a", tmp_path / "b"):
+        (root / "raw").mkdir(parents=True)
+    start = meter.utc_datetime("2026-11-02T00:00:00Z")
+    first = tmp_path / "a" / "raw" / "20260901-000000-synthetic.jsonl"
+    first.write_text("{}\n", encoding="utf-8")
+    meter._rotate(tmp_path / "a", start)
+    assert not first.exists()
+    late = tmp_path / "a" / "raw" / "20260902-000000-synthetic.jsonl"
+    late.write_text("{}\n", encoding="utf-8")
+    meter._rotate(tmp_path / "a", start + timedelta(minutes=30))
+    assert late.exists()  # the same process swept this root half an hour ago
+    other = tmp_path / "b" / "raw" / "20260901-000000-synthetic.jsonl"
+    other.write_text("{}\n", encoding="utf-8")
+    meter._rotate(tmp_path / "b", start + timedelta(minutes=30))
+    assert not other.exists()  # the throttle is per root
+    meter._rotate(tmp_path / "a", start + meter.ROTATE_INTERVAL)
+    assert not late.exists()
