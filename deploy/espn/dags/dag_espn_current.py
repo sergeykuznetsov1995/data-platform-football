@@ -39,6 +39,21 @@ DEFAULT_ARGS: dict[str, Any] = {
     "retry_delay": timedelta(minutes=3),
 }
 
+# Every statement waits in the per-table limiter (scrapers/espn/trino_budget.py)
+# while another process commits to the same relation, and for INTERVAL +
+# WRITE_TIMEOUT of scrapers/whoscored/trino_budget.py after a crashed holder.
+# A task budget below that fence turns the wait into a failed wave: 22.11.2026
+# plan_wave spent three 20-min attempts inside the fence, 25.11.2026 three
+# groups waited 23 min behind one replay MERGE and their retries no longer
+# fitted into 55 min (#2472).
+LIMITER_FENCE = timedelta(minutes=46)
+# A task waits the fence out and still does its work (plan <= 6 min,
+# a group <= 11 min observed) instead of burning its attempts inside the wait.
+TASK_TIMEOUT = LIMITER_FENCE + timedelta(minutes=14)
+# The run absorbs the fence once and still gives the slowest task its budget;
+# waves are six hours apart, so the longer run keeps a delivery window free.
+DAGRUN_TIMEOUT = LIMITER_FENCE + TASK_TIMEOUT + timedelta(minutes=14)
+
 
 def _trino():
     # Without dynamic filtering: the tombstone MERGE loses NULL rows (#1557).
@@ -371,7 +386,7 @@ with DAG(
     max_active_runs=1,
     max_active_tasks=3,
     is_paused_upon_creation=True,
-    dagrun_timeout=timedelta(minutes=55),
+    dagrun_timeout=DAGRUN_TIMEOUT,
     tags=["espn", "bronze", "scraping"],
     doc_md=__doc__,
 ) as dag:
@@ -379,14 +394,14 @@ with DAG(
         task_id="prepare",
         python_callable=prepare,
         retries=2,
-        execution_timeout=timedelta(minutes=10),
+        execution_timeout=TASK_TIMEOUT,
     )
     plan_task = PythonOperator(
         task_id=PLAN_TASK_ID,
         python_callable=plan_wave,
         pool=LIVE_POOL,
         retries=2,
-        execution_timeout=timedelta(minutes=20),
+        execution_timeout=TASK_TIMEOUT,
     )
     run_task = PythonOperator.partial(
         task_id=RUN_TASK_ID,
@@ -395,14 +410,14 @@ with DAG(
         retries=2,
         retry_delay=timedelta(minutes=3),
         max_active_tis_per_dag=4,
-        execution_timeout=timedelta(minutes=20),
+        execution_timeout=TASK_TIMEOUT,
     ).expand(op_kwargs=plan_task.output)
     summary_task = PythonOperator(
         task_id="wave_summary",
         python_callable=wave_summary,
         trigger_rule="all_done",
         retries=0,
-        execution_timeout=timedelta(minutes=5),
+        execution_timeout=TASK_TIMEOUT,
     )
 
     prepare_task >> plan_task >> run_task >> summary_task
